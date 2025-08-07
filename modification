@@ -1,55 +1,47 @@
-LoadRelationTables(); // appelle cette méthode juste après avoir désactivé les contraintes
-
-var (dependencies, allCircularRefs) = AnalyzeDatabaseStructure();
-var importOrder = GetImportOrderExcludingCircular(dependencies, allCircularRefs);
-
-// 1. Importer les tables normales (non-relationnelles)
-foreach (var table in importOrder)
+private void ImportTablesWithFKReadiness(IEnumerable<string> tables)
 {
-    if (_pureRelations.Contains(table) || _extendedRelations.Contains(table))
-        continue; // cette table sera traitée dans la partie relation
+    var skipped = new List<string>();
+    var pass = 1;
 
-    if (_importedTables.Contains(table)) continue;
-    _importedTables.Add(table);
-
-    Console.WriteLine($"Import de {table}");
-    ImportTable(table);
-}
-
-// 2. Importer les tables de relations PURES
-foreach (var table in _pureRelations)
-{
-    if (_importedTables.Contains(table)) continue;
-    _importedTables.Add(table);
-
-    Console.WriteLine($"Import de la relation pure {table}");
-    ImportPureRelationTable(table);
-}
-
-// 3. Importer les tables de relations ÉTENDUES
-foreach (var table in _extendedRelations)
-{
-    if (_importedTables.Contains(table)) continue;
-    _importedTables.Add(table);
-
-    Console.WriteLine($"Import de la relation étendue {table}");
-    ImportExtendedRelationTable(table);
-}
-
-
-foreach (var table in _pureRelations.Concat(_extendedRelations))
-{
-    if (_importedTables.Contains(table)) continue;
-    _importedTables.Add(table);
-
-    if (_extendedRelations.Contains(table))
+    foreach (var table in tables)
     {
-        Console.WriteLine($"Import de la relation étendue {table}");
-        ImportExtendedRelationTable(table);
+        if (_importedTables.Contains(table)) continue;
+
+        var fks = GetForeignKeyInfo(table);
+        bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
+
+        if (!ready)
+        {
+            Console.WriteLine($"[ATTENTE] (pass {pass}) {table} : FK non résolues. Mise en attente.");
+            skipped.Add(table);
+            continue;
+        }
+
+        Console.WriteLine($"[IMPORT] (pass {pass}) {table}");
+        ImportTable(table);
+        _importedTables.Add(table);
     }
-    else
+
+    // Relancer la passe si des tables étaient en attente
+    if (skipped.Count > 0)
     {
-        Console.WriteLine($"Import de la relation pure {table}");
-        ImportPureRelationTable(table);
+        if (pass > 5)
+        {
+            Console.WriteLine("⚠️ Trop de passes sans progrès. Tables restantes non résolues :");
+            foreach (var t in skipped)
+                Console.WriteLine($" - {t}");
+            throw new Exception("Import bloqué : certaines dépendances FK n'ont pas pu être satisfaites.");
+        }
+
+        pass++;
+        Console.WriteLine($"🔁 Nouvelle passe pour {skipped.Count} table(s) ignorée(s).");
+        ImportTablesWithFKReadiness(skipped); // récursion contrôlée
     }
 }
+
+
+
+var nonRelationTables = importOrder
+    .Where(t => !_pureRelations.Contains(t) && !_extendedRelations.Contains(t));
+
+ImportTablesWithFKReadiness(nonRelationTables);
