@@ -1,32 +1,115 @@
 public class DatabaseMigrator
 {
-    private readonly HashSet<string> _pureRelations = new();
-    private readonly HashSet<string> _extendedRelations = new();
-    private readonly Dictionary<string, Dictionary<string, string>> _idMappings = new();
+    private readonly HashSet<string> _pureRelations = new();
+    private readonly HashSet<string> _extendedRelations = new();
+    private readonly HashSet<string> _importedTables = new();
+    private readonly Dictionary<string, Dictionary<string, string>> _idMappings = new();
 
-    public void PerformMigration()
-    {
-        // ... Initialisation des relations
-        LoadRelationTables(); // comme avant
+    public void PerformMigration(bool disableForeignKeys = true)
+    {
+        LoadRelationTables(); // Remplit _pureRelations et _extendedRelations
 
-        var orchestrator = new MigrationOrchestrator(
-            _pureRelations,
-            _extendedRelations,
-            _idMappings,
-            GetForeignKeyInfo,
-            ImportTable,
-            ImportPureRelationTable,
-            ImportExtendedRelationTable,
-            GetAllTables
-        );
+        if (disableForeignKeys)
+            DisableAllForeignKeys();
 
-        orchestrator.PerformGlobalImport();
-    }
+        try
+        {
+            var orchestrator = new MigrationOrchestrator(
+                _pureRelations,
+                _extendedRelations,
+                _idMappings,
+                GetForeignKeyInfo,
+                ImportTable,
+                ImportPureRelationTable,
+                ImportExtendedRelationTable,
+                GetAllTables
+            );
 
-    // Ces méthodes sont nécessaires au fonctionnement
-    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName) { ... }
-    private void ImportTable(string tableName) { ... }
-    private void ImportPureRelationTable(string tableName) { ... }
-    private void ImportExtendedRelationTable(string tableName) { ... }
-    private List<string> GetAllTables() { ... }
+            orchestrator.PerformGlobalImport();
+        }
+        finally
+        {
+            if (disableForeignKeys)
+            {
+                EnableAllForeignKeys();
+                ValidateDataIntegrity();
+            }
+        }
+    }
+
+    // 🧱 À implémenter selon ta logique existante
+
+    private void ImportTable(string tableName)
+    {
+        ExecuteInTransaction(() =>
+        {
+            Console.WriteLine($"▶️ Import de la table : {tableName}");
+            // 1. Charger les données (depuis CSV par exemple)
+            // 2. Mapper les FK à partir de _idMappings
+            // 3. Construire et exécuter les requêtes d'insertion
+        });
+    }
+
+    private void ImportPureRelationTable(string tableName)
+    {
+        ExecuteInTransaction(() =>
+        {
+            Console.WriteLine($"▶️ Import de la relation pure : {tableName}");
+            // Logique similaire : charger, mapper FK, insérer
+        });
+    }
+
+    private void ImportExtendedRelationTable(string tableName)
+    {
+        ExecuteInTransaction(() =>
+        {
+            Console.WriteLine($"▶️ Import de la relation étendue : {tableName}");
+            // Avec colonnes métier + mapping FK
+        });
+    }
+
+    private List<string> GetAllTables()
+    {
+        // Retourne la liste complète des tables à migrer (ordre non important ici)
+        // Peut venir d’un fichier config, schéma de BDD, ou analyse des fichiers CSV
+        throw new NotImplementedException();
+    }
+
+    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
+    {
+        // Retourne les FK de la table (à partir de ton parser de schéma par exemple)
+        throw new NotImplementedException();
+    }
+
+    private void DisableAllForeignKeys()
+    {
+        Console.WriteLine("🔒 Désactivation des contraintes FK...");
+        // Implémenter selon ton SGBD (ex : ALTER TABLE ... NOCHECK)
+    }
+
+    private void EnableAllForeignKeys()
+    {
+        Console.WriteLine("🔓 Réactivation des contraintes FK...");
+        // Implémenter selon ton SGBD (ex : ALTER TABLE ... CHECK CONSTRAINT ALL)
+    }
+
+    private void ValidateDataIntegrity()
+    {
+        Console.WriteLine("✅ Validation de l'intégrité des données...");
+        // Tu peux utiliser : DBCC CHECKCONSTRAINTS ou autre commande selon ton SGBD
+    }
+
+    private void ExecuteInTransaction(Action action)
+    {
+        // Méthode centrale à adapter selon ton moteur :
+        // - Begin transaction
+        // - Try { action(); Commit } Catch { Rollback; throw }
+        throw new NotImplementedException();
+    }
+
+    private void LoadRelationTables()
+    {
+        // Charge les noms dans _pureRelations et _extendedRelations selon ta logique
+        // Exemple : analyse des noms de fichiers, ou fichier de conf
+    }
 }
