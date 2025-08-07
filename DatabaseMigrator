@@ -28,6 +28,7 @@ namespace PXE_JOBS.PXE1O003
         private readonly HashSet<string> _importedTables;
         private readonly DynamicSql _transactionSql;
         private Dictionary<string,HashSet<string>> _uniqueKeyTracker = new Dictionary<string, HashSet<string>>();
+        private HashSet<string> _relationTables;
 
         public DatabaseMigrator(string importPath)
         {
@@ -40,6 +41,7 @@ namespace PXE_JOBS.PXE1O003
         {
             try
             {
+                 _relationTables = GetRelationTables();
                 ExecuteTransactionCommand("BEGIN TRANSACTION");
 
                 // 1. Désactiver TOUTES les contraintes au début
@@ -122,11 +124,7 @@ namespace PXE_JOBS.PXE1O003
         }
         private bool IsRelationTable(string tableName)
         {
-            // Règle métier : table sans colonnes hormis des FK (+ optionnellement un ID)
-            var columns = GetTableColumns(tableName);
-            var fkInfo = GetForeignKeyInfo(tableName);
-
-            return fkInfo.Count >= 2 && fkInfo.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
+            return _relationTables.Contains(tableName);
         }
         private void ImportExtendedRelationTable(string tableName)
         {
@@ -953,6 +951,18 @@ namespace PXE_JOBS.PXE1O003
             }
 
             return violations;
+        }
+        private HashSet<string> GetRelationTables()
+        {
+            var relations = new HashSet<string>();
+            var sql = ExecuteProcedure("batch_get_relation_tables");
+        
+            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+            {
+                relations.Add(sql.GetValueUsingColName(i, "TableName", 1, 1));
+            }
+        
+            return relations;
         }
 
         public class ForeignKeyViolation
