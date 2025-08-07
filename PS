@@ -594,3 +594,33 @@ BEGIN
     ) = 0 -- aucune colonne autre que des FK ou un ID
 END
 GO
+
+/******************************************************************************
+ * Procédure [batch_get_relation_tables] :
+ * [batch_get_relation_tables]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_all_relation_tables]', N'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[batch_get_all_relation_tables]
+GO
+
+CREATE PROCEDURE [dbo].[batch_get_all_relation_tables]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT 
+        t.name AS TableName,
+        CASE 
+            WHEN COUNT(c.column_id) > COUNT(DISTINCT fkc.parent_column_id)
+                THEN 1
+            ELSE 0
+        END AS IsExtended
+    FROM sys.tables t
+    LEFT JOIN sys.columns c ON c.object_id = t.object_id
+    LEFT JOIN sys.foreign_key_columns fkc ON fkc.parent_object_id = t.object_id AND c.column_id = fkc.parent_column_id
+    WHERE EXISTS (
+        SELECT 1 FROM sys.foreign_keys fk WHERE fk.parent_object_id = t.object_id
+    )
+    GROUP BY t.name, t.object_id
+END
+GO
