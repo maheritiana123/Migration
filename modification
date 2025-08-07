@@ -1,83 +1,12 @@
-private List<string> GetOrderedExtendedRelations()
-{
-    var ordered = new List<string>();
-    var visited = new HashSet<string>();
+var orchestrator = new MigrationOrchestrator(
+    pureRelations: _pureRelations,
+    extendedRelations: _extendedRelations,
+    idMappings: _idMappings,
+    getForeignKeyInfo: GetForeignKeyInfo,
+    importTable: ImportTable,
+    importPureRelationTable: ImportPureRelationTable,
+    importExtendedRelationTable: ImportExtendedRelationTable,
+    getAllTables: GetAllTables // à implémenter si nécessaire
+);
 
-    void Visit(string table)
-    {
-        if (visited.Contains(table)) return;
-
-        var fks = GetForeignKeyInfo(table);
-        foreach (var fk in fks)
-        {
-            if (_extendedRelations.Contains(fk.ReferencedTableName))
-                Visit(fk.ReferencedTableName);
-        }
-
-        visited.Add(table);
-        ordered.Add(table);
-    }
-
-    foreach (var table in _extendedRelations)
-    {
-        Visit(table);
-    }
-
-    return ordered;
-}
-
-private void ImportExtendedRelationsSafely()
-{
-    var orderedTables = GetOrderedExtendedRelations();
-    var skipped = new List<string>();
-    int pass = 1;
-
-    foreach (var table in orderedTables)
-    {
-        if (_importedTables.Contains(table)) continue;
-
-        var fks = GetForeignKeyInfo(table);
-        bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
-
-        if (!ready)
-        {
-            Console.WriteLine($"[ATTENTE] {table} (relation étendue) : FK manquantes");
-            skipped.Add(table);
-            continue;
-        }
-
-        Console.WriteLine($"[IMPORT] {table} (relation étendue)");
-        ImportExtendedRelationTable(table);
-        _importedTables.Add(table);
-    }
-
-    if (skipped.Count > 0)
-    {
-        if (pass > 5)
-        {
-            Console.WriteLine("🛑 Tables de relation étendues non importables après plusieurs passes :");
-            foreach (var t in skipped) Console.WriteLine($" - {t}");
-            throw new Exception("Import échoué pour des relations étendues à cause de dépendances non résolues.");
-        }
-
-        pass++;
-        Console.WriteLine($"🔁 Nouvelle passe relations étendues : {skipped.Count} table(s)");
-        ImportExtendedRelationsSafely(); // récursion contrôlée
-    }
-}
-
-// 1. Tables parents (avec ordre topologique + passes)
-ImportTablesWithFKReadiness(...);
-
-// 2. Relations pures (FK simples)
-foreach (var table in _pureRelations)
-{
-    if (_importedTables.Contains(table)) continue;
-    _importedTables.Add(table);
-
-    Console.WriteLine($"Import de la relation pure {table}");
-    ImportPureRelationTable(table);
-}
-
-// 3. Relations étendues (FK complexes, dépendances croisées)
-ImportExtendedRelationsSafely();
+orchestrator.PerformGlobalImport();
