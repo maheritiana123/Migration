@@ -1,0 +1,562 @@
+/******************************************************************************
+ * Procédure batch_disable_all_foreign_keys :
+ * Désactive temporairement toutes les contraintes de clé étrangère
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_disable_all_foreign_keys]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_disable_all_foreign_keys]
+GO
+CREATE PROCEDURE [dbo].[batch_disable_all_foreign_keys]
+AS
+BEGIN
+    SET NOCOUNT ON
+    DECLARE @sql NVARCHAR(MAX) = N''
+    
+    SELECT @sql += N'
+    ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) 
+        + '.' + QUOTENAME(OBJECT_NAME(parent_object_id)) 
+        + ' NOCHECK CONSTRAINT ' + QUOTENAME(name) + ';'
+    FROM sys.foreign_keys
+    
+    EXEC sp_executesql @sql
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_has_identity_column :
+ * Vérifie si une table possède une colonne identity
+ * @TableName : Nom de la table à vérifier
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_has_identity_column]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_has_identity_column]
+GO
+CREATE PROCEDURE [dbo].[batch_has_identity_column]
+    @TableName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON
+    SELECT CAST(CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END AS BIT) AS Result
+    FROM sys.identity_columns
+    WHERE OBJECT_NAME(object_id) = @TableName
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_primary_key_column :
+ * Retourne la colonne clé primaire (version OUTPUT)
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_primary_key_column]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_primary_key_column]
+GO
+CREATE PROCEDURE [dbo].[batch_get_primary_key_column]
+    @TableName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    SELECT TOP 1 
+        COLUMN_NAME AS [PrimaryKeyColumn]  -- Alias explicite ici
+    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+    WHERE TABLE_NAME = @TableName
+    AND CONSTRAINT_NAME LIKE 'PK_%';
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_table_dependencies :
+ * Récupère les dépendances entre tables (relations FK)
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_table_dependencies]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_table_dependencies]
+GO
+CREATE PROCEDURE [dbo].[batch_get_table_dependencies]
+AS
+BEGIN
+    SET NOCOUNT ON
+    SELECT 
+        OBJECT_NAME(fk.parent_object_id) AS TableName,
+        OBJECT_NAME(fk.referenced_object_id) AS ReferencedTableName
+    FROM sys.foreign_keys fk
+    ORDER BY TableName
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_table_columns :
+ * Récupère les colonnes d'une table avec leur type
+ * @TableName : Nom de la table
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_table_columns]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_table_columns]
+GO
+CREATE PROCEDURE [dbo].[batch_get_table_columns]
+    @TableName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = @TableName
+    ORDER BY ORDINAL_POSITION
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_table_columns_type :
+ * Récupère les colonnes d'une table avec leur type
+ * @TableName : Nom de la table
+ * @ColumnName : nom du colonne 
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_table_columns_type]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_table_columns_type]
+GO
+CREATE PROCEDURE [dbo].[batch_get_table_columns_type]
+    @TableName NVARCHAR(128),
+	@ColumnName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = @TableName AND COLUMN_NAME = @ColumnName
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_table_foreign_keys :
+ * Récupère les clés étrangères d'une table
+ * @TableName : Nom de la table
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_table_foreign_keys]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_table_foreign_keys]
+GO
+CREATE PROCEDURE [dbo].[batch_get_table_foreign_keys]
+    @TableName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON
+    SELECT 
+        COL_NAME(fkc.parent_object_id, fkc.parent_column_id) AS ColumnName,
+        OBJECT_NAME(fkc.referenced_object_id) AS ReferencedTableName,
+        COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) AS ReferencedColumnName
+    FROM 
+        sys.foreign_key_columns fkc
+    WHERE 
+        OBJECT_NAME(fkc.parent_object_id) = @TableName
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_get_foreign_key_column :
+ * Trouve la colonne FK entre deux tables
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_foreign_key_column]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_foreign_key_column]
+GO
+CREATE PROCEDURE [dbo].[batch_get_foreign_key_column]
+    @TableName NVARCHAR(128),
+    @ReferencedTable NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    SELECT TOP 1 COL_NAME(fkc.parent_object_id, fkc.parent_column_id) As ReferenceColumn
+    FROM sys.foreign_key_columns fkc
+    WHERE OBJECT_NAME(fkc.parent_object_id) = @TableName
+    AND OBJECT_NAME(fkc.referenced_object_id) = @ReferencedTable;
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_create_mapping_table :
+ * Crée la table temporaire de mapping des IDs
+ * @ReferencedTable : Table contenant les mappings
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_create_mapping_table]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_create_mapping_table]
+GO
+CREATE PROCEDURE [dbo].[batch_create_mapping_table]
+    @ReferencedTable NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @pkColumn NVARCHAR(128);
+    DECLARE @sql NVARCHAR(MAX);
+    
+    -- Créer une table temporaire pour stocker le résultat
+    CREATE TABLE #TempPkResult (PrimaryKeyColumn NVARCHAR(128));
+    
+    -- Insérer le résultat de la procédure
+    INSERT INTO #TempPkResult
+    EXEC batch_get_primary_key_column @TableName = @ReferencedTable;
+    
+    -- Récupérer la valeur
+    SELECT @pkColumn = PrimaryKeyColumn FROM #TempPkResult;
+    
+    -- Vérification
+    IF @pkColumn IS NULL
+    BEGIN
+        DROP TABLE #TempPkResult;
+        RAISERROR('Aucune colonne de clé primaire trouvée pour la table %s', 16, 1, @ReferencedTable);
+        RETURN;
+    END
+    
+    -- Construction de la requête de création
+    SET @sql = N'
+    IF OBJECT_ID(''tempdb..#IdMapping'') IS NOT NULL
+        DROP TABLE #IdMapping;
+        
+    SELECT 
+        ''' + @ReferencedTable + ''' AS TableName,
+        ' + QUOTENAME(@pkColumn) + ' AS OldId,
+        ' + QUOTENAME(@pkColumn) + ' AS NewId
+    INTO #IdMapping
+    FROM ' + QUOTENAME(@ReferencedTable);
+    
+    EXEC sp_executesql @sql;
+    DROP TABLE #TempPkResult;
+END
+GO
+
+/******************************************************************************
+ * Procédure batch_drop_mapping_table :
+ * Supprime la table temporaire
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_drop_mapping_table]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_drop_mapping_table]
+GO
+CREATE PROCEDURE [dbo].[batch_drop_mapping_table]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    EXEC('IF OBJECT_ID(''tempdb..##IdMapping'') IS NOT NULL DROP TABLE ##IdMapping');
+END
+GO
+
+/******************************************************************************
+ * Procédure [batch_disable_identity_constraints] :
+ * Désactive toutes les contraintes IDENTITY temporairement
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_disable_identity_constraints]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_disable_identity_constraints]
+GO
+CREATE PROCEDURE [dbo].[batch_disable_identity_constraints]
+AS
+BEGIN
+    EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
+END
+GO
+
+/******************************************************************************
+ * Procédure [batch_enable_identity_constraints] :
+ * Réactive toutes les contraintes IDENTITY
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_enable_identity_constraints]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_enable_identity_constraints]
+GO
+CREATE PROCEDURE [dbo].[batch_enable_identity_constraints]
+AS
+BEGIN
+    EXEC sp_MSforeachtable 'ALTER TABLE ? CHECK CONSTRAINT ALL';
+END
+GO
+/******************************************************************************
+ * Procédure [batch_enable_fk_constraints] :
+ * Réactivation avec vérification
+ ******************************************************************************/
+ IF OBJECT_ID(N'[dbo].[batch_enable_fk_constraints]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_enable_fk_constraints]
+GO
+
+CREATE PROCEDURE [dbo].[batch_enable_fk_constraints]
+    @TableName NVARCHAR(128) = NULL  -- NULL pour toutes les tables
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @sql NVARCHAR(MAX) = N'';
+    
+    -- D'abord vérifier les contraintes
+    IF @TableName IS NULL
+    BEGIN
+        CREATE TABLE #InvalidFKs (
+            TableName NVARCHAR(128),
+            ConstraintName NVARCHAR(128),
+            ErrorMessage NVARCHAR(MAX)
+        );
+        
+        INSERT INTO #InvalidFKs
+        EXEC batch_validate_fk_constraints;
+        
+        IF EXISTS (SELECT 1 FROM #InvalidFKs)
+        BEGIN
+            SELECT * FROM #InvalidFKs;
+            RAISERROR('Erreurs de contraintes détectées', 16, 1);
+            RETURN;
+        END
+    END
+    
+    -- Puis réactiver
+    SELECT @sql = @sql + N'
+    ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + '.' + 
+    QUOTENAME(OBJECT_NAME(parent_object_id)) + 
+    ' WITH CHECK CHECK CONSTRAINT ' + QUOTENAME(name) + ';'
+    FROM sys.foreign_keys
+    WHERE @TableName IS NULL 
+       OR OBJECT_NAME(parent_object_id) = @TableName;
+    
+    EXEC sp_executesql @sql;
+END
+GO
+/******************************************************************************
+ * Procédure [batch_is_computed_column] :
+ * Réactivation avec vérification
+ ******************************************************************************/
+ IF OBJECT_ID(N'[dbo].[batch_is_computed_column]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_is_computed_column]
+GO
+
+CREATE PROCEDURE [dbo].[batch_is_computed_column]
+    @TableName NVARCHAR(128),
+    @ColumnName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    SELECT 
+        CASE WHEN is_computed = 1 THEN 1 ELSE 0 END AS IsComputed,
+        is_nullable AS IsNullable
+    FROM sys.columns
+    WHERE object_id = OBJECT_ID(@TableName)
+    AND name = @ColumnName;
+END
+GO
+/******************************************************************************
+ * Procédure [batch_update_circular_references] :
+ * [batch_update_circular_references]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_update_circular_references]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_update_circular_references]
+GO
+
+CREATE PROCEDURE [dbo].[batch_update_circular_references]
+    @TableName NVARCHAR(128),
+    @ColumnName NVARCHAR(128),
+    @ReferencedTable NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @sql NVARCHAR(MAX) = N'
+    UPDATE t SET 
+        t.' + QUOTENAME(@ColumnName) + ' = m.NewID
+    FROM ' + QUOTENAME(@TableName) + ' t
+    JOIN #ID_Mapping m ON t.' + QUOTENAME(@ColumnName) + ' = m.OldID
+    WHERE m.TableName = @ReferencedTable';
+    
+    EXEC sp_executesql @sql, 
+        N'@ReferencedTable NVARCHAR(128)', 
+        @ReferencedTable;
+END
+GO
+/******************************************************************************
+ * Procédure [batch_safe_insert_with_type_conversion] :
+ * [batch_safe_insert_with_type_conversion]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+GO
+
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName NVARCHAR(128),
+    @Columns NVARCHAR(MAX),
+    @Values NVARCHAR(MAX),
+    @HasIdentity BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @sql NVARCHAR(MAX);
+    DECLARE @output TABLE (NewID INT);
+    
+    -- Construire la requête avec TRY_CONVERT pour les dates
+    SET @sql = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
+    
+    IF @HasIdentity = 1
+        SET @sql = @sql + N'OUTPUT INSERTED.' + 
+                  (SELECT TOP 1 COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+                   WHERE TABLE_NAME = @TableName AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1) + ' AS NewID ';
+    
+    -- Conversion sécurisée des valeurs
+    DECLARE @convertedValues NVARCHAR(MAX) = N'';
+    
+    WITH ValueCTE AS (
+        SELECT 
+            value,
+            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        FROM STRING_SPLIT(REPLACE(@Values, '''', ''), ',')
+    )
+    SELECT @convertedValues = @convertedValues + 
+           CASE 
+               WHEN value LIKE '''%''' THEN  -- Chaîne entre guillemets
+                   CASE 
+                       WHEN TRY_CONVERT(DATETIME, REPLACE(value, '''', '')) IS NOT NULL 
+                           THEN 'TRY_CONVERT(DATETIME, ' + value + ')'
+                       WHEN TRY_CONVERT(DECIMAL(18,6), REPLACE(value, '''', '')) IS NOT NULL 
+                           THEN 'TRY_CONVERT(DECIMAL(18,6), ' + value + ')'
+                       ELSE value
+                   END
+               ELSE value  -- Valeurs numériques ou NULL
+           END + ','
+    FROM ValueCTE;
+    
+    -- Supprimer la dernière virgule
+    SET @convertedValues = LEFT(@convertedValues, LEN(@convertedValues) - 1);
+    
+    SET @sql = @sql + N'SELECT ' + @convertedValues;
+    
+    BEGIN TRY
+        IF @HasIdentity = 1
+            INSERT INTO @output EXEC sp_executesql @sql;
+        ELSE
+            EXEC sp_executesql @sql;
+            
+        SELECT NewID FROM @output;
+    END TRY
+    BEGIN CATCH
+        SELECT 
+            NULL AS NewID,
+            ERROR_MESSAGE() AS ErrorMessage;
+    END CATCH
+END
+GO
+/******************************************************************************
+ * Procédure [batch_enable_fk_constraints] :
+ * [batch_enable_fk_constraints]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_enable_fk_constraints]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_enable_fk_constraints]
+GO
+
+CREATE PROCEDURE [dbo].[batch_enable_fk_constraints]
+    @TableName NVARCHAR(128) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Correction: Utilisation des alias pour éviter les ambiguïtés
+    DECLARE @CheckSql NVARCHAR(MAX) = N'';
+    DECLARE @EnableSql NVARCHAR(MAX) = N'';
+    
+    SELECT @CheckSql = @CheckSql + N'
+    IF EXISTS (
+        SELECT 1 FROM ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) 
+        + '.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id)) 
+        + ' WHERE NOT EXISTS (
+            SELECT 1 FROM ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.referenced_object_id))
+            + '.' + QUOTENAME(OBJECT_NAME(fk.referenced_object_id))
+            + ' WHERE ' + QUOTENAME(OBJECT_NAME(fk.referenced_object_id)) + '.' 
+            + QUOTENAME(rc.name)
+            + ' = ' + QUOTENAME(OBJECT_NAME(fk.parent_object_id)) + '.' 
+            + QUOTENAME(pc.name) + '
+        )
+    )
+    BEGIN
+        PRINT ''Contrainte '' + QUOTENAME(fk.name) 
+              + '' violée entre '' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) 
+              + ''.'' + QUOTENAME(OBJECT_NAME(fk.parent_object_id))
+              + '' et '' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.referenced_object_id)) 
+              + ''.'' + QUOTENAME(OBJECT_NAME(fk.referenced_object_id));
+    END
+    ',
+    @EnableSql = @EnableSql + N'
+    ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(fk.parent_object_id)) 
+        + '.' + QUOTENAME(OBJECT_NAME(fk.parent_object_id)) 
+        + ' WITH CHECK CHECK CONSTRAINT ' + QUOTENAME(fk.name) + ';
+    '
+    FROM sys.foreign_keys fk
+    JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+    JOIN sys.columns pc ON fkc.parent_object_id = pc.object_id AND fkc.parent_column_id = pc.column_id
+    JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id
+    WHERE @TableName IS NULL 
+       OR OBJECT_NAME(fk.parent_object_id) = @TableName
+    GROUP BY fk.name, fk.parent_object_id, fk.referenced_object_id,rc.name,pc.name;
+    
+    EXEC sp_executesql @CheckSql;
+    EXEC sp_executesql @EnableSql;
+END
+GO
+/******************************************************************************
+ * Procédure [batch_get_fk_violations] :
+ * [batch_get_fk_violations]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_get_fk_violations]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_get_fk_violations]
+GO
+
+CREATE PROCEDURE [dbo].[batch_get_fk_violations]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    -- Correction: Structure simplifiée et sans ambiguïté
+    SELECT DISTINCT
+        OBJECT_NAME(fk.parent_object_id) AS TableName,
+        pc.name AS ColumnName,
+        OBJECT_NAME(fk.referenced_object_id) AS ReferencedTable,
+        rc.name AS ReferencedColumn,
+        fk.name AS ConstraintName
+    FROM 
+        sys.foreign_keys fk
+    INNER JOIN 
+        sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+    INNER JOIN
+        sys.columns pc ON fkc.parent_object_id = pc.object_id AND fkc.parent_column_id = pc.column_id
+    INNER JOIN
+        sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id
+    WHERE EXISTS (
+        SELECT 1 
+        FROM 
+            sys.foreign_key_columns fkc2
+        WHERE 
+            fkc2.constraint_object_id = fk.object_id
+            AND NOT EXISTS (
+                SELECT 1 
+                FROM 
+                    sys.foreign_key_columns fkc3
+                JOIN
+                    sys.columns rc2 ON fkc3.referenced_object_id = rc2.object_id AND fkc3.referenced_column_id = rc2.column_id
+                WHERE 
+                    fkc3.constraint_object_id = fk.object_id
+                    AND rc2.object_id = fkc2.referenced_object_id
+                    AND rc2.column_id = fkc2.referenced_column_id
+            )
+    );
+END
+GO
+/******************************************************************************
+ * Procédure [batch_repair_fk_violation] :
+ * [batch_repair_fk_violation]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_repair_fk_violation]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_repair_fk_violation]
+GO
+
+CREATE PROCEDURE [dbo].[batch_repair_fk_violation]
+    @TableName NVARCHAR(128),
+    @ColumnName NVARCHAR(128),
+    @ReferencedTable NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @sql NVARCHAR(MAX) = N'
+    DELETE FROM ' + QUOTENAME(@TableName) + '
+    WHERE ' + QUOTENAME(@ColumnName) + ' NOT IN (
+        SELECT ' + QUOTENAME(@ColumnName) + ' 
+        FROM ' + QUOTENAME(@ReferencedTable) + '
+        WHERE ' + QUOTENAME(@ColumnName) + ' IS NOT NULL
+    )';
+    
+    EXEC sp_executesql @sql;
+END
