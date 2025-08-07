@@ -28,7 +28,8 @@ namespace PXE_JOBS.PXE1O003
         private readonly HashSet<string> _importedTables;
         private readonly DynamicSql _transactionSql;
         private Dictionary<string,HashSet<string>> _uniqueKeyTracker = new Dictionary<string, HashSet<string>>();
-        private HashSet<string> _relationTables;
+        private HashSet<string> _pureRelations = new();
+        private HashSet<string> _extendedRelations = new();
 
         public DatabaseMigrator(string importPath)
         {
@@ -41,7 +42,7 @@ namespace PXE_JOBS.PXE1O003
         {
             try
             {
-                 _relationTables = GetRelationTables();
+                LoadRelationTables();
                 ExecuteTransactionCommand("BEGIN TRANSACTION");
 
                 // 1. Désactiver TOUTES les contraintes au début
@@ -121,10 +122,6 @@ namespace PXE_JOBS.PXE1O003
             {
                 ValidateDataIntegrity();
             }
-        }
-        private bool IsRelationTable(string tableName)
-        {
-            return _relationTables.Contains(tableName);
         }
         private void ImportExtendedRelationTable(string tableName)
         {
@@ -215,12 +212,6 @@ namespace PXE_JOBS.PXE1O003
             }
 
             return result;
-        }
-        private bool HasAdditionalColumns(string tableName)
-        {
-            var columns = GetTableColumns(tableName);
-            var fkColumns = GetForeignKeyInfo(tableName).Select(fk => fk.ColumnName);
-            return columns.Count > fkColumns.Count();
         }
         private void ImportRelationTable(string tableName)
         {
@@ -963,6 +954,31 @@ namespace PXE_JOBS.PXE1O003
             }
         
             return relations;
+        }
+
+        private void LoadRelationTables()
+        {
+            var sql = ExecuteProcedure("batch_get_all_relation_tables");
+        
+            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+            {
+                var table = sql.GetValueUsingColName(i, "TableName", 1, 1);
+                var isExtended = sql.GetValueUsingColName(i, "IsExtended", 1, 1) == "1";
+        
+                if (isExtended)
+                    _extendedRelations.Add(table);
+                else
+                    _pureRelations.Add(table);
+            }
+        }
+        private bool IsRelationTable(string tableName)
+        {
+            return _pureRelations.Contains(tableName) || _extendedRelations.Contains(tableName);
+        }
+        
+        private bool HasAdditionalColumns(string tableName)
+        {
+            return _extendedRelations.Contains(tableName);
         }
 
         public class ForeignKeyViolation
