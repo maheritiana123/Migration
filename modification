@@ -1,12 +1,32 @@
-var orchestrator = new MigrationOrchestrator(
-    pureRelations: _pureRelations,
-    extendedRelations: _extendedRelations,
-    idMappings: _idMappings,
-    getForeignKeyInfo: GetForeignKeyInfo,
-    importTable: ImportTable,
-    importPureRelationTable: ImportPureRelationTable,
-    importExtendedRelationTable: ImportExtendedRelationTable,
-    getAllTables: GetAllTables // à implémenter si nécessaire
-);
+public class DatabaseMigrator
+{
+    private readonly HashSet<string> _pureRelations = new();
+    private readonly HashSet<string> _extendedRelations = new();
+    private readonly Dictionary<string, Dictionary<string, string>> _idMappings = new();
 
-orchestrator.PerformGlobalImport();
+    public void PerformMigration()
+    {
+        // ... Initialisation des relations
+        LoadRelationTables(); // comme avant
+
+        var orchestrator = new MigrationOrchestrator(
+            _pureRelations,
+            _extendedRelations,
+            _idMappings,
+            GetForeignKeyInfo,
+            ImportTable,
+            ImportPureRelationTable,
+            ImportExtendedRelationTable,
+            GetAllTables
+        );
+
+        orchestrator.PerformGlobalImport();
+    }
+
+    // Ces méthodes sont nécessaires au fonctionnement
+    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName) { ... }
+    private void ImportTable(string tableName) { ... }
+    private void ImportPureRelationTable(string tableName) { ... }
+    private void ImportExtendedRelationTable(string tableName) { ... }
+    private List<string> GetAllTables() { ... }
+}
