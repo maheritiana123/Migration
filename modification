@@ -1,72 +1,55 @@
-private Dictionary<string, object> ValidateAndMapForeignKeys(Dictionary<string, object> record, List<ForeignKeyInfo> fkInfo)
+LoadRelationTables(); // appelle cette méthode juste après avoir désactivé les contraintes
+
+var (dependencies, allCircularRefs) = AnalyzeDatabaseStructure();
+var importOrder = GetImportOrderExcludingCircular(dependencies, allCircularRefs);
+
+// 1. Importer les tables normales (non-relationnelles)
+foreach (var table in importOrder)
 {
-    var result = new Dictionary<string, object>();
+    if (_pureRelations.Contains(table) || _extendedRelations.Contains(table))
+        continue; // cette table sera traitée dans la partie relation
 
-    foreach (var fk in fkInfo)
-    {
-        if (!record.ContainsKey(fk.ColumnName))
-        {
-            Console.WriteLine($"[ERREUR] Colonne FK manquante : {fk.ColumnName}");
-            return null;
-        }
+    if (_importedTables.Contains(table)) continue;
+    _importedTables.Add(table);
 
-        var originalValue = record[fk.ColumnName];
-
-        // Si la valeur est NULL, on vérifie si la colonne l'accepte
-        if (originalValue == null || originalValue.ToString() == "")
-        {
-            bool nullable = IsForeignKeyNullable(fk);
-            if (nullable)
-            {
-                result[fk.ColumnName] = null; // autorisé => on garde la ligne
-                continue;
-            }
-            else
-            {
-                Console.WriteLine($"[ERREUR] Valeur NULL interdite pour {fk.ColumnName} dans {fk.ReferencedTableName}");
-                return null; // on rejette si NON NULL
-            }
-        }
-
-        // On vérifie que la table de mapping est bien là
-        if (!_idMappings.ContainsKey(fk.ReferencedTableName))
-        {
-            Console.WriteLine($"[ERREUR] Mapping manquant pour : {fk.ReferencedTableName}");
-            return null;
-        }
-
-        if (!_idMappings[fk.ReferencedTableName].TryGetValue(originalValue, out var newId))
-        {
-            Console.WriteLine($"[ERREUR] Valeur FK introuvable : {fk.ColumnName}={originalValue} dans {fk.ReferencedTableName}");
-            return null;
-        }
-
-        result[fk.ColumnName] = newId;
-    }
-
-    return result;
+    Console.WriteLine($"Import de {table}");
+    ImportTable(table);
 }
 
-private bool IsForeignKeyNullable(ForeignKeyInfo fk)
+// 2. Importer les tables de relations PURES
+foreach (var table in _pureRelations)
 {
-    DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-    sql.AddDirectRequest(@"
-        SELECT is_nullable
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = $table$
-        AND COLUMN_NAME = $col$",
-        MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    if (_importedTables.Contains(table)) continue;
+    _importedTables.Add(table);
 
-    sql.SetSecureParam("table", fk.TableName, true, 0);
-    sql.SetSecureParam("col", fk.ColumnName, true, 0);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute();
+    Console.WriteLine($"Import de la relation pure {table}");
+    ImportPureRelationTable(table);
+}
 
-    if (sql.ReturnedRows(1, 1) > 0)
+// 3. Importer les tables de relations ÉTENDUES
+foreach (var table in _extendedRelations)
+{
+    if (_importedTables.Contains(table)) continue;
+    _importedTables.Add(table);
+
+    Console.WriteLine($"Import de la relation étendue {table}");
+    ImportExtendedRelationTable(table);
+}
+
+
+foreach (var table in _pureRelations.Concat(_extendedRelations))
+{
+    if (_importedTables.Contains(table)) continue;
+    _importedTables.Add(table);
+
+    if (_extendedRelations.Contains(table))
     {
-        string nullable = sql.GetValueUsingColName(1, "is_nullable", 1, 1);
-        return nullable == "YES";
+        Console.WriteLine($"Import de la relation étendue {table}");
+        ImportExtendedRelationTable(table);
     }
-
-    return false; // si on ne sait pas, on préfère bloquer
+    else
+    {
+        Console.WriteLine($"Import de la relation pure {table}");
+        ImportPureRelationTable(table);
+    }
 }
