@@ -1,13 +1,127 @@
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
+GO
 
-DECLARE	@return_value int
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName      NVARCHAR(128),
+    @Columns        NVARCHAR(MAX),   -- ex: [Col1],[Col2],...
+    @Values         NVARCHAR(MAX),   -- ex: 'val1',NULL,123,...
+    @HasIdentity    BIT = 0,
+    @ValueTokens    NVARCHAR(MAX) = NULL  -- valeurs formatées et séparées par CHAR(31)
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-EXEC	@return_value = [dbo].[batch_safe_insert_with_type_conversion]
-		@TableName = N'VarEnv',
-		@Columns = N'[VENom],[ADVAR]',
-		@Values = N'''WPNumStat'',NULL',
-		@HasIdentity = 1,
-		@ValueTokens = N'''WPNumStat''NULL'
+    DECLARE @identityCol NVARCHAR(128) = NULL;
+    DECLARE @pkCols NVARCHAR(MAX) = NULL;
+    DECLARE @whereClause NVARCHAR(MAX) = '';
+    DECLARE @exists BIT = 0;
+    DECLARE @output TABLE (NewID INT);
 
-SELECT	'Return Value' = @return_value
+    -- 1) colonne identity
+    IF @HasIdentity = 1
+    BEGIN
+        SELECT TOP 1 @identityCol = COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @TableName
+          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
+    END
 
+    -- 2) colonnes PK/UK hors identity
+    SELECT @pkCols = STRING_AGG(QUOTENAME(c.COLUMN_NAME), ',')
+    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
+        ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+       AND tc.TABLE_NAME = c.TABLE_NAME
+    WHERE tc.TABLE_NAME = @TableName
+      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+      AND c.COLUMN_NAME <> ISNULL(@identityCol, '');
+
+    -- 3) Construire listes colonnes / valeurs
+    DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
+    DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
+
+    INSERT INTO @colList (ColName, Ord)
+    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    FROM STRING_SPLIT(@Columns, ',')
+    WHERE RTRIM(LTRIM(value)) <> '';
+
+    IF @ValueTokens IS NOT NULL
+    BEGIN
+        INSERT INTO @valList (Val, Ord)
+        SELECT LTRIM(RTRIM(value)),
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@ValueTokens, CHAR(31))
+        WHERE RTRIM(LTRIM(value)) <> '';
+    END
+    ELSE
+    BEGIN
+        INSERT INTO @valList (Val, Ord)
+        SELECT LTRIM(RTRIM(value)),
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@Values, ',')
+        WHERE RTRIM(LTRIM(value)) <> '';
+    END
+
+    -- 4) Construire clause WHERE sans AND final
+    IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
+    BEGIN
+        DECLARE @conditions TABLE (Cond NVARCHAR(MAX), Ord INT);
+
+        INSERT INTO @conditions (Cond, Ord)
+        SELECT CASE 
+                   WHEN UPPER(v.Val) = 'NULL' THEN QUOTENAME(c.ColName) + ' IS NULL'
+                   ELSE QUOTENAME(c.ColName) + ' = ' + v.Val 
+               END,
+               c.Ord
+        FROM @colList c
+        JOIN @valList v ON c.Ord = v.Ord
+        WHERE c.ColName IN (
+            SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value, '[', ''), ']', '')))
+            FROM STRING_SPLIT(@pkCols, ',') p
+        );
+
+        -- assembler avec AND
+        SELECT @whereClause = STRING_AGG(Cond, ' AND ') WITHIN GROUP (ORDER BY Ord)
+        FROM @conditions;
+    END
+
+    -- 5) Vérifier existence doublon
+    IF LEN(@whereClause) > 0
+    BEGIN
+        DECLARE @checkSql NVARCHAR(MAX) =
+            N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM ' 
+            + QUOTENAME(@TableName) + ' WHERE ' + @whereClause + N') THEN 1 ELSE 0 END';
+
+        EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out=@exists OUTPUT;
+
+        IF @exists = 1
+        BEGIN
+            SELECT NULL AS NewID, 'Doublon' AS ErrorMessage;
+            RETURN;
+        END
+    END
+
+    -- 6) Exécuter l'INSERT
+    DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
+    IF @HasIdentity = 1 AND @identityCol IS NOT NULL
+        SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@identityCol) + ' AS NewID ';
+    SET @sql += N'SELECT ' + @Values;
+
+    BEGIN TRY
+        IF @HasIdentity = 1
+            INSERT INTO @output EXEC sp_executesql @sql;
+        ELSE
+            EXEC sp_executesql @sql;
+
+        IF @HasIdentity = 1
+            SELECT NewID, NULL AS ErrorMessage FROM @output;
+        ELSE
+            SELECT NULL AS NewID, NULL AS ErrorMessage;
+    END TRY
+    BEGIN CATCH
+        SELECT NULL AS NewID, ERROR_MESSAGE() AS ErrorMessage;
+    END CATCH
+END
 GO
