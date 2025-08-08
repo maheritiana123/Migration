@@ -7,19 +7,11 @@ private void ExportTableToCsv(string tableName)
     sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
     sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
     sql.Execute(30000);
-    Dictionary<string,object> result = new Dictionary<string,object>();
-    for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-    {
-        string column = sql.GetColName(i, 1, 1);
-        string row = sql.GetValueUsingColName(i, column, 1, 1);
-        result.Add(column, row);
-    }
-    // Doit retourner : (List<string> columnNames, List<object[]> rows)
 
-    var columnNames = result.ColumnNames;
-    var rows = result.Rows;
+    int colCount = sql.ReturnedCols(1, 1);
+    int rowCount = sql.ReturnedRows(1, 1);
 
-    if (rows.Count == 0)
+    if (rowCount == 0)
     {
         Console.WriteLine($"⚠ Table vide : {tableName}");
         return;
@@ -29,13 +21,34 @@ private void ExportTableToCsv(string tableName)
 
     using var writer = new StreamWriter(csvPath, false, Encoding.UTF8);
 
-    // 📌 Écrire l’en-tête
+    // 1️⃣ Récupérer l’en-tête
+    var columnNames = new List<string>();
+    for (int c = 1; c <= colCount; c++)
+    {
+        columnNames.Add(sql.GetColName(c, 1, 1));
+    }
     writer.WriteLine(string.Join(";", columnNames.Select(EscapeCsvValue)));
 
-    // 📌 Écrire les données
-    foreach (var row in rows)
+    // 2️⃣ Parcourir toutes les lignes et écrire directement
+    for (int r = 1; r <= rowCount; r++)
     {
-        var line = string.Join(";", row.Select(EscapeCsvValue));
-        writer.WriteLine(line);
+        var values = new List<string>();
+        foreach (var col in columnNames)
+        {
+            var value = sql.GetValueUsingColName(r, col, 1, 1);
+            values.Add(EscapeCsvValue(value));
+        }
+        writer.WriteLine(string.Join(";", values));
     }
+
+    Console.WriteLine($"✅ Export terminé : {tableName} ({rowCount} lignes)");
+}
+
+private string EscapeCsvValue(object value)
+{
+    if (value == null) return "";
+    var str = value.ToString();
+    if (str.Contains(";") || str.Contains("\""))
+        str = "\"" + str.Replace("\"", "\"\"") + "\"";
+    return str;
 }
