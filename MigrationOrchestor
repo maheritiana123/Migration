@@ -1,166 +1,166 @@
-public class MigrationOrchestrator
-{
-    private readonly HashSet<string> _pureRelations;
-    private readonly HashSet<string> _extendedRelations;
-    private readonly HashSet<string> _importedTables = new();
-    private readonly Dictionary<string, Dictionary<string, string>> _idMappings;
+  public class MigrationOrchestrator
+  {
+      private readonly HashSet<string> _pureRelations;
+      private readonly HashSet<string> _extendedRelations;
+      private readonly HashSet<string> _importedTables = new HashSet<string>();
+      private readonly Dictionary<string, Dictionary<object, object>> _idMappings;
 
-    private readonly Func<string, List<ForeignKeyInfo>> _getForeignKeyInfo;
-    private readonly Action<string> _importTable;
-    private readonly Action<string> _importPureRelationTable;
-    private readonly Action<string> _importExtendedRelationTable;
-    private readonly Func<List<string>> _getAllTables;
+      private readonly Func<string, List<ForeignKeyInfo>> _getForeignKeyInfo;
+      private readonly Action<string> _importTable;
+      private readonly Action<string> _importPureRelationTable;
+      private readonly Action<string> _importExtendedRelationTable;
+      private readonly Func<List<string>> _getAllTables;
 
-    public MigrationOrchestrator(
-        HashSet<string> pureRelations,
-        HashSet<string> extendedRelations,
-        Dictionary<string, Dictionary<string, string>> idMappings,
-        Func<string, List<ForeignKeyInfo>> getForeignKeyInfo,
-        Action<string> importTable,
-        Action<string> importPureRelationTable,
-        Action<string> importExtendedRelationTable,
-        Func<List<string>> getAllTables)
-    {
-        _pureRelations = pureRelations;
-        _extendedRelations = extendedRelations;
-        _idMappings = idMappings;
-        _getForeignKeyInfo = getForeignKeyInfo;
-        _importTable = importTable;
-        _importPureRelationTable = importPureRelationTable;
-        _importExtendedRelationTable = importExtendedRelationTable;
-        _getAllTables = getAllTables;
-    }
+      public MigrationOrchestrator(
+        HashSet<string> pureRelations,
+        HashSet<string> extendedRelations,
+        Dictionary<string, Dictionary<object, object>> idMappings,
+        Func<string, List<ForeignKeyInfo>> getForeignKeyInfo,
+        Action<string> importTable,
+        Action<string> importPureRelationTable,
+        Action<string> importExtendedRelationTable,
+        Func<List<string>> getAllTables)
+      {
+          _pureRelations = pureRelations;
+          _extendedRelations = extendedRelations;
+          _idMappings = idMappings;
+          _getForeignKeyInfo = getForeignKeyInfo;
+          _importTable = importTable;
+          _importPureRelationTable = importPureRelationTable;
+          _importExtendedRelationTable = importExtendedRelationTable;
+          _getAllTables = getAllTables;
+      }
 
-    private class TableImportInfo
-    {
-        public string Name { get; set; }
-        public bool IsPureRelation { get; set; }
-        public bool IsExtendedRelation { get; set; }
-        public List<string> ForeignKeys { get; set; }
-    }
+      private class TableImportInfo
+      {
+          public string Name { get; set; }
+          public bool IsPureRelation { get; set; }
+          public bool IsExtendedRelation { get; set; }
+          public List<string> ForeignKeys { get; set; }
+      }
 
-    public void PerformGlobalImport()
-    {
-        var graph = BuildImportGraph();
-        var ordered = GetOrderedImportList(graph);
-        ImportAllInOrder(ordered);
-    }
+      public void PerformGlobalImport()
+      {
+          var graph = BuildImportGraph();
+          var ordered = GetOrderedImportList(graph);
+          ImportAllInOrder(ordered);
+      }
 
-    private List<TableImportInfo> BuildImportGraph()
-    {
-        var result = new List<TableImportInfo>();
-        var allTables = _getAllTables();
+      private List<TableImportInfo> BuildImportGraph()
+      {
+          var result = new List<TableImportInfo>();
+          var allTables = _getAllTables();
 
-        foreach (var table in allTables)
-        {
-            result.Add(new TableImportInfo
-            {
-                Name = table,
-                IsPureRelation = _pureRelations.Contains(table),
-                IsExtendedRelation = _extendedRelations.Contains(table),
-                ForeignKeys = _getForeignKeyInfo(table).Select(fk => fk.ReferencedTableName).ToList()
-            });
-        }
+          foreach (var table in allTables)
+          {
+              result.Add(new TableImportInfo
+              {
+                  Name = table,
+                  IsPureRelation = _pureRelations.Contains(table),
+                  IsExtendedRelation = _extendedRelations.Contains(table),
+                  ForeignKeys = _getForeignKeyInfo(table).Select(fk => fk.ReferencedTableName).ToList()
+              });
+          }
 
-        return result;
-    }
+          return result;
+      }
 
-    private List<TableImportInfo> GetOrderedImportList(List<TableImportInfo> graph)
-    {
-        var ordered = new List<TableImportInfo>();
-        var visited = new HashSet<string>();
-        var tempMark = new HashSet<string>();
-        var pathStack = new Stack<string>();
-        var cycles = new List<List<string>>();
+      private List<TableImportInfo> GetOrderedImportList(List<TableImportInfo> graph)
+      {
+          var ordered = new List<TableImportInfo>();
+          var visited = new HashSet<string>();
+          var tempMark = new HashSet<string>();
+          var pathStack = new Stack<string>();
+          var cycles = new List<List<string>>();
 
-        void Visit(TableImportInfo table)
-        {
-            if (visited.Contains(table.Name)) return;
+          void Visit(TableImportInfo table)
+          {
+              if (visited.Contains(table.Name)) return;
 
-            if (tempMark.Contains(table.Name))
-            {
-                var cycle = pathStack.Reverse().TakeWhile(t => t != table.Name).Reverse().ToList();
-                cycle.Add(table.Name);
-                Console.WriteLine("🔁 Cycle détecté : " + string.Join(" ➝ ", cycle));
-                cycles.Add(cycle);
-                return;
-            }
+              if (tempMark.Contains(table.Name))
+              {
+                  var cycle = pathStack.Reverse().TakeWhile(t => t != table.Name).Reverse().ToList();
+                  cycle.Add(table.Name);
+                  Console.WriteLine("🔁 Cycle détecté : " + string.Join(" ➝ ", cycle));
+                  cycles.Add(cycle);
+                  return;
+              }
 
-            tempMark.Add(table.Name);
-            pathStack.Push(table.Name);
+              tempMark.Add(table.Name);
+              pathStack.Push(table.Name);
 
-            foreach (var fk in table.ForeignKeys)
-            {
-                var dep = graph.FirstOrDefault(t => t.Name == fk);
-                if (dep != null)
-                    Visit(dep);
-            }
+              foreach (var fk in table.ForeignKeys)
+              {
+                  var dep = graph.FirstOrDefault(t => t.Name == fk);
+                  if (dep != null)
+                      Visit(dep);
+              }
 
-            pathStack.Pop();
-            tempMark.Remove(table.Name);
-            visited.Add(table.Name);
-            ordered.Add(table);
-        }
+              pathStack.Pop();
+              tempMark.Remove(table.Name);
+              visited.Add(table.Name);
+              ordered.Add(table);
+          }
 
-        foreach (var table in graph)
-        {
-            Visit(table);
-        }
+          foreach (var table in graph)
+          {
+              Visit(table);
+          }
 
-        if (cycles.Count > 0)
-        {
-            Console.WriteLine("⚠️ Cycle(s) détecté(s) : " + cycles.Count);
-        }
+          if (cycles.Count > 0)
+          {
+              Console.WriteLine("⚠️ Cycle(s) détecté(s) : " + cycles.Count);
+          }
 
-        return ordered;
-    }
+          return ordered;
+      }
 
-    private void ImportAllInOrder(List<TableImportInfo> importList)
-    {
-        var remaining = new List<TableImportInfo>(importList);
-        int pass = 1;
+      private void ImportAllInOrder(List<TableImportInfo> importList)
+      {
+          var remaining = new List<TableImportInfo>(importList);
+          int pass = 1;
 
-        while (remaining.Count > 0)
-        {
-            var skipped = new List<TableImportInfo>();
-            Console.WriteLine($"\n🚀 Pass {pass} : {remaining.Count} table(s) à importer");
+          while (remaining.Count > 0)
+          {
+              var skipped = new List<TableImportInfo>();
+              Console.WriteLine($"\n🚀 Pass {pass} : {remaining.Count} table(s) à importer");
 
-            foreach (var table in remaining)
-            {
-                if (_importedTables.Contains(table.Name)) continue;
+              foreach (var table in remaining)
+              {
+                  if (_importedTables.Contains(table.Name)) continue;
 
-                bool ready = table.ForeignKeys.All(fk => _idMappings.ContainsKey(fk));
-                if (!ready)
-                {
-                    Console.WriteLine($"[WAIT] {table.Name} - FK manquantes");
-                    skipped.Add(table);
-                    continue;
-                }
+                  bool ready = table.ForeignKeys.All(fk => _idMappings.ContainsKey(fk));
+                  if (!ready)
+                  {
+                      Console.WriteLine($"[WAIT] {table.Name} - FK manquantes");
+                      skipped.Add(table);
+                      continue;
+                  }
+                  Console.WriteLine($"__________________________________");
+                  Console.WriteLine($"[IMPORT] {table.Name}");
 
-                Console.WriteLine($"[IMPORT] {table.Name}");
+                  if (table.IsPureRelation)
+                      _importPureRelationTable(table.Name);
+                  else if (table.IsExtendedRelation)
+                      _importExtendedRelationTable(table.Name);
+                  else
+                      _importTable(table.Name);
 
-                if (table.IsPureRelation)
-                    _importPureRelationTable(table.Name);
-                else if (table.IsExtendedRelation)
-                    _importExtendedRelationTable(table.Name);
-                else
-                    _importTable(table.Name);
+                  _importedTables.Add(table.Name);
+              }
 
-                _importedTables.Add(table.Name);
-            }
+              if (skipped.Count == remaining.Count)
+              {
+                  Console.WriteLine("❌ Aucun progrès possible à cette passe. Import bloqué.");
+                  foreach (var table in skipped)
+                      Console.WriteLine($" - {table.Name}");
+                  throw new Exception("Import échoué : dépendances FK non satisfaites.");
+              }
 
-            if (skipped.Count == remaining.Count)
-            {
-                Console.WriteLine("❌ Aucun progrès possible à cette passe. Import bloqué.");
-                foreach (var table in skipped)
-                    Console.WriteLine($" - {table.Name}");
-                throw new Exception("Import échoué : dépendances FK non satisfaites.");
-            }
+              remaining = skipped;
+              pass++;
+          }
 
-            remaining = skipped;
-            pass++;
-        }
-
-        Console.WriteLine("\n✅ Import global terminé !");
-    }
-}
+          Console.WriteLine("\n✅ Import global terminé !");
+      }
+  }
