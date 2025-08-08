@@ -1,47 +1,106 @@
-private string FormatValueForSql(object value, string columnType)
+private string FormatValueForSql(object value, string sqlType)
 {
     if (value == null || value == DBNull.Value)
         return "NULL";
 
-    string strValue = value.ToString();
-
-    if (string.IsNullOrWhiteSpace(strValue) || strValue.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+    var str = value.ToString();
+    if (string.IsNullOrWhiteSpace(str) || str.Equals("NULL", StringComparison.OrdinalIgnoreCase))
         return "NULL";
 
-    // Types texte
-    if (columnType.Contains("char", StringComparison.OrdinalIgnoreCase) ||
-        columnType.Contains("text", StringComparison.OrdinalIgnoreCase) ||
-        columnType.Contains("nchar", StringComparison.OrdinalIgnoreCase) ||
-        columnType.Contains("ntext", StringComparison.OrdinalIgnoreCase) ||
-        columnType.Contains("nvarchar", StringComparison.OrdinalIgnoreCase))
+    sqlType = sqlType ?? string.Empty;
+
+    // TEXT / CHAR types
+    if (sqlType.IndexOf("char", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("text", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("nchar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("ntext", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("nvarchar", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("varchar", StringComparison.OrdinalIgnoreCase) >= 0)
     {
-        return $"'{strValue.Replace("'", "''")}'";
+        return $"'{str.Replace("'", "''")}'";
     }
 
-    // Types date/heure
-    if (columnType.Contains("date", StringComparison.OrdinalIgnoreCase) ||
-        columnType.Contains("time", StringComparison.OrdinalIgnoreCase))
+    // DATETIME / DATE / TIME
+    if (sqlType.IndexOf("datetime", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("date", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("time", StringComparison.OrdinalIgnoreCase) >= 0)
     {
-        return $"'{strValue}'";
+        if (DateTime.TryParse(str, out var dt))
+            return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
+        // fallback : try to keep the raw value quoted (so SQL will TRY_CONVERT if your proc does)
+        return $"'{str.Replace("'", "''")}'";
     }
 
-    // Valeurs numériques ou autres
-    return strValue;
+    // BIT
+    if (sqlType.IndexOf("bit", StringComparison.OrdinalIgnoreCase) >= 0)
+    {
+        if (str == "1" || str.Equals("true", StringComparison.OrdinalIgnoreCase)) return "1";
+        if (str == "0" || str.Equals("false", StringComparison.OrdinalIgnoreCase)) return "0";
+        // fallback
+        return "0";
+    }
+
+    // DECIMAL / NUMERIC / FLOAT / REAL
+    if (sqlType.IndexOf("decimal", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("numeric", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("float", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("real", StringComparison.OrdinalIgnoreCase) >= 0)
+    {
+        if (decimal.TryParse(str, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d))
+            return d.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        // try with current culture then fallback to quoted
+        if (decimal.TryParse(str, out d))
+            return d.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return "NULL";
+    }
+
+    // INTEGER types
+    if (sqlType.IndexOf("int", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("bigint", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("smallint", StringComparison.OrdinalIgnoreCase) >= 0 ||
+        sqlType.IndexOf("tinyint", StringComparison.OrdinalIgnoreCase) >= 0)
+    {
+        if (long.TryParse(str, out var l))
+            return l.ToString();
+        return "NULL";
+    }
+
+    // UNIQUEIDENTIFIER
+    if (sqlType.IndexOf("uniqueidentifier", StringComparison.OrdinalIgnoreCase) >= 0)
+    {
+        // accept GUID as string
+        return $"'{str.Replace("'", "''")}'";
+    }
+
+    // default -> quote as string
+    return $"'{str.Replace("'", "''")}'";
 }
 private (string insertColumns, string insertValues) BuildInsertParameters(Dictionary<string, object> rowDict, string tableName)
 {
-    var columns = new List<string>();
-    var values = new List<string>();
+    // Fixer l'ordre pour éviter tout décalage entre colonnes et valeurs
+    var cols = rowDict.Keys.ToList();
 
-    foreach (var kvp in rowDict)
+    var colList = new List<string>();
+    var valList = new List<string>();
+
+    foreach (var col in cols)
     {
-        string colName = kvp.Key;
-        object colValue = kvp.Value;
-        string colType = GetColumnType(tableName, colName);
+        // si tu as une méthode IsComputedColumn, on peut l'exclure :
+        try
+        {
+            if (IsComputedColumn(tableName, col))
+                continue;
+        }
+        catch
+        {
+            // si IsComputedColumn n'existe pas ou échoue, on continue quand même
+        }
 
-        columns.Add($"[{colName}]");
-        values.Add(FormatValueForSql(colValue, colType));
+        var colType = GetColumnType(tableName, col) ?? string.Empty;
+        colList.Add($"[{col}]");
+        valList.Add(FormatValueForSql(rowDict[col], colType));
     }
 
-    return (string.Join(",", columns), string.Join(",", values));
+    // Garder le même séparateur que tu utilises côté SQL (STRING_SPLIT tolère les espaces grâce au TRIM côté SQL)
+    return (string.Join(", ", colList), string.Join(", ", valList));
 }
