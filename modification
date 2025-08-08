@@ -1,25 +1,71 @@
-CREATE PROCEDURE sp_GetForeignKeyInfo
-    @TableName NVARCHAR(128)
+/******************************************************************************
+ * Procédure [batch_safe_insert_with_type_conversion] :
+ * [batch_safe_insert_with_type_conversion]
+ ******************************************************************************/
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+GO
+
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName NVARCHAR(128),
+    @Columns NVARCHAR(MAX),
+    @Values NVARCHAR(MAX),
+    @HasIdentity BIT = 0
 AS
 BEGIN
     SET NOCOUNT ON;
-
-    SELECT 
-        KCU.COLUMN_NAME,
-        PK.TABLE_NAME AS REFERENCED_TABLE,
-        CASE 
-            WHEN C.IS_NULLABLE = 'YES' THEN 1 ELSE 0
-        END AS IS_NULLABLE
-    FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS RC
-    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU
-        ON KCU.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS TC
-        ON TC.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS PK
-        ON PK.CONSTRAINT_NAME = RC.UNIQUE_CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.COLUMNS C
-        ON C.TABLE_NAME = KCU.TABLE_NAME
-        AND C.COLUMN_NAME = KCU.COLUMN_NAME
-    WHERE KCU.TABLE_NAME = @TableName
-    ORDER BY KCU.ORDINAL_POSITION;
+    
+    DECLARE @sql NVARCHAR(MAX);
+    DECLARE @output TABLE (NewID INT);
+    
+    -- Construire la requête avec TRY_CONVERT pour les dates
+    SET @sql = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
+    
+    IF @HasIdentity = 1
+        SET @sql = @sql + N'OUTPUT INSERTED.' + 
+                  (SELECT TOP 1 COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+                   WHERE TABLE_NAME = @TableName AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1) + ' AS NewID ';
+    
+    -- Conversion sécurisée des valeurs
+    DECLARE @convertedValues NVARCHAR(MAX) = N'';
+    
+    WITH ValueCTE AS (
+        SELECT 
+            value,
+            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        FROM STRING_SPLIT(REPLACE(@Values, '''', ''), ',')
+    )
+    SELECT @convertedValues = @convertedValues + 
+           CASE 
+               WHEN value LIKE '''%''' THEN  -- Chaîne entre guillemets
+                   CASE 
+                       WHEN TRY_CONVERT(DATETIME, REPLACE(value, '''', '')) IS NOT NULL 
+                           THEN 'TRY_CONVERT(DATETIME, ' + value + ')'
+                       WHEN TRY_CONVERT(DECIMAL(18,6), REPLACE(value, '''', '')) IS NOT NULL 
+                           THEN 'TRY_CONVERT(DECIMAL(18,6), ' + value + ')'
+                       ELSE value
+                   END
+               ELSE value  -- Valeurs numériques ou NULL
+           END + ','
+    FROM ValueCTE;
+    
+    -- Supprimer la dernière virgule
+    SET @convertedValues = LEFT(@convertedValues, LEN(@convertedValues) - 1);
+    
+    SET @sql = @sql + N'SELECT ' + @convertedValues;
+    
+    BEGIN TRY
+        IF @HasIdentity = 1
+            INSERT INTO @output EXEC sp_executesql @sql;
+        ELSE
+            EXEC sp_executesql @sql;
+            
+        SELECT NewID FROM @output;
+    END TRY
+    BEGIN CATCH
+        SELECT 
+            NULL AS NewID,
+            ERROR_MESSAGE() AS ErrorMessage;
+    END CATCH
 END
+GO
