@@ -1,6 +1,193 @@
-private void ExportTableToCsv(string tableName)
+private void ImportTable(string tableName)
 {
-    var query = $"SELECT * FROM [{tableName}]";
+    Console.WriteLine($"▶️ Import de la table : {tableName}");
+
+    var csvPath = Path.Combine(_importDirectory, $"{tableName}.csv");
+    if (!File.Exists(csvPath))
+    {
+        Console.WriteLine($"⚠ Fichier CSV introuvable pour {tableName}, import ignoré.");
+        return;
+    }
+
+    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+    if (lines.Length <= 1)
+    {
+        Console.WriteLine($"⚠ CSV vide pour {tableName}");
+        return;
+    }
+
+    // 📌 Lecture de l'en-tête
+    var headers = lines[0].Split(';').Select(h => h.Trim()).ToArray();
+
+    // 📌 Récupération de la structure réelle de la table en base
+    var tableColumns = GetTableColumnNames(tableName);
+
+    // 📌 Mapping CSV -> index
+    var headerMap = headers
+        .Select((name, idx) => new { name, idx })
+        .ToDictionary(x => x.name, x => x.idx, StringComparer.OrdinalIgnoreCase);
+
+    ExecuteInTransaction(() =>
+    {
+        // 📌 Boucle sur toutes les lignes de données
+        for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
+        {
+            var cells = lines[lineIndex].Split(';');
+
+            // 🔹 Construction des valeurs pour les colonnes existantes
+            var insertValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var col in tableColumns)
+            {
+                if (headerMap.TryGetValue(col, out var csvIndex) && csvIndex < cells.Length)
+                {
+                    insertValues[col] = string.IsNullOrEmpty(cells[csvIndex]) ? null : cells[csvIndex];
+                }
+                else
+                {
+                    // Colonne manquante dans le CSV → NULL
+                    insertValues[col] = null;
+                }
+            }
+
+            // 📌 Mapping des FK par nom de colonne
+            var fkInfos = GetForeignKeyInfo(tableName);
+            foreach (var fk in fkInfos)
+            {
+                if (insertValues.TryGetValue(fk.ColumnName, out var val) && !string.IsNullOrEmpty(val))
+                {
+                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var mapping) &&
+                        mapping.TryGetValue(val, out var newId))
+                    {
+                        insertValues[fk.ColumnName] = newId;
+                    }
+                    else
+                    {
+                        // Si FK non trouvée mais nullable → mettre NULL
+                        if (fk.IsNullable)
+                            insertValues[fk.ColumnName] = null;
+                        else
+                            throw new Exception($"[Erreur FK] Valeur '{val}' introuvable pour {fk.ColumnName} dans {tableName}");
+                    }
+                }
+            }
+
+            // 📌 Construction de la requête INSERT
+            var colNames = string.Join(", ", insertValues.Keys.Select(c => $"[{c}]"));
+            var colValues = string.Join(", ", insertValues.Values.Select(v => v == null ? "NULL" : $"'{v.Replace("'", "''")}'"));
+
+            var insertSql = $"INSERT INTO [{tableName}] ({colNames}) VALUES ({colValues})";
+
+            // 📌 Exécution via ton framework maison
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
+            sql.AddDirectRequest(insertSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
+        }
+    });
+}
+private void ImportPureRelationTable(string tableName)
+{
+    Console.WriteLine($"▶️ Import de la relation pure : {tableName}");
+    ImportTableCommon(tableName, isPureRelation: true);
+}
+
+private void ImportExtendedRelationTable(string tableName)
+{
+    Console.WriteLine($"▶️ Import de la relation étendue : {tableName}");
+    ImportTableCommon(tableName, isPureRelation: false);
+}
+private void ImportTableCommon(string tableName, bool isPureRelation)
+{
+    var csvPath = Path.Combine(_importDirectory, $"{tableName}.csv");
+    if (!File.Exists(csvPath))
+    {
+        Console.WriteLine($"⚠ Fichier CSV introuvable pour {tableName}, import ignoré.");
+        return;
+    }
+
+    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+    if (lines.Length <= 1)
+    {
+        Console.WriteLine($"⚠ CSV vide pour {tableName}");
+        return;
+    }
+
+    // 📌 Lecture de l'en-tête
+    var headers = lines[0].Split(';').Select(h => h.Trim()).ToArray();
+
+    // 📌 Colonnes réelles de la table en base
+    var tableColumns = GetTableColumnNames(tableName);
+
+    // 📌 Mapping nom colonne CSV -> index
+    var headerMap = headers
+        .Select((name, idx) => new { name, idx })
+        .ToDictionary(x => x.name, x => x.idx, StringComparer.OrdinalIgnoreCase);
+
+    ExecuteInTransaction(() =>
+    {
+        for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
+        {
+            var cells = lines[lineIndex].Split(';');
+
+            var insertValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var col in tableColumns)
+            {
+                if (headerMap.TryGetValue(col, out var csvIndex) && csvIndex < cells.Length)
+                {
+                    insertValues[col] = string.IsNullOrEmpty(cells[csvIndex]) ? null : cells[csvIndex];
+                }
+                else
+                {
+                    insertValues[col] = null;
+                }
+            }
+
+            // 📌 Mapping FK (même logique pour pure/étendue)
+            var fkInfos = GetForeignKeyInfo(tableName);
+            foreach (var fk in fkInfos)
+            {
+                if (insertValues.TryGetValue(fk.ColumnName, out var val) && !string.IsNullOrEmpty(val))
+                {
+                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var mapping) &&
+                        mapping.TryGetValue(val, out var newId))
+                    {
+                        insertValues[fk.ColumnName] = newId;
+                    }
+                    else
+                    {
+                        if (fk.IsNullable)
+                            insertValues[fk.ColumnName] = null;
+                        else
+                            throw new Exception($"[Erreur FK] Valeur '{val}' introuvable pour {fk.ColumnName} dans {tableName}");
+                    }
+                }
+            }
+
+            // 📌 Construction INSERT
+            var colNames = string.Join(", ", insertValues.Keys.Select(c => $"[{c}]"));
+            var colValues = string.Join(", ", insertValues.Values.Select(v => v == null ? "NULL" : $"'{v.Replace("'", "''")}'"));
+            var insertSql = $"INSERT INTO [{tableName}] ({colNames}) VALUES ({colValues})";
+
+            // 📌 Exécution via framework maison
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
+            sql.AddDirectRequest(insertSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
+        }
+    });
+}
+private List<string> GetTableColumnNames(string tableName)
+{
+    var query = $@"
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{tableName}'
+        ORDER BY ORDINAL_POSITION
+    ";
 
     DynamicSql sql = new DynamicSql();
     sql.Dsn = "PXE1_PXE";
@@ -8,47 +195,15 @@ private void ExportTableToCsv(string tableName)
     sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
     sql.Execute(30000);
 
-    int colCount = sql.ReturnedCols(1, 1);
-    int rowCount = sql.ReturnedRows(1, 1);
+    var colCount = sql.ReturnedRows(1, 1);
+    var result = new List<string>();
 
-    if (rowCount == 0)
+    for (int r = 1; r <= colCount; r++)
     {
-        Console.WriteLine($"⚠ Table vide : {tableName}");
-        return;
+        var colName = sql.GetValueUsingColName(r, "COLUMN_NAME", 1, 1);
+        if (!string.IsNullOrEmpty(colName))
+            result.Add(colName);
     }
 
-    var csvPath = Path.Combine(_exportDirectory, $"{tableName}.csv");
-
-    using var writer = new StreamWriter(csvPath, false, Encoding.UTF8);
-
-    // 1️⃣ Récupérer l’en-tête
-    var columnNames = new List<string>();
-    for (int c = 1; c <= colCount; c++)
-    {
-        columnNames.Add(sql.GetColName(c, 1, 1));
-    }
-    writer.WriteLine(string.Join(";", columnNames.Select(EscapeCsvValue)));
-
-    // 2️⃣ Parcourir toutes les lignes et écrire directement
-    for (int r = 1; r <= rowCount; r++)
-    {
-        var values = new List<string>();
-        foreach (var col in columnNames)
-        {
-            var value = sql.GetValueUsingColName(r, col, 1, 1);
-            values.Add(EscapeCsvValue(value));
-        }
-        writer.WriteLine(string.Join(";", values));
-    }
-
-    Console.WriteLine($"✅ Export terminé : {tableName} ({rowCount} lignes)");
-}
-
-private string EscapeCsvValue(object value)
-{
-    if (value == null) return "";
-    var str = value.ToString();
-    if (str.Contains(";") || str.Contains("\""))
-        str = "\"" + str.Replace("\"", "\"\"") + "\"";
-    return str;
+    return result;
 }
