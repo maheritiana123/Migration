@@ -1,17 +1,56 @@
-private string GetIdentityColumn(string tableName)
+public void PerformMigration()
 {
-    var query = $@"
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = '{tableName}'
-        AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
-    ";
+    GetAllTables();
 
-    DynamicSql sql = new DynamicSql();
-    sql.Dsn = "PXE1_PXE";
-    sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(30000);
+    BeginTransaction();
+    try
+    {
+        Console.WriteLine("=== 📤 Import des tables mères ===");
+        foreach (var table in SortTablesByDependencies(_importOrder))
+            ImportTableCommon(table);
 
-    return sql.ReturnedRows(1, 1) > 0 ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1) : null;
+        Console.WriteLine("=== 📤 Import des relations pures ===");
+        foreach (var table in SortTablesByDependencies(_pureRelations))
+            ImportTableCommon(table);
+
+        Console.WriteLine("=== 📤 Import des relations étendues ===");
+        foreach (var table in SortTablesByDependencies(_extendedRelations))
+            ImportTableCommon(table);
+
+        CommitTransaction();
+        Console.WriteLine("✅ Migration terminée avec succès !");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Erreur critique lors de la migration : {ex.Message}");
+        RollbackTransaction();
+    }
+}
+private List<string> SortTablesByDependencies(List<string> tables)
+{
+    var sorted = new List<string>();
+    var visited = new HashSet<string>();
+
+    void Visit(string table)
+    {
+        if (visited.Contains(table))
+            return;
+
+        visited.Add(table);
+
+        var fks = GetForeignKeyInfo(table)
+            .Where(fk => tables.Contains(fk.ReferencedTableName))
+            .Select(fk => fk.ReferencedTableName)
+            .Distinct();
+
+        foreach (var dep in fks)
+            Visit(dep);
+
+        sorted.Add(table);
+    }
+
+    foreach (var table in tables)
+        Visit(table);
+
+    return sorted;
 }
