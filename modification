@@ -1,15 +1,14 @@
-private void GetAllTables()
+private List<string> GetPrimaryKeyColumns(string tableName)
 {
-    _importOrder.Clear();
-    _pureRelations.Clear();
-    _extendedRelations.Clear();
-
-    var query = @"
-        SELECT TABLE_NAME 
-        FROM INFORMATION_SCHEMA.TABLES 
-        WHERE TABLE_TYPE = 'BASE TABLE'
-        ORDER BY TABLE_NAME
+    var query = $@"
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_NAME = '{tableName}'
+        AND OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_NAME), 'IsPrimaryKey') = 1
+        ORDER BY ORDINAL_POSITION
     ";
+
+    var pkColumns = new List<string>();
 
     DynamicSql sql = new DynamicSql();
     sql.Dsn = "PXE1_PXE";
@@ -18,38 +17,10 @@ private void GetAllTables()
     sql.Execute(30000);
 
     var rowCount = sql.ReturnedRows(1, 1);
-
     for (int i = 1; i <= rowCount; i++)
     {
-        var tableName = sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1);
-
-        // Ignorer si table dans la liste noire
-        if (_ignoredTables.Contains(tableName, StringComparer.OrdinalIgnoreCase))
-            continue;
-
-        // Analyse de la structure
-        var columns = GetTableColumnNames(tableName);
-        var fks = GetForeignKeyInfo(tableName);
-        var pkColumns = GetPrimaryKeyColumns(tableName);
-
-        if (fks.Count == 2 && columns.Count == 2 && pkColumns.Count == 2)
-        {
-            // Relation pure (2 FK uniquement)
-            _pureRelations.Add(tableName);
-        }
-        else if (fks.Count >= 1 && columns.Count > fks.Count)
-        {
-            // Relation étendue (FK + colonnes supplémentaires)
-            _extendedRelations.Add(tableName);
-        }
-        else
-        {
-            // Table normale
-            _importOrder.Add(tableName);
-        }
+        pkColumns.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
     }
 
-    Console.WriteLine($"📋 Tables normales : {_importOrder.Count}");
-    Console.WriteLine($"📋 Relations pures : {_pureRelations.Count}");
-    Console.WriteLine($"📋 Relations étendues : {_extendedRelations.Count}");
+    return pkColumns;
 }
