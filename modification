@@ -4,7 +4,7 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
     Console.WriteLine($"Import table {tableName}");
 
     string csvPath = Path.Combine(
-        _importPath, 
+        _importPath,
         $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv"
     );
 
@@ -25,12 +25,10 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
     var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
 
     // Info PK, FK, Identity
-    var pkColumns = GetPrimaryKeyColumn(tableName);
     var identityColumn = GetIdentityColumn(tableName);
     var fkInfos = GetForeignKeyInfo(tableName);
 
     bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-
     Console.WriteLine($"{lines.Length - 1} lignes à importer");
 
     for (int i = 1; i < lines.Length; i++)
@@ -41,15 +39,15 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
         var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
                                  .ToDictionary(x => x.col, x => x.val);
 
-        // Si table avec IDENTITY → on retire la colonne IDENTITY de l'insert
+        // Stocker l'ancien ID si table à IDENTITY
         string oldId = null;
         if (hasIdentity && rowDict.ContainsKey(identityColumn))
         {
             oldId = rowDict[identityColumn];
-            rowDict.Remove(identityColumn);
+            rowDict.Remove(identityColumn); // ❌ On ne réinsère pas l'IDENTITY
         }
 
-        // Remplacement des FK par les nouveaux IDs
+        // 🔹 Remplacement des FK par les nouveaux IDs
         foreach (var fk in fkInfos)
         {
             if (forceNullFK)
@@ -77,10 +75,18 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
             }
         }
 
-        // Colonnes & valeurs formatées
-        var (insertColumns, insertValues) = BuildInsertParameters(rowDict, tableName);
+        // 🔹 Colonnes formatées
+        var insertColumns = string.Join(", ", rowDict.Keys.Select(c => $"[{c}]"));
 
-        // Appel de la procédure stockée
+        // 🔹 Valeurs formatées en fonction du type SQL
+        var insertValues = string.Join(", ",
+            rowDict.Select(kv => FormatValueForSql(kv.Value, GetColumnType(tableName, kv.Key)))
+        );
+
+        // DEBUG (optionnel)
+        // Console.WriteLine($"[DEBUG] {tableName} -> {insertColumns} VALUES {insertValues}");
+
+        // 🔹 Appel à la procédure stockée
         DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
 
         string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
@@ -97,35 +103,81 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
 
         sql.Execute();
 
-        // Gestion du mapping des IDs générés
-        if (hasIdentity)
+        // 🔹 Gestion du retour
+        string newId = sql.GetValueUsingColName(1, "NewID", 1, 1);
+        string errMsg = sql.GetValueUsingColName(1, "ErrorMessage", 1, 1);
+
+        if (!string.IsNullOrEmpty(errMsg))
         {
-            string newId = sql.GetValueUsingColName(1, "NewID", 1, 1);
+            Console.WriteLine($"⚠ Erreur insertion {tableName} (ancienne ID: {oldId ?? "-"}) → {errMsg}");
+        }
 
-            if (string.IsNullOrEmpty(newId))
-            {
-                string errMsg = sql.GetValueUsingColName(1, "ErrorMessage", 1, 1);
-                Console.WriteLine($"⚠ Aucun NewID retourné pour {tableName} (ancienne ID: {oldId}) → {errMsg}");
-            }
-            else if (!string.IsNullOrEmpty(oldId))
-            {
-                if (!_idMappings.ContainsKey(tableName))
-                    _idMappings[tableName] = new Dictionary<string, string>();
+        if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+        {
+            if (!_idMappings.ContainsKey(tableName))
+                _idMappings[tableName] = new Dictionary<string, string>();
 
-                _idMappings[tableName][oldId] = newId;
-            }
+            _idMappings[tableName][oldId] = newId;
         }
     }
+}
+private string FormatValueForSql(string value, string sqlType)
+{
+    if (string.IsNullOrEmpty(value) || value.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+        return "NULL";
+
+    switch (sqlType.ToLower())
+    {
+        case "int":
+        case "bigint":
+        case "smallint":
+        case "tinyint":
+        case "decimal":
+        case "numeric":
+        case "float":
+        case "real":
+            return value.Replace(",", "."); // décimal invariant
+
+        case "bit":
+            return (value == "1" || value.ToLower() == "true") ? "1" : "0";
+
+        case "datetime":
+        case "smalldatetime":
+        case "date":
+        case "time":
+            if (DateTime.TryParse(value, out var dt))
+                return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
+            return "NULL";
+
+        default:
+            // Chaîne → échapper les quotes simples
+            return $"'{value.Replace("'", "''")}'";
+    }
+}
+private string GetColumnType(string tableName, string columnName)
+{
+    // Requête pour interroger INFORMATION_SCHEMA
+    DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+    string request = @"SELECT DATA_TYPE 
+                       FROM INFORMATION_SCHEMA.COLUMNS 
+                       WHERE TABLE_NAME = $table$ 
+                         AND COLUMN_NAME = $col$";
+    sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    sql.SetSecureParam("table", tableName, true, 0);
+    sql.SetSecureParam("col", columnName, true, 0);
+    sql.Execute();
+
+    return sql.GetValueUsingColName(1, "DATA_TYPE", 1, 1);
 }
 IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
     DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
 GO
 
 CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName NVARCHAR(128),
-    @Columns NVARCHAR(MAX),
-    @Values NVARCHAR(MAX),
-    @HasIdentity BIT = 0
+    @TableName NVARCHAR(128),    -- Nom de la table
+    @Columns NVARCHAR(MAX),      -- Liste des colonnes déjà formatée : [Col1],[Col2],...
+    @Values NVARCHAR(MAX),       -- Liste des valeurs déjà formatée : 'val1',NULL,123,...
+    @HasIdentity BIT = 0         -- 1 si table avec colonne IDENTITY
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -134,7 +186,7 @@ BEGIN
     DECLARE @identityCol NVARCHAR(128);
     DECLARE @output TABLE (NewID INT);
 
-    -- 🔹 Détection de la colonne IDENTITY
+    -- Si IDENTITY demandé, chercher la colonne
     IF @HasIdentity = 1
     BEGIN
         SELECT TOP 1 @identityCol = COLUMN_NAME
@@ -142,7 +194,6 @@ BEGIN
         WHERE TABLE_NAME = @TableName
           AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
 
-        -- Si aucune colonne IDENTITY trouvée alors qu'on a @HasIdentity = 1
         IF @identityCol IS NULL
         BEGIN
             SELECT NULL AS NewID, 'Aucune colonne IDENTITY trouvée pour cette table' AS ErrorMessage;
@@ -150,38 +201,14 @@ BEGIN
         END
     END
 
-    -- 🔹 Construction requête d'insertion
+    -- Construire la requête d'INSERT
     SET @sql = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
 
+    -- Ajout de l'OUTPUT si IDENTITY
     IF @HasIdentity = 1
         SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@identityCol) + ' AS NewID ';
 
-    -- Conversion sécurisée des valeurs
-    DECLARE @convertedValues NVARCHAR(MAX) = N'';
-
-    WITH ValueCTE AS (
-        SELECT 
-            value,
-            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
-        FROM STRING_SPLIT(REPLACE(@Values, '''', ''), ',')
-    )
-    SELECT @convertedValues = @convertedValues + 
-           CASE 
-               WHEN value LIKE '''%''' THEN
-                   CASE 
-                       WHEN TRY_CONVERT(DATETIME, REPLACE(value, '''', '')) IS NOT NULL 
-                           THEN 'TRY_CONVERT(DATETIME, ' + value + ')'
-                       WHEN TRY_CONVERT(DECIMAL(18,6), REPLACE(value, '''', '')) IS NOT NULL 
-                           THEN 'TRY_CONVERT(DECIMAL(18,6), ' + value + ')'
-                       ELSE value
-                   END
-               ELSE value
-           END + ','
-    FROM ValueCTE;
-
-    SET @convertedValues = LEFT(@convertedValues, LEN(@convertedValues) - 1);
-
-    SET @sql += N'SELECT ' + @convertedValues;
+    SET @sql += N'SELECT ' + @Values;
 
     BEGIN TRY
         IF @HasIdentity = 1
@@ -189,7 +216,7 @@ BEGIN
         ELSE
             EXEC sp_executesql @sql;
 
-        -- 🔹 Vérification du résultat
+        -- Retourner l'ID généré si présent
         IF @HasIdentity = 1
         BEGIN
             IF NOT EXISTS (SELECT 1 FROM @output)
@@ -197,15 +224,13 @@ BEGIN
                 SELECT NULL AS NewID, 'INSERT effectué mais aucun IDENTITY retourné' AS ErrorMessage;
                 RETURN;
             END
-            ELSE
-            BEGIN
-                SELECT NewID, NULL AS ErrorMessage FROM @output;
-                RETURN;
-            END
+
+            SELECT NewID, NULL AS ErrorMessage FROM @output;
+            RETURN;
         END
         ELSE
         BEGIN
-            SELECT NULL AS NewID, NULL AS ErrorMessage; -- Pas d'IDENTITY à retourner
+            SELECT NULL AS NewID, NULL AS ErrorMessage; -- Pas d'IDENTITY
             RETURN;
         END
     END TRY
