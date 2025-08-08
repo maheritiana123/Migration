@@ -1,1 +1,203 @@
- Erreur insertion VarEnv (ancienne ID: 1) ␦ Violation de la contrainte UNIQUE KEY « UniqueVENom ». Impossible d'insérer une clé en double dans l'objet « dbo.VarEnv ». Valeur de clé dupliquée : (WPNumStat).
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
+GO
+
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName NVARCHAR(128),
+    @Columns NVARCHAR(MAX),
+    @Values NVARCHAR(MAX),
+    @HasIdentity BIT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @sql NVARCHAR(MAX);
+    DECLARE @identityCol NVARCHAR(128);
+    DECLARE @pkCols NVARCHAR(MAX) = '';
+    DECLARE @whereClause NVARCHAR(MAX) = '';
+    DECLARE @output TABLE (NewID INT);
+
+    -- Récupérer colonne IDENTITY si applicable
+    IF @HasIdentity = 1
+    BEGIN
+        SELECT TOP 1 @identityCol = COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @TableName
+          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
+    END
+
+    -- Récupérer colonnes PK ou UK (hors IDENTITY)
+    SELECT @pkCols = STRING_AGG(QUOTENAME(c.COLUMN_NAME), ',')
+    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
+        ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+       AND tc.TABLE_NAME = c.TABLE_NAME
+    WHERE tc.TABLE_NAME = @TableName
+      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+      AND c.COLUMN_NAME <> ISNULL(@identityCol, '');
+
+    -- Construire WHERE si PK/UK trouvées
+    IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
+    BEGIN
+        DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
+        DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
+
+        -- Découper colonnes et valeurs
+        INSERT INTO @colList
+        SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(REPLACE(@Columns, '[', ''), '],')
+        WHERE RTRIM(LTRIM(value)) <> '';
+
+        INSERT INTO @valList
+        SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@Values, ',')
+        WHERE RTRIM(LTRIM(value)) <> '';
+
+        -- Associer colonnes PK avec leurs valeurs
+        SELECT @whereClause = COALESCE(@whereClause + ' AND ', '') + QUOTENAME(c.ColName) + ' = ' + v.Val
+        FROM @colList c
+        JOIN @valList v ON c.Ord = v.Ord
+        WHERE c.ColName IN (SELECT REPLACE(REPLACE(p, '[', ''), ']', '') FROM STRING_SPLIT(@pkCols, ','));
+    END
+
+    -- Vérification du doublon
+    IF LEN(@whereClause) > 0
+    BEGIN
+        SET @sql = N'SELECT 1 FROM ' + QUOTENAME(@TableName) + ' WHERE ' + @whereClause;
+        IF EXISTS (EXEC sp_executesql @sql)
+        BEGIN
+            SELECT NULL AS NewID, 'Doublon détecté sur clé unique/PK' AS ErrorMessage;
+            RETURN;
+        END
+    END
+
+    -- Insertion
+    SET @sql = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
+    IF @HasIdentity = 1
+        SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@identityCol) + ' AS NewID ';
+    SET @sql += N'SELECT ' + @Values;
+
+    BEGIN TRY
+        IF @HasIdentity = 1
+            INSERT INTO @output EXEC sp_executesql @sql;
+        ELSE
+            EXEC sp_executesql @sql;
+
+        IF @HasIdentity = 1
+            SELECT NewID, NULL AS ErrorMessage FROM @output;
+        ELSE
+            SELECT NULL AS NewID, NULL AS ErrorMessage;
+    END TRY
+    BEGIN CATCH
+        SELECT NULL AS NewID, ERROR_MESSAGE() AS ErrorMessage;
+    END CATCH
+END
+GO
+private void ImportTableCommon(string tableName, bool forceNullFK = false)
+{
+    Console.WriteLine("_______________________");
+    Console.WriteLine($"Import table {tableName}");
+
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath))
+    {
+        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
+        return;
+    }
+
+    var lines = File.ReadAllLines(csvPath);
+    if (lines.Length < 2)
+    {
+        Console.WriteLine($"⚠ CSV vide : {tableName}");
+        return;
+    }
+
+    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+    var pkColumns = GetPrimaryKeyColumn(tableName);
+    var identityColumn = GetIdentityColumn(tableName);
+    var fkInfos = GetForeignKeyInfo(tableName);
+
+    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+
+    int insertedCount = 0;
+    int duplicateCount = 0;
+
+    Console.WriteLine($"{lines.Length - 1} lignes à importer...");
+
+    for (int i = 1; i < lines.Length; i++)
+    {
+        var values = lines[i].Split(';').ToList();
+
+        var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
+                                 .ToDictionary(x => x.col, x => x.val);
+
+        // Remplacement des FK
+        foreach (var fk in fkInfos)
+        {
+            if (forceNullFK)
+            {
+                rowDict[fk.ColumnName] = "NULL";
+                continue;
+            }
+
+            var oldFkValue = rowDict[fk.ColumnName];
+            if (string.IsNullOrWhiteSpace(oldFkValue))
+                continue;
+
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
+                map.TryGetValue(oldFkValue, out var newFkValue))
+            {
+                rowDict[fk.ColumnName] = newFkValue;
+            }
+            else if (fk.IsNullable)
+            {
+                rowDict[fk.ColumnName] = "NULL";
+            }
+            else
+            {
+                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName}");
+            }
+        }
+
+        // Colonnes & valeurs formatées
+        var (insertColumns, insertValues) = BuildInsertParameters(rowDict, tableName);
+
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
+              @TableName = $table$, 
+              @Columns = $cols$, 
+              @Values = $vals$,
+              @HasIdentity = $identity$";
+
+        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("table", tableName, true, 0);
+        sql.SetSecureParam("cols", insertColumns, true, 0);
+        sql.SetSecureParam("vals", insertValues, true, 0);
+        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
+
+        sql.Execute();
+
+        string newId = hasIdentity ? sql.GetValueUsingColName(1, "NewID", 1, 1) : null;
+        string errorMessage = sql.GetValueUsingColName(1, "ErrorMessage", 1, 1);
+
+        if (!string.IsNullOrEmpty(errorMessage) && errorMessage.Contains("Doublon", StringComparison.OrdinalIgnoreCase))
+        {
+            duplicateCount++;
+            continue; // on ne mappe pas l'ID pour un doublon
+        }
+
+        if (hasIdentity && !string.IsNullOrEmpty(newId))
+        {
+            string oldId = rowDict[identityColumn];
+            if (!_idMappings.ContainsKey(tableName))
+                _idMappings[tableName] = new Dictionary<string, string>();
+
+            _idMappings[tableName][oldId] = newId;
+        }
+
+        insertedCount++;
+    }
+
+    // Résumé de la table
+    Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
+}
