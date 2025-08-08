@@ -1,89 +1,17 @@
-private void ImportTableCommon(string tableName)
+private string GetIdentityColumn(string tableName)
 {
-    var csvPath = Path.Combine(_importDirectory, $"{tableName}.csv");
-    if (!File.Exists(csvPath))
-    {
-        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
-        return;
-    }
+    var query = $@"
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{tableName}'
+        AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1
+    ";
 
-    var lines = File.ReadAllLines(csvPath);
-    if (lines.Length < 2)
-    {
-        Console.WriteLine($"⚠ CSV vide : {tableName}");
-        return;
-    }
+    DynamicSql sql = new DynamicSql();
+    sql.Dsn = "PXE1_PXE";
+    sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+    sql.Execute(30000);
 
-    // Lecture de l'en-tête CSV
-    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-
-    // Info PK & FK
-    var pkColumns = GetPrimaryKeyColumns(tableName);
-    var identityColumn = GetIdentityColumn(tableName);
-    var fkInfos = GetForeignKeyInfo(tableName);
-
-    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-
-    for (int i = 1; i < lines.Length; i++)
-    {
-        var values = lines[i].Split(';').ToList();
-
-        // Mapping colonnes/valeurs
-        var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
-                                 .ToDictionary(x => x.col, x => x.val);
-
-        // 🔹 Remplacement des FK par les nouveaux IDs
-        foreach (var fk in fkInfos)
-        {
-            var oldFkValue = rowDict[fk.ColumnName];
-            if (string.IsNullOrWhiteSpace(oldFkValue))
-                continue;
-
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
-                map.TryGetValue(oldFkValue, out var newFkValue))
-            {
-                rowDict[fk.ColumnName] = newFkValue;
-            }
-            else if (fk.IsNullable)
-            {
-                rowDict[fk.ColumnName] = "NULL";
-            }
-            else
-            {
-                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName}");
-            }
-        }
-
-        // Colonnes pour la procédure
-        var insertColumns = string.Join(",", rowDict.Keys.Select(c => $"[{c}]"));
-        var insertValues = string.Join(",", rowDict.Values.Select(FormatValue));
-
-        // Appel de la procédure stockée
-        var procSql = $"EXEC batch_safe_insert_with_type_conversion " +
-                      $"@TableName = '{tableName}', " +
-                      $"@Columns = '{insertColumns}', " +
-                      $"@Values = '{insertValues}', " +
-                      $"@HasIdentity = {(hasIdentity ? 1 : 0)}";
-
-        DynamicSql sql = new DynamicSql();
-        sql.Dsn = "PXE1_PXE";
-        sql.AddDirectRequest(procSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-
-        // Si IDENTITY → récupérer le mapping
-        if (hasIdentity)
-        {
-            string newId = sql.GetValueUsingColName(1, "NewID", 1, 1);
-            string oldId = rowDict[identityColumn];
-
-            if (!string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
-            {
-                if (!_idMappings.ContainsKey(tableName))
-                    _idMappings[tableName] = new Dictionary<string, string>();
-
-                _idMappings[tableName][oldId] = newId;
-            }
-        }
-    }
+    return sql.ReturnedRows(1, 1) > 0 ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1) : null;
 }
