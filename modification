@@ -1,26 +1,25 @@
-private List<string> GetPrimaryKeyColumns(string tableName)
-{
-    var query = $@"
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-        WHERE TABLE_NAME = '{tableName}'
-        AND OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-        ORDER BY ORDINAL_POSITION
-    ";
+CREATE PROCEDURE sp_GetForeignKeyInfo
+    @TableName NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-    var pkColumns = new List<string>();
-
-    DynamicSql sql = new DynamicSql();
-    sql.Dsn = "PXE1_PXE";
-    sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(30000);
-
-    var rowCount = sql.ReturnedRows(1, 1);
-    for (int i = 1; i <= rowCount; i++)
-    {
-        pkColumns.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
-    }
-
-    return pkColumns;
-}
+    SELECT 
+        KCU.COLUMN_NAME,
+        PK.TABLE_NAME AS REFERENCED_TABLE,
+        CASE 
+            WHEN C.IS_NULLABLE = 'YES' THEN 1 ELSE 0
+        END AS IS_NULLABLE
+    FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS RC
+    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU
+        ON KCU.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
+    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS TC
+        ON TC.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
+    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS PK
+        ON PK.CONSTRAINT_NAME = RC.UNIQUE_CONSTRAINT_NAME
+    INNER JOIN INFORMATION_SCHEMA.COLUMNS C
+        ON C.TABLE_NAME = KCU.TABLE_NAME
+        AND C.COLUMN_NAME = KCU.COLUMN_NAME
+    WHERE KCU.TABLE_NAME = @TableName
+    ORDER BY KCU.ORDINAL_POSITION;
+END
