@@ -5,38 +5,107 @@ public void PerformMigration()
     BeginTransaction();
     try
     {
-        Console.WriteLine("=== 📤 Import des tables mères ===");
-        foreach (var table in SortTablesByDependencies(_importOrder))
-            ImportTableCommon(table);
+        // 1️⃣ Tables normales
+        var (orderedMain, cyclicMain) = SortTablesByDependencies(_importOrder);
+        foreach (var table in orderedMain)
+            ImportTableCommon(table); // insertion normale
 
-        Console.WriteLine("=== 📤 Import des relations pures ===");
-        foreach (var table in SortTablesByDependencies(_pureRelations))
-            ImportTableCommon(table);
+        // 2️⃣ Relations pures
+        var (orderedPure, cyclicPure) = SortTablesByDependencies(_pureRelations);
+        foreach (var table in orderedPure)
+            ImportTableCommon(table); // insertion normale
 
-        Console.WriteLine("=== 📤 Import des relations étendues ===");
-        foreach (var table in SortTablesByDependencies(_extendedRelations))
-            ImportTableCommon(table);
+        // 3️⃣ Relations étendues
+        var (orderedExt, cyclicExt) = SortTablesByDependencies(_extendedRelations);
+        foreach (var table in orderedExt)
+            ImportTableCommon(table); // insertion normale
+
+        // 4️⃣ Gestion des cycles → insertion partielle
+        var cyclicAll = cyclicMain.Concat(cyclicPure).Concat(cyclicExt).Distinct().ToList();
+        foreach (var table in cyclicAll)
+            ImportTableCommon(table, forceNullFK: true);
+
+        // 5️⃣ Mise à jour des FK après coup
+        UpdateCyclicForeignKeys(cyclicAll);
 
         CommitTransaction();
-        Console.WriteLine("✅ Migration terminée avec succès !");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"❌ Erreur critique lors de la migration : {ex.Message}");
+        Console.WriteLine($"❌ Erreur : {ex.Message}");
         RollbackTransaction();
     }
 }
-private List<string> SortTablesByDependencies(List<string> tables)
+private void ImportTableCommon(string tableName, bool forceNullFK = false)
+{
+    // ... lecture CSV et mapping comme avant
+
+    foreach (var fk in fkInfos)
+    {
+        if (forceNullFK)
+        {
+            rowDict[fk.ColumnName] = "NULL";
+            continue;
+        }
+
+        // mapping FK normal
+    }
+
+    // ... appel à la procédure stockée
+}
+private void UpdateCyclicForeignKeys(List<string> cyclicTables)
+{
+    foreach (var table in cyclicTables)
+    {
+        var fkInfos = GetForeignKeyInfo(table);
+        foreach (var fk in fkInfos)
+        {
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map))
+            {
+                foreach (var kvp in map)
+                {
+                    var oldId = kvp.Key;
+                    var newId = kvp.Value;
+                    var updateSql = $"UPDATE [{table}] SET [{fk.ColumnName}] = {newId} WHERE [{fk.ColumnName}] IS NULL AND /* condition sur oldId si dispo */ 1=1";
+
+                    DynamicSql sql = new DynamicSql();
+                    sql.Dsn = "PXE1_PXE";
+                    sql.AddDirectRequest(updateSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                    sql.Execute(30000);
+                }
+            }
+        }
+    }
+}
+private void InsertCyclicTables(List<string> cyclicTables)
+{
+    foreach (var table in cyclicTables)
+    {
+        Console.WriteLine($"⚠ Insertion partielle (FK nullées) : {table}");
+        ImportTableCommon(table, forceNullFK: true);
+    }
+}
+private (List<string> ordered, List<string> cyclicTables) SortTablesByDependencies(List<string> tables)
 {
     var sorted = new List<string>();
     var visited = new HashSet<string>();
+    var visiting = new HashSet<string>();
+    var cyclicTables = new HashSet<string>();
 
     void Visit(string table)
     {
         if (visited.Contains(table))
             return;
 
-        visited.Add(table);
+        if (visiting.Contains(table))
+        {
+            Console.WriteLine($"⚠ Cycle détecté impliquant la table {table}");
+            cyclicTables.Add(table);
+            return;
+        }
+
+        visiting.Add(table);
 
         var fks = GetForeignKeyInfo(table)
             .Where(fk => tables.Contains(fk.ReferencedTableName))
@@ -44,13 +113,123 @@ private List<string> SortTablesByDependencies(List<string> tables)
             .Distinct();
 
         foreach (var dep in fks)
+        {
             Visit(dep);
+        }
 
+        visiting.Remove(table);
+        visited.Add(table);
         sorted.Add(table);
     }
 
     foreach (var table in tables)
         Visit(table);
 
-    return sorted;
+    return (sorted, cyclicTables.ToList());
 }
+// Place ceci dans ta classe DatabaseMigrator
+
+/// <summary>
+/// Formatte une valeur pour la passer à la procédure stockée (texte SQL littéral ou NULL).
+/// Utiliser la surcharge avec sqlType si possible pour plus de précision.
+/// </summary>
+private string FormatValue(string rawValue, string sqlType = null)
+{
+    // Considère NULL ou chaîne vide comme NULL SQL
+    if (string.IsNullOrWhiteSpace(rawValue) || rawValue.Equals("NULL", StringComparison.OrdinalIgnoreCase))
+        return "NULL";
+
+    // Retire guillemets externes éventuels (si déjà encodée)
+    if (rawValue.Length >= 2 && rawValue.StartsWith("'") && rawValue.EndsWith("'"))
+        rawValue = rawValue.Substring(1, rawValue.Length - 2);
+
+    // Normalise
+    rawValue = rawValue.Trim();
+
+    // Si on a le type SQL, on s'en sert en priorité
+    if (!string.IsNullOrEmpty(sqlType))
+    {
+        var t = sqlType.ToLowerInvariant();
+        try
+        {
+            if (t == "int" || t == "smallint" || t == "tinyint")
+            {
+                if (long.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+                    return rawValue;
+            }
+            else if (t == "bigint")
+            {
+                if (long.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+                    return rawValue;
+            }
+            else if (t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney")
+            {
+                if (decimal.TryParse(rawValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var dec))
+                    return dec.ToString(CultureInfo.InvariantCulture);
+            }
+            else if (t == "float" || t == "real")
+            {
+                if (double.TryParse(rawValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var d))
+                    return d.ToString(CultureInfo.InvariantCulture);
+            }
+            else if (t == "bit")
+            {
+                if (rawValue == "1" || rawValue.Equals("true", StringComparison.OrdinalIgnoreCase))
+                    return "1";
+                if (rawValue == "0" || rawValue.Equals("false", StringComparison.OrdinalIgnoreCase))
+                    return "0";
+            }
+            else if (t == "datetime" || t == "datetime2" || t == "smalldatetime")
+            {
+                if (DateTime.TryParse(rawValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var dt))
+                    return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
+            }
+            else if (t == "date")
+            {
+                if (DateTime.TryParse(rawValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var d2))
+                    return $"'{d2:yyyy-MM-dd}'";
+            }
+            else if (t == "uniqueidentifier")
+            {
+                if (Guid.TryParse(rawValue, out _))
+                    return $"'{rawValue}'";
+            }
+            // else -> laisse tomber sur la détection automatique plus bas
+        }
+        catch
+        {
+            // en cas d'erreur de conversion, on tombera sur la détection automatique / chaîne échappée
+        }
+    }
+
+    // Détection automatique si on n'a pas de SQL type fiable
+    // Int
+    if (long.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out _))
+        return rawValue;
+
+    // Decimal / float
+    if (decimal.TryParse(rawValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var dec2))
+        return dec2.ToString(CultureInfo.InvariantCulture);
+
+    // Bool
+    if (rawValue == "1" || rawValue.Equals("true", StringComparison.OrdinalIgnoreCase))
+        return "1";
+    if (rawValue == "0" || rawValue.Equals("false", StringComparison.OrdinalIgnoreCase))
+        return "0";
+
+    // DateTime
+    if (DateTime.TryParse(rawValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var dt2))
+        return $"'{dt2:yyyy-MM-dd HH:mm:ss}'";
+
+    // GUID
+    if (Guid.TryParse(rawValue, out _))
+        return $"'{rawValue}'";
+
+    // Par défaut : chaîne échappée entre quotes
+    return $"'{rawValue.Replace("'", "''")}'";
+}
+
+// Remplacement recommandé (utilise GetColumnType)
+var insertColumns = string.Join(",", rowDict.Keys.Select(c => $"[{c}]"));
+var insertValues = string.Join(",", rowDict.Keys
+    .Select(c => FormatValue(rowDict[c], GetColumnType(tableName, c))));
