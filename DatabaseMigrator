@@ -1,142 +1,79 @@
-using CDM.DevbCommon;
-using CDM.DevbCommon.Toolkit.Gespar;
-using MIDW_CLIENTLib;
-using Newtonsoft.Json;
-using PXELib.BusinessObjects.PXE;
-using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
-using System.Data.Common;
-using System.Data.SqlClient;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Reflection;
-using System.Reflection.PortableExecutable;
-using System.Runtime.Remoting.Messaging;
-using System.Security.Policy;
-using System.Text;
-
-namespace PXE_JOBS.PXE1O003
+public class DatabaseMigrator
 {
-    public class DatabaseMigrator
+    private readonly string _importPath;
+    private readonly HashSet<string> _importedTables;
+    private readonly DynamicSql _transactionSql;
+    private Dictionary<string,HashSet<string>> _uniqueKeyTracker = new Dictionary<string, HashSet<string>>();
+    private readonly HashSet<string> _pureRelations = new HashSet<string>();
+    private readonly HashSet<string> _extendedRelations = new HashSet<string>();
+    private readonly Dictionary<string, Dictionary<object, object>> _idMappings = new Dictionary<string, Dictionary<object, object>>();
+    private readonly HashSet<string> _ignoredTables = new HashSet<string> { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings", "BASE36" };
+
+    public DatabaseMigrator(string importPath)
     {
-        private readonly string _importPath;
-        private readonly Dictionary<string, Dictionary<object, object>> _idMappings;
-        private readonly HashSet<string> _importedTables;
-        private readonly DynamicSql _transactionSql;
-        private Dictionary<string,HashSet<string>> _uniqueKeyTracker = new Dictionary<string, HashSet<string>>();
-        private HashSet<string> _pureRelations = new();
-        private HashSet<string> _extendedRelations = new();
+        _importPath = importPath;
+        _importedTables = new HashSet<string>();
+        _transactionSql = new DynamicSql { Dsn = "PXE1_PXE" };
+    }
+    public void PerformMigration(bool disableForeignKeys = true)
+    {
+        LoadRelationTables();
 
-        public DatabaseMigrator(string importPath)
+        if (disableForeignKeys)
+            DisableAllForeignKeys();
+
+        ExecuteTransactionCommand("BEGIN TRANSACTION");
+
+        try
         {
-            _importPath = importPath;
-            _idMappings = new Dictionary<string, Dictionary<object, object>>();
-            _importedTables = new HashSet<string>();
-            _transactionSql = new DynamicSql { Dsn = "PXE1_PXE" };
+            var orchestrator = new MigrationOrchestrator(
+                _pureRelations,
+                _extendedRelations,
+                _idMappings,
+                GetForeignKeyInfo,
+                ImportTable,
+                ImportPureRelationTable,
+                ImportExtendedRelationTable,
+                GetAllTables
+            );
+
+            orchestrator.PerformGlobalImport();
+
+            ExecuteTransactionCommand("COMMIT TRANSACTION");
         }
-        public void PerformMigration()
+        catch (Exception ex)
         {
-            try
+            ExecuteTransactionCommand("ROLLBACK TRANSACTION");
+            Console.WriteLine($"Erreur de migration: {ex.Message}");
+            throw;
+        }
+        finally
+        {
+            if (disableForeignKeys)
             {
-                LoadRelationTables();
-                ExecuteTransactionCommand("BEGIN TRANSACTION");
-
-                // 1. Désactiver TOUTES les contraintes au début
-                DisableAllForeignKeys();
-                DisableAllIdentityConstraints();
-
-                // 2. Exécuter toutes les insertions
-                var (dependencies, allCircularRefs) = AnalyzeDatabaseStructure();
-                var importOrder = GetImportOrderExcludingCircular(dependencies, allCircularRefs);
-
-                // 3. Importer les tables NON-relationnelles d'abord
-                foreach (var table in importOrder.Where(t => !IsRelationTable(t)))
-                {
-                    Console.WriteLine($"______________________________");
-                    Console.WriteLine($"insert in {table}");
-                    string[] skiptables = { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings" };
-                    if (skiptables.Contains(table))
-                    {
-                        Console.WriteLine($"{table} ingoré pour le moment");
-                        continue;
-                    }
-                    ImportTable(table);
-                }
-                Console.WriteLine($"________________________________");
-                // 4. Importer les tables de relations PURES
-                Console.WriteLine($"import des table de relations");
-                foreach (var table in importOrder.Where(IsRelationTable))
-                {
-                    Console.WriteLine($"______________________________");
-                    Console.WriteLine($"insert in {table}");
-
-                    if (HasAdditionalColumns(table))
-                        ImportExtendedRelationTable(table);
-                    else
-                        ImportPureRelationTable(table);
-                    ImportRelationTable(table); // Méthode optimisée pour tables IDs-only
-                }
-
-                // 3. Traiter les circularités
-                Console.WriteLine("\nTraitement des dépendances circulaires:");
-                foreach (var cycle in allCircularRefs)
-                {
-                    Console.WriteLine($"Cycle détecté: {string.Join(" -> ", cycle)}");
-
-                    // Première passe: insertion avec FK=NULL
-                    foreach (var table in cycle)
-                    {
-                        string fkColumn = GetForeignKeyInCycle(table, cycle);
-                        Console.WriteLine($"Import initial de {table} (FK {fkColumn} mise à NULL)");
-                        ImportTable(table, circularFkColumn: fkColumn);
-                    }
-
-                    // Deuxième passe: mise à jour des références
-                    for (int i = 0; i < cycle.Count; i++)
-                    {
-                        string table1 = cycle[i];
-                        string table2 = cycle[(i + 1) % cycle.Count];
-                        Console.WriteLine($"Mise à jour des références de {table1} vers {table2}");
-                        UpdateCircularReferences(table1, table2);
-                    }
-
-                }
-
-                // 4. Réactiver TOUTES les contraintes à la fin SEULEMENT
-                EnableAllForeignKeys(); 
-                EnableAllIdentityConstraints();
-
-                ExecuteTransactionCommand("COMMIT TRANSACTION");
-            }
-            catch (Exception ex)
-            {
-                ExecuteTransactionCommand("ROLLBACK TRANSACTION");
-                Console.WriteLine($"Erreur de migration: {ex.Message}");
-                throw;
-            }
-            finally
-            {
+                EnableAllForeignKeys();
                 ValidateDataIntegrity();
             }
-        }
-        private void ImportExtendedRelationTable(string tableName)
+        }            
+    }
+    private void ImportExtendedRelationTable(string tableName)
+    {
+        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+        if (!File.Exists(csvPath))
         {
-            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-            if (!File.Exists(csvPath))
-            {
-                Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-                return;
-            }
-            var fkInfo = GetForeignKeyInfo(tableName);
-            var nonFkColumns = GetTableColumns(tableName)
-                              .Except(fkInfo.Select(fk => fk.ColumnName))
-                              .ToList();
+            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
+            return;
+        }
+        var fkInfo = GetForeignKeyInfo(tableName);
+        var nonFkColumns = GetTableColumns(tableName)
+                          .Except(fkInfo.Select(fk => fk.ColumnName))
+                          .ToList();
 
-            foreach (var record in ReadCsvFile(csvPath, tableName))
+        int inserted = 0;
+        int enErreur = 0;
+        foreach (var record in ReadCsvFile(csvPath, tableName))
+        {
+            try
             {
                 // Validation des FK
                 var mappedRecord = ValidateAndMapForeignKeys(record, fkInfo);
@@ -151,20 +88,31 @@ namespace PXE_JOBS.PXE1O003
                 bool hasIdentity = HasIdentityColumn(tableName);
                 string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
                 InsertAndGetNewId(tableName, mappedRecord, hasIdentity, pkColumn);
+                inserted++;
             }
-        }
-        private void ImportPureRelationTable(string tableName)
-        {
-            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-            if (!File.Exists(csvPath))
+            catch (Exception)
             {
-                Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-                return;
-            }
-            var fkInfo = GetForeignKeyInfo(tableName);
-            var records = ReadCsvFile(csvPath,tableName);
-
-            foreach (var record in records)
+                enErreur++;
+            }               
+        }
+        Console.WriteLine($"{enErreur} ligne(s) en erreur trouvée(s)");
+        Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");
+    }
+    private void ImportPureRelationTable(string tableName)
+    {
+        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+        if (!File.Exists(csvPath))
+        {
+            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
+            return;
+        }
+        var fkInfo = GetForeignKeyInfo(tableName);
+        var records = ReadCsvFile(csvPath,tableName);
+        int inserted = 0;
+        int enErreur = 0;
+        foreach (var record in records)
+        {
+            try
             {
                 // Validation et mapping des FK
                 var mappedRecord = ValidateAndMapForeignKeys(record, fkInfo);
@@ -174,820 +122,788 @@ namespace PXE_JOBS.PXE1O003
                 bool hasIdentity = HasIdentityColumn(tableName);
                 string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
                 InsertAndGetNewId(tableName, mappedRecord, hasIdentity, pkColumn);
+                inserted++;
             }
+            catch (Exception)
+            {
+                enErreur++;
+            }
+            
         }
-        private Dictionary<string, object> ValidateAndMapForeignKeys(Dictionary<string, object> record, List<ForeignKeyInfo> fkInfo)
+        Console.WriteLine($"{enErreur} ligne(s) en erreur trouvée(s)");
+        Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");
+    }
+    private Dictionary<string, object> ValidateAndMapForeignKeys(Dictionary<string, object> record, List<ForeignKeyInfo> fkInfo)
+    {
+        var result = new Dictionary<string, object>();
+
+        foreach (var fk in fkInfo)
         {
-            var result = new Dictionary<string, object>();
-
-            foreach (var fk in fkInfo)
+            if (!record.ContainsKey(fk.ColumnName))
             {
-                if (!record.ContainsKey(fk.ColumnName))
-                {
-                    Console.WriteLine($"[ERREUR] Colonne FK manquante dans les données source : {fk.ColumnName}");
-                    return null;
-                }
-
-                var originalValue = record[fk.ColumnName];
-
-                if (originalValue == null)
-                {
-                    Console.WriteLine($"[ERREUR] Valeur NULL pour la clé étrangère {fk.ColumnName} dans {fk.ReferencedTableName}");
-                    return null;
-                }
-
-                if (!_idMappings.ContainsKey(fk.ReferencedTableName))
-                {
-                    Console.WriteLine($"[ERREUR] Mapping manquant pour la table référencée : {fk.ReferencedTableName}");
-                    return null;
-                }
-
-                if (!_idMappings[fk.ReferencedTableName].TryGetValue(originalValue, out var newId))
-                {
-                    Console.WriteLine($"[ERREUR] ID {originalValue} non trouvé dans mapping pour {fk.ReferencedTableName}");
-                    return null;
-                }
-
-                result[fk.ColumnName] = newId;
+                Console.WriteLine($"[ERREUR] Colonne FK manquante : {fk.ColumnName}");
+                return null;
             }
 
-            return result;
-        }
-        private void ImportRelationTable(string tableName)
-        {
-            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}.csv");
-            if (!File.Exists(csvPath)) return;
+            var originalValue = record[fk.ColumnName];
 
-            // 1. Charger les métadonnées UNE FOIS
-            var fkInfo = GetForeignKeyInfo(tableName); // Ex: [{ ColumnName: "UserId", ReferencedTable: "Users" }, ...]
-            var records = ReadCsvFile(csvPath, tableName);
-
-            // 2. Vérifier que toutes les tables référencées sont migrées
-            foreach (var fk in fkInfo)
+            // Si la valeur est NULL, on vérifie si la colonne l'accepte
+            if (originalValue == null || originalValue.ToString() == "")
             {
-                if (!_idMappings.ContainsKey(fk.ReferencedTableName))
+                bool nullable = IsForeignKeyNullable(fk);
+                if (nullable)
                 {
-                    Console.WriteLine($"ERREUR: Table parente {fk.ReferencedTableName} non migrée !");
-                    return;
-                }
-            }
-
-            // 3. Tracker des doublons en mémoire (optimisation clé)
-            var uniqueTracker = new HashSet<string>();
-
-            foreach (var record in records)
-            {
-                // 4. Générer une signature unique (ex: "UserId:5|RoleId:8")
-                var signature = string.Join("|", fkInfo.Select(fk => $"{fk.ColumnName}:{record[fk.ColumnName]}"));
-
-                // 5. Vérifier les doublons
-                if (uniqueTracker.Contains(signature))
-                {
-                    Console.WriteLine($"Doublon ignoré: {signature}");
+                    result[fk.ColumnName] = null; // autorisé => on garde la ligne
                     continue;
                 }
-
-                // 6. Valider et mapper les FK
-                var mappedRecord = new Dictionary<string,object>();
-                bool isValid = true;
-
-                foreach (var fk in fkInfo)
+                else
                 {
-                    if (_idMappings[fk.ReferencedTableName].TryGetValue(record[fk.ColumnName], out var newId))
+                    Console.WriteLine($"[ERREUR] Valeur NULL interdite pour {fk.ColumnName} dans {fk.ReferencedTableName}");
+                    return null; // on rejette si NON NULL
+                }
+            }
+
+            // On vérifie que la table de mapping est bien là
+            if (!_idMappings.ContainsKey(fk.ReferencedTableName))
+            {
+                Console.WriteLine($"[ERREUR] Mapping manquant pour : {fk.ReferencedTableName}");
+                return null;
+            }
+
+            if (!_idMappings[fk.ReferencedTableName].TryGetValue(originalValue, out var newId))
+            {
+                Console.WriteLine($"[ERREUR] Valeur FK introuvable : {fk.ColumnName}={originalValue} dans {fk.ReferencedTableName}");
+                return null;
+            }
+
+            result[fk.ColumnName] = newId;
+        }
+
+        return result;
+    }
+    private bool IsForeignKeyNullable(ForeignKeyInfo fk)
+    {
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql.AddDirectRequest(@"
+        SELECT is_nullable
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = $table$
+        AND COLUMN_NAME = $col$",
+          MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+        sql.SetSecureParam("table", fk.TableName, true, 0);
+        sql.SetSecureParam("col", fk.ColumnName, true, 0);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute();
+
+        if (sql.ReturnedRows(1, 1) > 0)
+        {
+            string nullable = sql.GetValueUsingColName(1, "is_nullable", 1, 1);
+            return nullable == "YES";
+        }
+
+        return false; // si on ne sait pas, on préfère bloquer
+    }       
+    
+    private void ExecuteTransactionCommand(string command)
+    {
+        var sql = new DynamicSql
+        {
+            Dsn = "PXE1_PXE"
+        };            
+        sql.AddDirectRequest(command, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(30000);
+    }
+
+    private void VisitImproved(string table,
+                             Dictionary<string, List<string>> dependencies,
+                             HashSet<string> visited,
+                             HashSet<string> temporaryMarks,
+                             List<string> result)
+    {
+        if (temporaryMarks.Contains(table))
+        {
+            // Ne plus lever d'exception, le traitement se fait ailleurs
+            return;
+        }
+
+        if (!visited.Contains(table))
+        {
+            temporaryMarks.Add(table);
+
+            if (dependencies.TryGetValue(table, out var deps))
+            {
+                foreach (var dep in deps)
+                {
+                    VisitImproved(dep, dependencies, visited, temporaryMarks, result);
+                }
+            }
+
+            temporaryMarks.Remove(table);
+            visited.Add(table);
+            result.Add(table);
+        }
+    }
+
+    private DynamicSql ExecuteProcedure(string procedure,string TableName = null,string ColumnName = null,string referencedTable = null,string ReferenceColumn = null)
+    {
+        string request = @"EXEC [dbo].[" + procedure + "] ";
+        DynamicSql sql = new DynamicSql();
+        sql.Dsn = "PXE1_PXE";            
+
+        if (!string.IsNullOrEmpty(TableName))
+            request += "@TableName = $table$ ";
+        if (!string.IsNullOrEmpty(ColumnName))
+            request += ", @ColumnName = $col$ ";
+        if (!string.IsNullOrEmpty(referencedTable))
+            request += ", @ReferencedTable = $refTable$ ";
+        if (!string.IsNullOrEmpty(ReferenceColumn))
+            request += ", @ReferenceColumn = $refCol$ ";
+
+        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+        if (!string.IsNullOrEmpty(TableName))
+            sql.SetSecureParam("table", TableName, true, 0);
+        if (!string.IsNullOrEmpty(ColumnName))
+            sql.SetSecureParam("col", ColumnName, true, 0);
+        if (!string.IsNullOrEmpty(referencedTable))
+            sql.SetSecureParam("refTable", referencedTable, true, 0);
+        if (!string.IsNullOrEmpty(ReferenceColumn))
+            sql.SetSecureParam("refCol", ReferenceColumn, true, 0);
+
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(30000);                      
+        return sql;
+    }
+
+    private void VisitForTopologicalSort(string table,
+                               Dictionary<string, List<string>> dependencies,
+                               HashSet<string> visited,
+                               HashSet<string> tempMarks,
+                               List<string> result)
+    {
+        if (tempMarks.Contains(table))
+        {
+            // Circularité détectée, mais on continue pour compléter le tri
+            return;
+        }
+
+        if (!visited.Contains(table))
+        {
+            tempMarks.Add(table);
+
+            if (dependencies.TryGetValue(table, out var deps))
+            {
+                foreach (var dep in deps)
+                {
+                    VisitForTopologicalSort(dep, dependencies, visited, tempMarks, result);
+                }
+            }
+
+            tempMarks.Remove(table);
+            visited.Add(table);
+            result.Add(table);
+        }
+    }
+    private void Visit(
+        string table,
+        Dictionary<string, List<string>> dependencies,
+        HashSet<string> visited,
+        HashSet<string> temporaryMarks,
+        List<string> result,
+        List<List<string>> circularRefs)
+
+    {
+        if (temporaryMarks.Contains(table))
+        {
+            // Détection d'une circularité - on l'ajoute à la liste plutôt que de throw
+            var cycle = new List<string>(temporaryMarks.SkipWhile(t => t != table).Append(table));
+            if (!circularRefs.Any(c => c.SequenceEqual(cycle)))
+            {
+                circularRefs.Add(cycle);
+            }
+            return;
+        }
+
+        if (!visited.Contains(table))
+        {
+            temporaryMarks.Add(table);
+
+            if (dependencies.ContainsKey(table))
+            {
+                foreach (var dependency in dependencies[table])
+                {
+                    Visit(dependency, dependencies, visited, temporaryMarks, result, circularRefs);
+                }
+            }
+
+            temporaryMarks.Remove(table);
+            visited.Add(table);
+            result.Add(table);
+        }
+    }
+    private void DisableAllForeignKeys()
+    {
+        DynamicSql sql = ExecuteProcedure("batch_disable_all_foreign_keys");            
+    }
+    private void ImportTable(string tableName)
+    {            
+        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+        if (!File.Exists(csvPath))
+        {
+            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
+            return;
+        }
+
+        bool hasIdentity = HasIdentityColumn(tableName);
+        string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
+        var records = ReadCsvFile(csvPath, tableName);
+        var idMap = new Dictionary<object, object>();
+
+
+        try
+        {
+            int inserted = 0;
+            int doublons = 0;
+            
+            foreach (var record in records)
+            {
+                // 1. Récupérer les colonnes UNIQUE (autre que l'ID)
+                var uniqueColumns = GetUniqueColumns(tableName);
+                if (uniqueColumns.Count > 0)
+                {
+                    // 2. Générer une signature unique pour la vérification
+                    var keySignature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
+
+                    // 3. Vérifier en mémoire
+                    if (!_uniqueKeyTracker.ContainsKey(tableName))
+                        _uniqueKeyTracker[tableName] = new HashSet<string>();
+
+                    if (_uniqueKeyTracker[tableName].Contains(keySignature))
                     {
-                        mappedRecord[fk.ColumnName] = newId;
+                        doublons++;
+                        continue;
                     }
-                    else
+                }
+
+                // Insertion
+                var newId = InsertAndGetNewId(tableName, record, hasIdentity, pkColumn);
+                
+                // 5. Mettre à jour le tracker si insertion réussie
+                if (newId != null && uniqueColumns.Count > 0)
+                {
+                    var signature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
+                    _uniqueKeyTracker[tableName].Add(signature);
+                    inserted++;
+                }
+                if (newId != null && pkColumn != null && record.ContainsKey(pkColumn))
+                {
+                    idMap[record[pkColumn]] = newId;
+                }
+            }
+
+            if (idMap.Count > 0)
+            {
+                _idMappings[tableName] = idMap;
+            }
+
+            Console.WriteLine($"{doublons} ligne(s) en doublons trouvée(s)");
+            Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");                
+        }
+        catch(Exception e)
+        {
+            Console.WriteLine(e.ToString());
+        }
+    }
+    private List<string> GetUniqueColumns(string tableName)
+    {
+        // Récupère les colonnes UNIQUE (sauf ID si auto-incrémenté)
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql.AddDirectRequest(@"
+            SELECT COL_NAME(ic.object_id, ic.column_id) AS UniqueColumn
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+            WHERE i.is_unique = 1
+            AND OBJECT_NAME(ic.object_id) = $tableName$
+            AND (COL_NAME(ic.object_id, ic.column_id) <> 'ID' OR $hasIdentity$ = 0)",
+            MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+        sql.SetSecureParam("tableName", tableName, true, 0);
+        sql.SetSecureParam("hasIdentity", HasIdentityColumn(tableName) ? 1 : 0, true, 0);
+        sql.Execute();
+
+        var columns = new List<string>();
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+        {
+            columns.Add(sql.GetValueUsingColName(i, "UniqueColumn", 1, 1));
+        }
+        return columns;
+    }  
+
+    private object InsertAndGetNewId(string tableName, Dictionary<string,object> record, bool hasIdentity, string pkColumn)
+    {
+        var (columns, values) = BuildInsertParameters(record, tableName);
+
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+
+        // Utilisation d'une procédure stockée sécurisée pour l'insertion
+        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
+                  @TableName = $table$, 
+                  @Columns = $cols$, 
+                  @Values = $vals$,
+                  @HasIdentity = $identity$";
+
+        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("table", tableName, true, 0);
+        sql.SetSecureParam("cols", columns, true, 0);
+        sql.SetSecureParam("vals", values, true, 0);
+        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
+
+        sql.Execute();
+
+        if (hasIdentity && pkColumn != null && sql.ReturnedRows(1, 1) > 0)
+        {
+            return sql.GetValueUsingColName(1, "NewID", 1, 1);
+        }
+
+        return null;
+    }
+    private bool IsComputedColumn(string tableName, string columnName)
+    {
+        DynamicSql sql = ExecuteProcedure("batch_is_computed_column",
+            TableName: tableName,
+            ColumnName: columnName);
+        return sql.GetValueUsingColName(1, "IsComputed", 1, 1) == "1";
+    }
+
+    private bool HasIdentityColumn(string tableName)
+    {
+        DynamicSql sql = ExecuteProcedure("batch_has_identity_column", TableName: tableName);
+        return Int32.Parse(sql.GetValueUsingColName(1, "Result", 1, 1)) != 0;
+    }
+
+    private string GetPrimaryKeyColumn(string tableName)
+    {
+        DynamicSql sql = ExecuteProcedure("batch_get_primary_key_column", TableName: tableName);
+        return sql.GetValueUsingColName(1, "PrimaryKeyColumn", 1, 1);
+    }
+
+
+    private List<Dictionary<string, object>> ReadCsvFile(string csvPath, string tableName)
+    {
+        Console.WriteLine("Lecture de fichier csv en cours...");
+        var records = new List<Dictionary<string, object>>();
+        var columns = GetTableColumns(tableName).ToList();
+        var columnTypes = columns.ToDictionary(col => col, col => GetColumnType(tableName, col));
+        int expectedValueCount = columns.Count;
+        bool structureValid = true;
+
+        try
+        {
+            using (var reader = new StreamReader(csvPath, Encoding.UTF8))
+            {
+                string line;
+                int lineNumber = 0;
+
+                while ((line = reader.ReadLine()) != null)
+                {
+                    lineNumber++;
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+
+                    var values = line.Split(';');
+                    if (values.Length != expectedValueCount)
                     {
-                        Console.WriteLine($"Clé étrangère invalide: {fk.ColumnName}={record[fk.ColumnName]}");
-                        isValid = false;
+                        Console.WriteLine($"[Erreur Structurelle] Ligne {lineNumber}: {values.Length} valeurs au lieu de {expectedValueCount}. Le fichier semble mal formé. Arrêt de l'import.");
+                        structureValid = false;
                         break;
                     }
-                }
 
-                if (!isValid) continue;
-                bool hasIdentity = HasIdentityColumn(tableName);
-                string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
-
-                // 7. Insertion directe 
-                InsertAndGetNewId(tableName, mappedRecord,hasIdentity,pkColumn);
-
-                // 8. Mémoriser la signature
-                uniqueTracker.Add(signature);
-            }
-        }
-        private void ExecuteTransactionCommand(string command)
-        {
-            var sql = new DynamicSql
-            {
-                Dsn = "PXE1_PXE"
-            };            
-            sql.AddDirectRequest(command, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-            sql.Execute(30000);
-        }
-        private void DisableAllIdentityConstraints()
-        {
-            DynamicSql sql = ExecuteProcedure("batch_disable_identity_constraints");
-        }
-
-        private void EnableAllIdentityConstraints()
-        {
-            DynamicSql sql = ExecuteProcedure("batch_enable_identity_constraints");
-        }
-
-        private void VisitImproved(string table,
-                                 Dictionary<string, List<string>> dependencies,
-                                 HashSet<string> visited,
-                                 HashSet<string> temporaryMarks,
-                                 List<string> result)
-        {
-            if (temporaryMarks.Contains(table))
-            {
-                // Ne plus lever d'exception, le traitement se fait ailleurs
-                return;
-            }
-
-            if (!visited.Contains(table))
-            {
-                temporaryMarks.Add(table);
-
-                if (dependencies.TryGetValue(table, out var deps))
-                {
-                    foreach (var dep in deps)
+                    var record = new Dictionary<string, object>();
+                    for (int i = 0; i < columns.Count; i++)
                     {
-                        VisitImproved(dep, dependencies, visited, temporaryMarks, result);
-                    }
-                }
-
-                temporaryMarks.Remove(table);
-                visited.Add(table);
-                result.Add(table);
-            }
-        }
-
-        private (Dictionary<string, List<string>> dependencies, List<List<string>> circularRefs) AnalyzeDatabaseStructure()
-        {
-            var dependencies = new Dictionary<string, List<string>>();
-            var circularRefs = new List<List<string>>();
-
-            DynamicSql sql = ExecuteProcedure("batch_get_table_dependencies");
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                var parent = sql.GetValueUsingColName(i, "TableName", 1, 1);
-                var child = sql.GetValueUsingColName(i, "ReferencedTableName", 1, 1);
-
-                if (!dependencies.ContainsKey(parent))
-                    dependencies[parent] = new List<string>();
-
-                dependencies[parent].Add(child);
-            }
-
-            // Détection des cycles
-            var cycleDetector = new TarjanCycleDetector();
-            circularRefs = cycleDetector.FindCycles(dependencies);
-           
-            return (dependencies, circularRefs);
-        }       
-
-        private DynamicSql ExecuteProcedure(string procedure,string TableName = null,string ColumnName = null,string referencedTable = null,string ReferenceColumn = null)
-        {
-            string request = @"EXEC [dbo].[" + procedure + "] ";
-            DynamicSql sql = new DynamicSql();
-            sql.Dsn = "PXE1_PXE";            
-
-            if (!string.IsNullOrEmpty(TableName))
-                request += "@TableName = $table$ ";
-            if (!string.IsNullOrEmpty(ColumnName))
-                request += ", @ColumnName = $col$ ";
-            if (!string.IsNullOrEmpty(referencedTable))
-                request += ", @ReferencedTable = $refTable$ ";
-            if (!string.IsNullOrEmpty(ReferenceColumn))
-                request += ", @ReferenceColumn = $refCol$ ";
-
-            sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-            if (!string.IsNullOrEmpty(TableName))
-                sql.SetSecureParam("table", TableName, true, 0);
-            if (!string.IsNullOrEmpty(ColumnName))
-                sql.SetSecureParam("col", ColumnName, true, 0);
-            if (!string.IsNullOrEmpty(referencedTable))
-                sql.SetSecureParam("refTable", referencedTable, true, 0);
-            if (!string.IsNullOrEmpty(ReferenceColumn))
-                sql.SetSecureParam("refCol", ReferenceColumn, true, 0);
-
-            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-            sql.Execute(30000);                      
-            return sql;
-        }
-
-        private List<string> GetImportOrder(Dictionary <string, List<string>> dependencies)
-        {
-            var result = new List<string>();
-            var visited = new HashSet<string>();
-            var tempMarks = new HashSet<string>();
-
-            foreach (var table in dependencies.Keys)
-            {
-                if (!visited.Contains(table))
-                {
-                    VisitForTopologicalSort(table, dependencies, visited, tempMarks, result);
-                }
-            }
-
-            return result;
-        }
-        private void VisitForTopologicalSort(string table,
-                                   Dictionary<string, List<string>> dependencies,
-                                   HashSet<string> visited,
-                                   HashSet<string> tempMarks,
-                                   List<string> result)
-        {
-            if (tempMarks.Contains(table))
-            {
-                // Circularité détectée, mais on continue pour compléter le tri
-                return;
-            }
-
-            if (!visited.Contains(table))
-            {
-                tempMarks.Add(table);
-
-                if (dependencies.TryGetValue(table, out var deps))
-                {
-                    foreach (var dep in deps)
-                    {
-                        VisitForTopologicalSort(dep, dependencies, visited, tempMarks, result);
-                    }
-                }
-
-                tempMarks.Remove(table);
-                visited.Add(table);
-                result.Add(table);
-            }
-        }
-        private void Visit(
-            string table,
-            Dictionary<string, List<string>> dependencies,
-            HashSet<string> visited,
-            HashSet<string> temporaryMarks,
-            List<string> result,
-            List<List<string>> circularRefs)
-
-        {
-            if (temporaryMarks.Contains(table))
-            {
-                // Détection d'une circularité - on l'ajoute à la liste plutôt que de throw
-                var cycle = new List<string>(temporaryMarks.SkipWhile(t => t != table).Append(table));
-                if (!circularRefs.Any(c => c.SequenceEqual(cycle)))
-                {
-                    circularRefs.Add(cycle);
-                }
-                return;
-            }
-
-            if (!visited.Contains(table))
-            {
-                temporaryMarks.Add(table);
-
-                if (dependencies.ContainsKey(table))
-                {
-                    foreach (var dependency in dependencies[table])
-                    {
-                        Visit(dependency, dependencies, visited, temporaryMarks, result, circularRefs);
-                    }
-                }
-
-                temporaryMarks.Remove(table);
-                visited.Add(table);
-                result.Add(table);
-            }
-        }
-        private List<string> GetImportOrderExcludingCircular(Dictionary<string,List<string>> dependencies, List<List<string>> allCircularRefs)
-        {
-            // 1. Flatten toutes les tables dans des circularités
-            var circularTables = new HashSet<string>(allCircularRefs.SelectMany(x => x));
-
-            // 2. Obtenir l'ordre topologique complet
-            var fullOrder = GetImportOrder(dependencies);
-
-            // 3. Filtrer pour exclure les tables circulaires
-            return fullOrder.Where(t => !circularTables.Contains(t)).ToList();
-        }
-        private void DisableAllForeignKeys()
-        {
-            DynamicSql sql = ExecuteProcedure("batch_disable_all_foreign_keys");            
-        }
-        private void ImportTable(string tableName, string circularFkColumn = null)
-        {            
-            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-            if (!File.Exists(csvPath))
-            {
-                Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-                return;
-            }
-
-            bool hasIdentity = HasIdentityColumn(tableName);
-            string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
-            var records = ReadCsvFile(csvPath, tableName);
-            var idMap = new Dictionary<object, object>();
-
-
-            try
-            {
-                int inserted = 0;
-                int doublons = 0;
-                
-                foreach (var record in records)
-                {
-                    // 1. Récupérer les colonnes UNIQUE (autre que l'ID)
-                    var uniqueColumns = GetUniqueColumns(tableName);
-                    if (uniqueColumns.Count > 0)
-                    {
-                        // 2. Générer une signature unique pour la vérification
-                        var keySignature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
-
-                        // 3. Vérifier en mémoire
-                        if (!_uniqueKeyTracker.ContainsKey(tableName))
-                            _uniqueKeyTracker[tableName] = new HashSet<string>();
-
-                        if (_uniqueKeyTracker[tableName].Contains(keySignature))
+                        try
                         {
-                            doublons++;
-                            continue;
+                            record[columns[i]] = ConvertValue(values[i], columnTypes[columns[i]]);
                         }
-                    }
-
-                    // Insertion
-                    var newId = InsertAndGetNewId(tableName, record, hasIdentity, pkColumn);
-                    
-                    // 5. Mettre à jour le tracker si insertion réussie
-                    if (newId != null && uniqueColumns.Count > 0)
-                    {
-                        var signature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
-                        _uniqueKeyTracker[tableName].Add(signature);
-                        inserted++;
-                    }
-                    if (newId != null && pkColumn != null && record.ContainsKey(pkColumn))
-                    {
-                        idMap[record[pkColumn]] = newId;
-                    }
-                }
-
-                if (idMap.Count > 0)
-                {
-                    _idMappings[tableName] = idMap;
-                }
-
-                Console.WriteLine($"{doublons} ligne(s) en doublons trouvée(s)");
-                Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");                
-            }
-            catch(Exception e)
-            {
-                Console.WriteLine(e.ToString());
-            }
-        }
-        private List<string> GetUniqueColumns(string tableName)
-        {
-            // Récupère les colonnes UNIQUE (sauf ID si auto-incrémenté)
-            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-            sql.AddDirectRequest(@"
-                SELECT COL_NAME(ic.object_id, ic.column_id) AS UniqueColumn
-                FROM sys.indexes i
-                JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-                WHERE i.is_unique = 1
-                AND OBJECT_NAME(ic.object_id) = $tableName$
-                AND (COL_NAME(ic.object_id, ic.column_id) <> 'ID' OR $hasIdentity$ = 0)",
-                MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-            sql.SetSecureParam("tableName", tableName, true, 0);
-            sql.SetSecureParam("hasIdentity", HasIdentityColumn(tableName) ? 1 : 0, true, 0);
-            sql.Execute();
-
-            var columns = new List<string>();
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                columns.Add(sql.GetValueUsingColName(i, "UniqueColumn", 1, 1));
-            }
-            return columns;
-        }  
-
-        private object InsertAndGetNewId(string tableName, Dictionary<string,object> record, bool hasIdentity, string pkColumn)
-        {
-            var (columns, values) = BuildInsertParameters(record, tableName);
-
-            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-
-            // Utilisation d'une procédure stockée sécurisée pour l'insertion
-            string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
-                      @TableName = $table$, 
-                      @Columns = $cols$, 
-                      @Values = $vals$,
-                      @HasIdentity = $identity$";
-
-            sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.SetSecureParam("table", tableName, true, 0);
-            sql.SetSecureParam("cols", columns, true, 0);
-            sql.SetSecureParam("vals", values, true, 0);
-            sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
-
-            sql.Execute();
-
-            if (hasIdentity && pkColumn != null && sql.ReturnedRows(1, 1) > 0)
-            {
-                return sql.GetValueUsingColName(1, "NewID", 1, 1);
-            }
-
-            return null;
-        }
-        private bool IsComputedColumn(string tableName, string columnName)
-        {
-            DynamicSql sql = ExecuteProcedure("batch_is_computed_column",
-                TableName: tableName,
-                ColumnName: columnName);
-            return sql.GetValueUsingColName(1, "IsComputed", 1, 1) == "1";
-        }
-
-        private bool HasIdentityColumn(string tableName)
-        {
-            DynamicSql sql = ExecuteProcedure("batch_has_identity_column", TableName: tableName);
-            return Int32.Parse(sql.GetValueUsingColName(1, "Result", 1, 1)) != 0;
-        }
-
-        private string GetPrimaryKeyColumn(string tableName)
-        {
-            DynamicSql sql = ExecuteProcedure("batch_get_primary_key_column", TableName: tableName);
-            return sql.GetValueUsingColName(1, "PrimaryKeyColumn", 1, 1);
-        }
-
-
-        private List<Dictionary<string, object>> ReadCsvFile(string csvPath, string tableName)
-        {
-            Console.WriteLine("Lecture de fichier csv en cours...");
-            var records = new List<Dictionary<string, object>>();
-            var columns = GetTableColumns(tableName).ToList();
-            var columnTypes = columns.ToDictionary(col => col, col => GetColumnType(tableName, col));
-            int expectedValueCount = columns.Count;
-            bool structureValid = true;
-
-            try
-            {
-                using (var reader = new StreamReader(csvPath, Encoding.UTF8))
-                {
-                    string line;
-                    int lineNumber = 0;
-
-                    while ((line = reader.ReadLine()) != null)
-                    {
-                        lineNumber++;
-                        if (string.IsNullOrWhiteSpace(line)) continue;
-
-                        var values = line.Split(';');
-                        if (values.Length != expectedValueCount)
+                        catch (Exception ex)
                         {
-                            Console.WriteLine($"[Erreur Structurelle] Ligne {lineNumber}: {values.Length} valeurs au lieu de {expectedValueCount}. Le fichier semble mal formé. Arrêt de l'import.");
-                            structureValid = false;
+                            Console.WriteLine($"[Ligne {lineNumber}] Erreur conversion {columns[i]}: {ex.Message}");
+                            record = null;
                             break;
                         }
-
-                        var record = new Dictionary<string, object>();
-                        for (int i = 0; i < columns.Count; i++)
-                        {
-                            try
-                            {
-                                record[columns[i]] = ConvertValue(values[i], columnTypes[columns[i]]);
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"[Ligne {lineNumber}] Erreur conversion {columns[i]}: {ex.Message}");
-                                record = null;
-                                break;
-                            }
-                        }
-
-                        if (record != null)
-                        {
-                            records.Add(record);
-                        }
                     }
-                    Console.WriteLine($"{lineNumber} ligne à importer");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Erreur lecture {csvPath}: {ex.Message}");
-            }
-            return structureValid ? records : new List<Dictionary<string, object>>();
-        }
 
-        private object ConvertValue(string value, string columnType)
-        {
-            if (string.IsNullOrEmpty(value))
-                return null;
-
-            try
-            {
-                string lowerType = columnType.ToLower();
-
-                if (lowerType == "int")
-                    return int.Parse(value);
-                if (lowerType == "bigint")
-                    return long.Parse(value);
-                if (lowerType == "bit")
-                    return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
-                if (lowerType == "datetime" || lowerType == "datetime2")
-                    return DateTime.Parse(value);
-                if (lowerType == "date")
-                    return DateTime.ParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-                if (lowerType == "decimal" || lowerType == "numeric")
-                    return decimal.Parse(value, CultureInfo.InvariantCulture);
-                if (lowerType == "float")
-                    return double.Parse(value, CultureInfo.InvariantCulture);
-                if (lowerType == "uniqueidentifier")
-                    return Guid.Parse(value);
-
-                return value; // Type string par défaut
-            }
-            catch
-            {
-                return value; // Retourne la valeur originale si conversion échoue
-            }
-        }
-
-        private HashSet<string> GetTableColumns(string tableName)
-        {
-            var columns = new HashSet<string>();
-            DynamicSql sql = ExecuteProcedure("batch_get_table_columns", TableName: tableName);
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                columns.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
-            }            
-            return columns;
-        }
-
-        private string GetColumnType(string tableName, string columnName)
-        {
-            var columns = new HashSet<string>();
-            DynamicSql sql = ExecuteProcedure("batch_get_table_columns_type", TableName: tableName, ColumnName: columnName);
-            return  sql.GetValueUsingColName(1, "DATA_TYPE", 1, 1);
-        }
-
-        private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
-        {
-            var foreignKeys = new List<ForeignKeyInfo>();
-            DynamicSql sql = ExecuteProcedure("batch_get_table_foreign_keys", TableName: tableName);
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                foreignKeys.Add(new ForeignKeyInfo
-                {
-                    ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
-                    ReferencedTableName = sql.GetValueUsingColName(i, "ReferencedTableName", 1, 1),
-                    ReferencedColumnName = sql.GetValueUsingColName(i, "ReferencedColumnName", 1, 1)
-                });
-            }   
-            return foreignKeys;
-        }
-        private void ValidateDataIntegrity()
-        {
-            DynamicSql sql = ExecuteProcedure("batch_validate_data_integrity");            
-            if (sql.ReturnedResults() > 0)
-            {
-                Console.WriteLine("Erreurs d'intégrité trouvées:");
-                for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-                {
-                    Console.WriteLine($"- {sql.GetValueUsingColName(i, "Table", 1, 1)}.{sql.GetValueUsingColName(i, "Constraint", 1, 1)} : {sql.GetValueUsingColName(i, "Where", 1, 1)}");                  
-                }
-                throw new Exception("Erreurs de contraintes détectées");
-            }            
-        }     
-        // Met à jour les références circulaires après insertion
-
-        private void UpdateCircularReferences(string table1, string table2)
-        {
-            // 1. Créer la table temporaire pour le mapping
-            ExecuteProcedure("batch_create_mapping_table", referencedTable: table1);
-
-            try
-            {
-                // 2. Mettre à jour les références de table1 vers table2
-                string fkColumn = GetForeignKeyColumn(table1, table2);
-                if (!string.IsNullOrEmpty(fkColumn))
-                {
-                    ExecuteProcedure("batch_update_circular_references",
-                        TableName: table1,
-                        ColumnName: fkColumn,
-                        referencedTable: table2);
-                }
-
-                // 3. Mettre à jour les références de table2 vers table1
-                fkColumn = GetForeignKeyColumn(table2, table1);
-                if (!string.IsNullOrEmpty(fkColumn))
-                {
-                    ExecuteProcedure("batch_update_circular_references",
-                        TableName: table2,
-                        ColumnName: fkColumn,
-                        referencedTable: table1);
-                }
-            }
-            finally
-            {
-                // 4. Nettoyer
-                ExecuteProcedure("batch_drop_mapping_table");
-            }
-        }
-
-        private string GetForeignKeyInCycle(string table, List<string> cycle)
-        {
-            int currentIndex = cycle.IndexOf(table);
-            string nextTable = cycle[(currentIndex + 1) % cycle.Count];
-
-            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-            sql.AddDirectRequest(
-                @"SELECT COLUMN_NAME 
-              FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-              WHERE TABLE_NAME = $tableName$
-              AND REFERENCED_TABLE_NAME = $refTable$",
-                MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW
-            );
-            sql.SetSecureParam("tableName", table, true, 0);
-            sql.SetSecureParam("refTable", nextTable, true, 0);
-            sql.Execute();
-
-            return sql.ReturnedRows(1, 1) > 0
-                ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1)
-                : null;
-        }
-
-
-        private string GetForeignKeyColumn(string tableName, string referencedTable)
-        {
-            DynamicSql sql = ExecuteProcedure("batch_get_foreign_key_column", TableName : tableName, referencedTable: referencedTable);
-            return sql.GetValueUsingColName(1, "ReferenceColumn", 1, 1);            
-        }
-        private (string Columns, string Values) BuildInsertParameters(Dictionary<string, object> record, string tableName)
-        {
-            var columns = string.Join(", ", record.Keys.Where(k => !IsComputedColumn(tableName, k)));
-            var values = string.Join(", ", record.Keys.Select(k => FormatValueForSql(record[k], GetColumnType(tableName, k))));
-
-            return (columns, values);
-        }
-        
-        private string FormatValueForSql(object value, string sqlType)
-        {
-            if (value == null) return "NULL";
-
-            try
-            {
-                switch (sqlType.ToLower())
-                {
-                    case "datetime":
-                    case "datetime2":
-                    case "smalldatetime":
-                        if (value is DateTime dt)
-                            return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
-                        return $"TRY_CONVERT(DATETIME, '{value}')";
-
-                    case "date":
-                        if (value is DateTime date)
-                            return $"'{date:yyyy-MM-dd}'";
-                        return $"TRY_CONVERT(DATE, '{value}')";
-
-                    case "bit":
-                        return (bool)value ? "1" : "0";
-
-                    case "uniqueidentifier":
-                        return $"'{value}'";
-
-                    case "decimal":
-                    case "numeric":
-                    case "float":
-                        return Convert.ToDecimal(value).ToString(CultureInfo.InvariantCulture);
-
-                    default:
-                        return $"'{value.ToString().Replace("'", "''")}'";
-                }
-            }
-            catch
-            {
-                return $"'{value.ToString().Replace("'", "''")}'";
-            }
-        }
-        private void EnableAllForeignKeys()
-        {
-            try
-            {
-                Console.WriteLine("Vérification des contraintes FK...");
-
-                // 1. D'abord vérifier sans activer
-                var violations = GetForeignKeyViolations();
-
-                if (violations.Count > 0)
-                {
-                    Console.WriteLine("Violations trouvées :");
-                    foreach (var v in violations)
+                    if (record != null)
                     {
-                        Console.WriteLine($"- {v.TableName}.{v.ColumnName} => {v.ReferencedTable}.{v.ReferencedColumn}");
+                        records.Add(record);
                     }
-
-                    // 2. Corriger automatiquement
-                    Console.WriteLine("Correction automatique...");
-                    RepairForeignKeyViolations();
                 }
-
-                // 3. Activer avec vérification
-                Console.WriteLine("Activation des contraintes...");
-                ExecuteProcedure("batch_enable_fk_constraints");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"ERREUR Contraintes FK : {ex.Message}");
-                throw;
+                Console.WriteLine($"{lineNumber} ligne à importer");
             }
         }
-
-        private void RepairForeignKeyViolations()
+        catch (Exception ex)
         {
-            // 1. Identifier toutes les violations
+            Console.WriteLine($"Erreur lecture {csvPath}: {ex.Message}");
+        }
+        return structureValid ? records : new List<Dictionary<string, object>>();
+    }
+
+    private object ConvertValue(string value, string columnType)
+    {
+        if (string.IsNullOrEmpty(value))
+            return null;
+
+        try
+        {
+            string lowerType = columnType.ToLower();
+
+            if (lowerType == "int")
+                return int.Parse(value);
+            if (lowerType == "bigint")
+                return long.Parse(value);
+            if (lowerType == "bit")
+                return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
+            if (lowerType == "datetime" || lowerType == "datetime2")
+                return DateTime.Parse(value);
+            if (lowerType == "date")
+                return DateTime.ParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+            if (lowerType == "decimal" || lowerType == "numeric")
+                return decimal.Parse(value, CultureInfo.InvariantCulture);
+            if (lowerType == "float")
+                return double.Parse(value, CultureInfo.InvariantCulture);
+            if (lowerType == "uniqueidentifier")
+                return Guid.Parse(value);
+
+            return value; // Type string par défaut
+        }
+        catch
+        {
+            return value; // Retourne la valeur originale si conversion échoue
+        }
+    }
+
+    private HashSet<string> GetTableColumns(string tableName)
+    {
+        var columns = new HashSet<string>();
+        DynamicSql sql = ExecuteProcedure("batch_get_table_columns", TableName: tableName);
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+        {
+            columns.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
+        }            
+        return columns;
+    }
+
+    private string GetColumnType(string tableName, string columnName)
+    {
+        var columns = new HashSet<string>();
+        DynamicSql sql = ExecuteProcedure("batch_get_table_columns_type", TableName: tableName, ColumnName: columnName);
+        return  sql.GetValueUsingColName(1, "DATA_TYPE", 1, 1);
+    }
+
+    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
+    {
+        var foreignKeys = new List<ForeignKeyInfo>();
+        DynamicSql sql = ExecuteProcedure("batch_get_table_foreign_keys", TableName: tableName);
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+        {
+            foreignKeys.Add(new ForeignKeyInfo
+            {
+                TableName = tableName,
+                ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
+                ReferencedTableName = sql.GetValueUsingColName(i, "ReferencedTableName", 1, 1),
+                ReferencedColumnName = sql.GetValueUsingColName(i, "ReferencedColumnName", 1, 1)
+            });
+        }   
+        return foreignKeys;
+    }
+    private void ValidateDataIntegrity()
+    {
+        DynamicSql sql = ExecuteProcedure("batch_validate_data_integrity");            
+        if (sql.ReturnedResults() > 0)
+        {
+            Console.WriteLine("Erreurs d'intégrité trouvées:");
+            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+            {
+                Console.WriteLine($"- {sql.GetValueUsingColName(i, "Table", 1, 1)}.{sql.GetValueUsingColName(i, "Constraint", 1, 1)} : {sql.GetValueUsingColName(i, "Where", 1, 1)}");                  
+            }
+            throw new Exception("Erreurs de contraintes détectées");
+        }            
+    }     
+      
+    private (string Columns, string Values) BuildInsertParameters(Dictionary<string, object> record, string tableName)
+    {
+        var columns = string.Join(", ", record.Keys.Where(k => !IsComputedColumn(tableName, k)));
+        var values = string.Join(", ", record.Keys.Select(k => FormatValueForSql(record[k], GetColumnType(tableName, k))));
+
+        return (columns, values);
+    }
+    
+    private string FormatValueForSql(object value, string sqlType)
+    {
+        if (value == null) return "NULL";
+
+        try
+        {
+            switch (sqlType.ToLower())
+            {
+                case "datetime":
+                case "datetime2":
+                case "smalldatetime":
+                    if (value is DateTime dt)
+                        return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
+                    return $"TRY_CONVERT(DATETIME, '{value}')";
+
+                case "date":
+                    if (value is DateTime date)
+                        return $"'{date:yyyy-MM-dd}'";
+                    return $"TRY_CONVERT(DATE, '{value}')";
+
+                case "bit":
+                    return (bool)value ? "1" : "0";
+
+                case "uniqueidentifier":
+                    return $"'{value}'";
+
+                case "decimal":
+                case "numeric":
+                case "float":
+                    return Convert.ToDecimal(value).ToString(CultureInfo.InvariantCulture);
+
+                default:
+                    return $"'{value.ToString().Replace("'", "''")}'";
+            }
+        }
+        catch
+        {
+            return $"'{value.ToString().Replace("'", "''")}'";
+        }
+    }
+    private void EnableAllForeignKeys()
+    {
+        try
+        {
+            Console.WriteLine("Vérification des contraintes FK...");
+
+            // 1. D'abord vérifier sans activer
             var violations = GetForeignKeyViolations();
 
-            foreach (var violation in violations)
+            if (violations.Count > 0)
             {
-                Console.WriteLine($"Correction violation: {violation.TableName}.{violation.ColumnName}");
-
-                // 2. Stratégie de correction (à adapter selon vos besoins)
-                ExecuteProcedure("batch_repair_fk_violation",
-                    violation.TableName,
-                    violation.ColumnName,
-                    violation.ReferencedTable);
-            }
-        }
-        public List<ForeignKeyViolation> GetForeignKeyViolations()
-        {
-            var violations = new List<ForeignKeyViolation>();
-
-            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-            sql.AddDirectRequest("EXEC batch_get_fk_violations", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.Execute();
-
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                violations.Add(new ForeignKeyViolation
+                Console.WriteLine("Violations trouvées :");
+                foreach (var v in violations)
                 {
-                    TableName = sql.GetValueUsingColName(i, "TableName", 1, 1),
-                    ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
-                    ReferencedTable = sql.GetValueUsingColName(i, "ReferencedTable", 1, 1),
-                    ReferencedColumn = sql.GetValueUsingColName(i, "ReferencedColumn", 1, 1),
-                    ConstraintName = sql.GetValueUsingColName(i, "ConstraintName", 1, 1)
-                });
+                    Console.WriteLine($"- {v.TableName}.{v.ColumnName} => {v.ReferencedTable}.{v.ReferencedColumn}");
+                }
+
+                // 2. Corriger automatiquement
+                Console.WriteLine("Correction automatique...");
+                RepairForeignKeyViolations();
             }
 
-            return violations;
+            // 3. Activer avec vérification
+            Console.WriteLine("Activation des contraintes...");
+            ExecuteProcedure("batch_enable_fk_constraints");
         }
-        private HashSet<string> GetRelationTables()
+        catch (Exception ex)
         {
-            var relations = new HashSet<string>();
-            var sql = ExecuteProcedure("batch_get_relation_tables");
-        
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                relations.Add(sql.GetValueUsingColName(i, "TableName", 1, 1));
-            }
-        
-            return relations;
+            Console.WriteLine($"ERREUR Contraintes FK : {ex.Message}");
+            throw;
+        }
+    }
+
+    private void RepairForeignKeyViolations()
+    {
+        // 1. Identifier toutes les violations
+        var violations = GetForeignKeyViolations();
+
+        foreach (var violation in violations)
+        {
+            Console.WriteLine($"Correction violation: {violation.TableName}.{violation.ColumnName}");
+
+            // 2. Stratégie de correction (à adapter selon vos besoins)
+            ExecuteProcedure("batch_repair_fk_violation",
+                violation.TableName,
+                violation.ColumnName,
+                violation.ReferencedTable);
+        }
+    }
+    public List<ForeignKeyViolation> GetForeignKeyViolations()
+    {
+        var violations = new List<ForeignKeyViolation>();
+
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql.AddDirectRequest("EXEC batch_get_fk_violations", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.Execute();
+
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+        {
+            violations.Add(new ForeignKeyViolation
+            {
+                TableName = sql.GetValueUsingColName(i, "TableName", 1, 1),
+                ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
+                ReferencedTable = sql.GetValueUsingColName(i, "ReferencedTable", 1, 1),
+                ReferencedColumn = sql.GetValueUsingColName(i, "ReferencedColumn", 1, 1),
+                ConstraintName = sql.GetValueUsingColName(i, "ConstraintName", 1, 1)
+            });
         }
 
-        private void LoadRelationTables()
+        return violations;
+    }
+    private void LoadRelationTables()
+    {
+        var sql = ExecuteProcedure("batch_get_all_relation_tables");
+
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
         {
-            var sql = ExecuteProcedure("batch_get_all_relation_tables");
-        
-            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            {
-                var table = sql.GetValueUsingColName(i, "TableName", 1, 1);
-                var isExtended = sql.GetValueUsingColName(i, "IsExtended", 1, 1) == "1";
-        
-                if (isExtended)
-                    _extendedRelations.Add(table);
-                else
-                    _pureRelations.Add(table);
-            }
+            var table = sql.GetValueUsingColName(i, "TableName", 1, 1);
+            var isExtended = sql.GetValueUsingColName(i, "IsExtended", 1, 1) == "1";
+
+            if (isExtended)
+                _extendedRelations.Add(table);
+            else
+                _pureRelations.Add(table);
         }
-        private bool IsRelationTable(string tableName)
+    }
+
+    private void ImportTablesWithFKReadiness(IEnumerable<string> tables)
+    {
+        var skipped = new List<string>();
+        var pass = 1;
+
+        foreach (var table in tables)
         {
-            return _pureRelations.Contains(tableName) || _extendedRelations.Contains(tableName);
-        }
-        
-        private bool HasAdditionalColumns(string tableName)
-        {
-            return _extendedRelations.Contains(tableName);
+            if (_importedTables.Contains(table)) continue;
+
+            Console.WriteLine($"______________________________");
+            Console.WriteLine($"Traitement de la table {table}");
+            string[] skiptables = { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings" };
+            if (skiptables.Contains(table))
+            {
+                Console.WriteLine($"{table} ingoré pour le moment");
+                continue;
+            }
+            var fks = GetForeignKeyInfo(table);
+            bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
+
+            if (!ready)
+            {
+                Console.WriteLine($"[ATTENTE] (pass {pass}) {table} : FK non résolues. Mise en attente.");
+                skipped.Add(table);
+                continue;
+            }
+            Console.WriteLine($"[IMPORT] (pass {pass}) {table}");
+            ImportTable(table);
+            _importedTables.Add(table);
         }
 
-        public class ForeignKeyViolation
+        // Relancer la passe si des tables étaient en attente
+        if (skipped.Count > 0)
         {
-            public string TableName { get; set; }
-            public string ColumnName { get; set; }
-            public string ReferencedTable { get; set; }
-            public string ReferencedColumn { get; set; }
-            public string ConstraintName { get; set; }
+            if (pass > 5)
+            {
+                Console.WriteLine("⚠️ Trop de passes sans progrès. Tables restantes non résolues :");
+                foreach (var t in skipped)
+                    Console.WriteLine($" - {t}");
+                throw new Exception("Import bloqué : certaines dépendances FK n'ont pas pu être satisfaites.");
+            }
+
+            pass++;
+            Console.WriteLine($"🔁 Nouvelle passe pour {skipped.Count} table(s) ignorée(s).");
+            ImportTablesWithFKReadiness(skipped); // récursion contrôlée
         }
+    }
+    private void ImportExtendedRelationsSafely()
+    {
+        var orderedTables = GetOrderedExtendedRelations();
+        var skipped = new List<string>();
+        int pass = 1;
+
+        foreach (var table in orderedTables)
+        {
+            Console.WriteLine($"______________________________");
+            Console.WriteLine($"Traitement de la table {table}");
+            if (_importedTables.Contains(table)) continue;
+
+            var fks = GetForeignKeyInfo(table);
+            bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
+
+            if (!ready)
+            {
+                Console.WriteLine($"[ATTENTE] {table} (relation étendue) : FK manquantes");
+                skipped.Add(table);
+                continue;
+            }
+
+            Console.WriteLine($"[IMPORT] {table} (relation étendue)");
+            ImportExtendedRelationTable(table);
+            _importedTables.Add(table);
+        }
+
+        if (skipped.Count > 0)
+        {
+            if (pass > 5)
+            {
+                Console.WriteLine("🛑 Tables de relation étendues non importables après plusieurs passes :");
+                foreach (var t in skipped) Console.WriteLine($" - {t}");
+                throw new Exception("Import échoué pour des relations étendues à cause de dépendances non résolues.");
+            }
+
+            pass++;
+            Console.WriteLine($"🔁 Nouvelle passe relations étendues : {skipped.Count} table(s)");
+            ImportExtendedRelationsSafely(); // récursion contrôlée
+        }
+    }
+    private List<string> GetOrderedExtendedRelations()
+    {
+        var ordered = new List<string>();
+        var visited = new HashSet<string>();
+
+        void Visit(string table)
+        {
+            if (visited.Contains(table)) return;
+
+            var fks = GetForeignKeyInfo(table);
+            foreach (var fk in fks)
+            {
+                if (_extendedRelations.Contains(fk.ReferencedTableName))
+                    Visit(fk.ReferencedTableName);
+            }
+
+            visited.Add(table);
+            ordered.Add(table);
+        }
+
+        foreach (var table in _extendedRelations)
+        {
+            Visit(table);
+        }
+
+        return ordered;
+    }
+    private List<string> GetAllTables()
+    {
+        var tables = new List<string>();
+        DynamicSql sql = new DynamicSql();
+        sql.Dsn = "PXE1_PXE";            
+        sql.AddDirectRequest(@"EXEC [dbo].[batch_select_all_tables]", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(30000);
+        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+        {
+            tables.Add(sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1));
+        }
+        var filtred = tables.Where(t => !_ignoredTables.Contains(t,StringComparer.OrdinalIgnoreCase)).ToList();
+        return filtred;
+    }
+
+
+    public class ForeignKeyViolation
+    {
+        public string TableName { get; set; }
+        public string ColumnName { get; set; }
+        public string ReferencedTable { get; set; }
+        public string ReferencedColumn { get; set; }
+        public string ConstraintName { get; set; }
     }
 }
