@@ -1,106 +1,282 @@
-private string FormatValueForSql(object value, string sqlType)
+private void ImportTableCommon(string tableName, bool forceNullFK = false)
 {
-    if (value == null || value == DBNull.Value)
-        return "NULL";
+    Console.WriteLine("_______________________");
+    Console.WriteLine($"Import table {tableName}");
 
-    var str = value.ToString();
-    if (string.IsNullOrWhiteSpace(str) || str.Equals("NULL", StringComparison.OrdinalIgnoreCase))
-        return "NULL";
-
-    sqlType = sqlType ?? string.Empty;
-
-    // TEXT / CHAR types
-    if (sqlType.IndexOf("char", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("text", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("nchar", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("ntext", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("nvarchar", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("varchar", StringComparison.OrdinalIgnoreCase) >= 0)
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath))
     {
-        return $"'{str.Replace("'", "''")}'";
+        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
+        return;
     }
 
-    // DATETIME / DATE / TIME
-    if (sqlType.IndexOf("datetime", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("date", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("time", StringComparison.OrdinalIgnoreCase) >= 0)
+    var lines = File.ReadAllLines(csvPath);
+    if (lines.Length < 2)
     {
-        if (DateTime.TryParse(str, out var dt))
-            return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
-        // fallback : try to keep the raw value quoted (so SQL will TRY_CONVERT if your proc does)
-        return $"'{str.Replace("'", "''")}'";
+        Console.WriteLine($"⚠ CSV vide : {tableName}");
+        return;
     }
 
-    // BIT
-    if (sqlType.IndexOf("bit", StringComparison.OrdinalIgnoreCase) >= 0)
+    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+    var identityColumn = GetIdentityColumn(tableName); // name or null
+    var fkInfos = GetForeignKeyInfo(tableName);
+
+    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+    int insertedCount = 0;
+    int duplicateCount = 0;
+
+    Console.WriteLine($"{lines.Length - 1} lignes à importer...");
+
+    for (int i = 1; i < lines.Length; i++)
     {
-        if (str == "1" || str.Equals("true", StringComparison.OrdinalIgnoreCase)) return "1";
-        if (str == "0" || str.Equals("false", StringComparison.OrdinalIgnoreCase)) return "0";
-        // fallback
-        return "0";
-    }
+        var values = lines[i].Split(';').ToList();
 
-    // DECIMAL / NUMERIC / FLOAT / REAL
-    if (sqlType.IndexOf("decimal", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("numeric", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("float", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("real", StringComparison.OrdinalIgnoreCase) >= 0)
-    {
-        if (decimal.TryParse(str, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var d))
-            return d.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        // try with current culture then fallback to quoted
-        if (decimal.TryParse(str, out d))
-            return d.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return "NULL";
-    }
-
-    // INTEGER types
-    if (sqlType.IndexOf("int", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("bigint", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("smallint", StringComparison.OrdinalIgnoreCase) >= 0 ||
-        sqlType.IndexOf("tinyint", StringComparison.OrdinalIgnoreCase) >= 0)
-    {
-        if (long.TryParse(str, out var l))
-            return l.ToString();
-        return "NULL";
-    }
-
-    // UNIQUEIDENTIFIER
-    if (sqlType.IndexOf("uniqueidentifier", StringComparison.OrdinalIgnoreCase) >= 0)
-    {
-        // accept GUID as string
-        return $"'{str.Replace("'", "''")}'";
-    }
-
-    // default -> quote as string
-    return $"'{str.Replace("'", "''")}'";
-}
-private (string insertColumns, string insertValues) BuildInsertParameters(Dictionary<string, object> rowDict, string tableName)
-{
-    // Fixer l'ordre pour éviter tout décalage entre colonnes et valeurs
-    var cols = rowDict.Keys.ToList();
-
-    var colList = new List<string>();
-    var valList = new List<string>();
-
-    foreach (var col in cols)
-    {
-        // si tu as une méthode IsComputedColumn, on peut l'exclure :
-        try
+        // Safety: malformed line
+        if (values.Count != columnNames.Count)
         {
-            if (IsComputedColumn(tableName, col))
+            Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i + 1}: colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count}). Ligne ignorée.");
+            continue;
+        }
+
+        var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
+                                 .ToDictionary(x => x.col, x => (object)x.val); // keep object for BuildInsertParameters compatibility
+
+        // Keep oldId for mapping and remove identity column from insert
+        string oldId = null;
+        if (hasIdentity && rowDict.ContainsKey(identityColumn))
+        {
+            oldId = (rowDict[identityColumn] ?? "").ToString();
+            rowDict.Remove(identityColumn);
+        }
+
+        // Replace FK values with mapped new IDs or NULL/throw if missing
+        foreach (var fk in fkInfos)
+        {
+            if (!rowDict.ContainsKey(fk.ColumnName))
                 continue;
-        }
-        catch
-        {
-            // si IsComputedColumn n'existe pas ou échoue, on continue quand même
+
+            if (forceNullFK)
+            {
+                rowDict[fk.ColumnName] = null; // will become NULL
+                continue;
+            }
+
+            var oldFkValue = (rowDict[fk.ColumnName] ?? "").ToString();
+            if (string.IsNullOrWhiteSpace(oldFkValue))
+            {
+                rowDict[fk.ColumnName] = null;
+                continue;
+            }
+
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
+                map.TryGetValue(oldFkValue, out var newFkValue))
+            {
+                rowDict[fk.ColumnName] = newFkValue;
+            }
+            else
+            {
+                // If FK nullable, set NULL, otherwise it's a blocking error
+                if (IsForeignKeyNullable(fk))
+                    rowDict[fk.ColumnName] = null;
+                else
+                    throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+            }
         }
 
-        var colType = GetColumnType(tableName, col) ?? string.Empty;
-        colList.Add($"[{col}]");
-        valList.Add(FormatValueForSql(rowDict[col], colType));
+        // Build insert columns & values for SQL
+        // BuildInsertParameters expected to return (columns, values) using FormatValueForSql internally.
+        var (insertColumns, insertValues) = BuildInsertParameters(rowDict, tableName);
+        // But BuildInsertParameters may return values joined by ", " (for SQL). We also need a safe token list:
+        var tokens = new List<string>();
+        foreach (var col in rowDict.Keys)
+        {
+            // Format value token using the same FormatValueForSql logic to ensure exact match with inserted values
+            var token = FormatValueForSql(rowDict[col], GetColumnType(tableName, col));
+            tokens.Add(token);
+        }
+        // Join tokens using a safe separator CHAR(31)
+        string valueTokens = string.Join(((char)31).ToString(), tokens);
+
+        // Call stored proc (with @ValueTokens)
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+
+        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
+          @TableName = $table$, 
+          @Columns = $cols$, 
+          @Values = $vals$,
+          @HasIdentity = $identity$,
+          @ValueTokens = $valTokens$";
+
+        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("table", tableName, true, 0);
+        sql.SetSecureParam("cols", insertColumns, true, 0);
+        sql.SetSecureParam("vals", insertValues, true, 0);
+        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
+        sql.SetSecureParam("valTokens", valueTokens, true, 0);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+
+        sql.Execute();
+
+        string newId = hasIdentity ? sql.GetValueUsingColName(1, "NewID", 1, 1) : null;
+        string errorMessage = sql.GetValueUsingColName(1, "ErrorMessage", 1, 1);
+
+        // Detect Doublon (proc returns "Doublon")
+        if (!string.IsNullOrEmpty(errorMessage) && errorMessage.ToLower().Contains("doublon"))
+        {
+            duplicateCount++;
+            continue;
+        }
+
+        // Save mapping oldId -> newId
+        if (hasIdentity && !string.IsNullOrEmpty(newId))
+        {
+            if (oldId != null)
+            {
+                if (!_idMappings.ContainsKey(tableName))
+                    _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                if (!_idMappings[tableName].ContainsKey(oldId))
+                    _idMappings[tableName][oldId] = newId;
+            }
+        }
+
+        // increment inserted count if no error message (success) — note: for non-identity tables NewID is null but ErrorMessage null => success
+        if (string.IsNullOrEmpty(errorMessage))
+            insertedCount++;
     }
 
-    // Garder le même séparateur que tu utilises côté SQL (STRING_SPLIT tolère les espaces grâce au TRIM côté SQL)
-    return (string.Join(", ", colList), string.Join(", ", valList));
+    Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
 }
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
+GO
+
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName      NVARCHAR(128),
+    @Columns        NVARCHAR(MAX),   -- ex: [Col1],[Col2],...
+    @Values         NVARCHAR(MAX),   -- ex: 'val1',NULL,123,...
+    @HasIdentity    BIT = 0,
+    @ValueTokens    NVARCHAR(MAX) = NULL  -- valeurs formatées et séparées par CHAR(31) (optionnel mais recommandé)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @identityCol NVARCHAR(128) = NULL;
+    DECLARE @pkCols NVARCHAR(MAX) = NULL;
+    DECLARE @whereClause NVARCHAR(MAX) = '';
+    DECLARE @exists BIT = 0;
+    DECLARE @output TABLE (NewID INT);
+
+    -- 1) trouver colonne identity si demandé
+    IF @HasIdentity = 1
+    BEGIN
+        SELECT TOP 1 @identityCol = COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @TableName
+          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
+    END
+
+    -- 2) récupérer colonnes PK/UK hors identity
+    SELECT @pkCols = STRING_AGG(QUOTENAME(c.COLUMN_NAME), ',')
+    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
+        ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+       AND tc.TABLE_NAME = c.TABLE_NAME
+    WHERE tc.TABLE_NAME = @TableName
+      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+      AND c.COLUMN_NAME <> ISNULL(@identityCol, '');
+
+    -- 3) construire liste colonnes et valeurs ordonnées
+    IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
+    BEGIN
+        DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
+        DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
+
+        -- colonnes : on enlève [ ] et on trim
+        INSERT INTO @colList (ColName, Ord)
+        SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@Columns, ',') c
+        WHERE RTRIM(LTRIM(value)) <> '';
+
+        -- valeurs : si @ValueTokens fourni -> on split sur CHAR(31) (séparateur sûr),
+        -- sinon fallback sur virgule (moins fiable, legacy)
+        IF @ValueTokens IS NOT NULL
+        BEGIN
+            INSERT INTO @valList (Val, Ord)
+            SELECT LTRIM(RTRIM(value)),
+                   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+            FROM STRING_SPLIT(@ValueTokens, CHAR(31)) v
+            WHERE RTRIM(LTRIM(value)) <> '';
+        END
+        ELSE
+        BEGIN
+            INSERT INTO @valList (Val, Ord)
+            SELECT LTRIM(RTRIM(value)),
+                   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+            FROM STRING_SPLIT(@Values, ',') v
+            WHERE RTRIM(LTRIM(value)) <> '';
+        END
+
+        -- Construire WHERE uniquement pour les colonnes PK/UK trouvées :
+        SELECT @whereClause = 
+               COALESCE(@whereClause + ' AND ', '') +
+               CASE WHEN UPPER(v.Val) = 'NULL' THEN QUOTENAME(c.ColName) + ' IS NULL'
+                    ELSE QUOTENAME(c.ColName) + ' = ' + v.Val END
+        FROM @colList c
+        JOIN @valList v ON c.Ord = v.Ord
+        WHERE c.ColName IN (
+            SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value, '[', ''), ']', '')) )
+            FROM STRING_SPLIT(@pkCols, ',') p
+        );
+    END
+
+    -- 4) si whereClause construite -> tester existence (doublon)
+    IF LEN(@whereClause) > 0
+    BEGIN
+        DECLARE @checkSql NVARCHAR(MAX) = 
+            N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM ' 
+            + QUOTENAME(@TableName) + ' WHERE ' + @whereClause + N') THEN 1 ELSE 0 END';
+
+        EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out=@exists OUTPUT;
+
+        IF @exists = 1
+        BEGIN
+            SELECT NULL AS NewID, 'Doublon' AS ErrorMessage;
+            RETURN;
+        END
+    END
+
+    -- 5) Construction & exécution de l'INSERT (on suppose que @Values est déjà formaté côté appelant)
+    DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
+    IF @HasIdentity = 1 AND @identityCol IS NOT NULL
+        SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@identityCol) + ' AS NewID ';
+    SET @sql += N'SELECT ' + @Values;
+
+    BEGIN TRY
+        IF @HasIdentity = 1
+            INSERT INTO @output EXEC sp_executesql @sql;
+        ELSE
+            EXEC sp_executesql @sql;
+
+        IF @HasIdentity = 1
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM @output)
+            BEGIN
+                SELECT NULL AS NewID, 'INSERT effectué mais aucun IDENTITY retourné' AS ErrorMessage;
+                RETURN;
+            END
+            SELECT NewID, NULL AS ErrorMessage FROM @output;
+            RETURN;
+        END
+        ELSE
+        BEGIN
+            SELECT NULL AS NewID, NULL AS ErrorMessage;
+            RETURN;
+        END
+    END TRY
+    BEGIN CATCH
+        SELECT NULL AS NewID, ERROR_MESSAGE() AS ErrorMessage;
+    END CATCH
+END
+GO
