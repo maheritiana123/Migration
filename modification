@@ -1,570 +1,62 @@
-IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
-GO
-
-CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName NVARCHAR(128),
-    @Columns NVARCHAR(MAX),
-    @Values NVARCHAR(MAX),
-    @HasIdentity BIT = 0
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @sql NVARCHAR(MAX);
-    DECLARE @identityCol NVARCHAR(128);
-    DECLARE @pkCols NVARCHAR(MAX) = '';
-    DECLARE @whereClause NVARCHAR(MAX) = '';
-    DECLARE @exists BIT = 0;
-    DECLARE @output TABLE (NewID INT);
-
-    -- Colonne IDENTITY si applicable
-    IF @HasIdentity = 1
-    BEGIN
-        SELECT TOP 1 @identityCol = COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = @TableName
-          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
-    END
-
-    -- PK/UK hors IDENTITY
-    SELECT @pkCols = STRING_AGG(QUOTENAME(c.COLUMN_NAME), ',')
-    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE c
-        ON tc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-       AND tc.TABLE_NAME = c.TABLE_NAME
-    WHERE tc.TABLE_NAME = @TableName
-      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
-      AND c.COLUMN_NAME <> ISNULL(@identityCol, '');
-
-    -- WHERE basé sur PK/UK
-    IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
-    BEGIN
-        DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
-        DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
-
-        INSERT INTO @colList
-        SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))), ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-        FROM STRING_SPLIT(@Columns, ',')
-        WHERE RTRIM(LTRIM(value)) <> '';
-
-        INSERT INTO @valList
-        SELECT LTRIM(RTRIM(value)), ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-        FROM STRING_SPLIT(@Values, ',')
-        WHERE RTRIM(LTRIM(value)) <> '';
-
-        SELECT @whereClause = COALESCE(@whereClause + ' AND ', '') + QUOTENAME(c.ColName) + ' = ' + v.Val
-        FROM @colList c
-        JOIN @valList v ON c.Ord = v.Ord
-        WHERE c.ColName IN (
-            SELECT REPLACE(REPLACE(p, '[', ''), ']', '') 
-            FROM STRING_SPLIT(@pkCols, ',')
-        );
-    END
-
-    -- Vérif doublon
-    IF LEN(@whereClause) > 0
-    BEGIN
-        DECLARE @checkSql NVARCHAR(MAX) = 
-            N'SELECT @out = CASE WHEN EXISTS (' + 
-            N'SELECT 1 FROM ' + QUOTENAME(@TableName) + ' WHERE ' + @whereClause + 
-            N') THEN 1 ELSE 0 END';
-
-        EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out=@exists OUTPUT;
-
-        IF @exists = 1
-        BEGIN
-            SELECT NULL AS NewID, 'Doublon' AS ErrorMessage;
-            RETURN;
-        END
-    END
-
-    -- INSERT sécurisé avec conversion
-    SET @sql = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
-    IF @HasIdentity = 1
-        SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@identityCol) + ' AS NewID ';
-
-    DECLARE @convertedValues NVARCHAR(MAX) = N'';
-    ;WITH ValueCTE AS (
-        SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
-        FROM STRING_SPLIT(@Values, ',')
-    )
-    SELECT @convertedValues = STRING_AGG(
-        CASE 
-            WHEN value LIKE '''%''' THEN
-                CASE 
-                    WHEN TRY_CONVERT(DATETIME, REPLACE(value, '''', '')) IS NOT NULL 
-                        THEN 'TRY_CONVERT(DATETIME, ' + value + ')'
-                    WHEN TRY_CONVERT(DECIMAL(18,6), REPLACE(value, '''', '')) IS NOT NULL 
-                        THEN 'TRY_CONVERT(DECIMAL(18,6), ' + value + ')'
-                    ELSE value
-                END
-            ELSE value
-        END, ','
-    )
-    FROM ValueCTE;
-
-    SET @sql += N'SELECT ' + @convertedValues;
-
-    BEGIN TRY
-        IF @HasIdentity = 1
-            INSERT INTO @output EXEC sp_executesql @sql;
-        ELSE
-            EXEC sp_executesql @sql;
-
-        IF @HasIdentity = 1
-            SELECT NewID, NULL AS ErrorMessage FROM @output;
-        ELSE
-            SELECT NULL AS NewID, NULL AS ErrorMessage;
-    END TRY
-    BEGIN CATCH
-        SELECT NULL AS NewID, ERROR_MESSAGE() AS ErrorMessage;
-    END CATCH
-END
-GO
-public class DatabaseMigrator
+private List<string> GetAllTables()
 {
-    private readonly string _importPath;
-    private readonly HashSet<string> _importedTables = new HashSet<string>();
-    private readonly DynamicSql _transactionSql;
-    private readonly HashSet<string> _ignoredTables = new HashSet<string> { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings", "BASE36" };
+    var tables = new List<string>();
 
-    // mapping oldId -> newId per table (string keys to be safe)
-    private readonly Dictionary<string, Dictionary<string, string>> _idMappings = new Dictionary<string, Dictionary<string, string>>();
-
-    public DatabaseMigrator(string importPath)
+    try
     {
-        _importPath = importPath;
-        _transactionSql = new DynamicSql { Dsn = "PXE1_PXE" };
-    }
+        // Essaye d'abord la procédure fournie (plus rapide / custom)
+        DynamicSql sql = ExecuteProcedure("batch_select_all_tables");
 
-    // --------------------------
-    // MAIN: PerformMigration
-    // --------------------------
-    public void PerformMigration(bool disableForeignKeys = true)
-    {
-        // 1) Récupère toutes les tables (et filtre _ignoredTables)
-        var allTables = GetAllTables(); // renvoie la liste filtrée
-
-        // 2) Classer par catégorie (mères / pure relations / extended relations)
-        var normalTables = new List<string>();
-        var pureRelations = new List<string>();
-        var extendedRelations = new List<string>();
-
-        foreach (var t in allTables)
+        if (sql != null && sql.ReturnedRows(1, 1) > 0)
         {
-            var fks = GetForeignKeyInfo(t);
-            var columns = GetTableColumns(t); // HashSet<string>
-            var fkCount = fks.Count;
-            var colCount = columns.Count;
-
-            // heuristique : pure relation = seulement FK cols (+ event. ID), extended = FK plus autres colonnes
-            if (fkCount >= 2 && colCount == fkCount) // très stricte : uniquement FK
-                pureRelations.Add(t);
-            else if (fkCount >= 1 && colCount > fkCount)
-                extendedRelations.Add(t);
-            else
-                normalTables.Add(t);
-        }
-
-        // 3) On va trier chaque catégorie en respectant dépendances et détecter cycles
-        var (orderedNormal, cyclicNormal) = SortTablesByDependencies(normalTables);
-        var (orderedPure, cyclicPure) = SortTablesByDependencies(pureRelations);
-        var (orderedExt, cyclicExt) = SortTablesByDependencies(extendedRelations);
-
-        // 4) Transaction globale
-        if (disableForeignKeys)
-            DisableAllForeignKeys();
-
-        ExecuteTransactionCommand("BEGIN TRANSACTION");
-
-        try
-        {
-            // 5) Import normal tables
-            Console.WriteLine("=== Import tables normales ===");
-            foreach (var table in orderedNormal)
-                ImportTableCommon(table, forceNullFK: false);
-
-            // 6) Import pure relations (ordered)
-            Console.WriteLine("=== Import relations pures ===");
-            foreach (var table in orderedPure)
-                ImportTableCommon(table, forceNullFK: false);
-
-            // 7) Import extended relations (ordered)
-            Console.WriteLine("=== Import relations étendues ===");
-            foreach (var table in orderedExt)
-                ImportTableCommon(table, forceNullFK: false);
-
-            // 8) Gestion des cycles : concaténation de toutes les tables cycliques trouvées
-            var cyclicAll = cyclicNormal.Concat(cyclicPure).Concat(cyclicExt).Distinct().ToList();
-            if (cyclicAll.Count > 0)
+            for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
             {
-                Console.WriteLine("=== Gestion des tables cycliques (insertion 1ère passe avec FK=null) ===");
-                foreach (var table in cyclicAll)
-                {
-                    ImportTableCommon(table, forceNullFK: true);
-                }
+                var table = sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1);
+                if (string.IsNullOrWhiteSpace(table)) continue;
 
-                Console.WriteLine("=== Mise à jour des FK circulaires (2ème passe) ===");
-                UpdateCyclicForeignKeys(cyclicAll);
-            }
-
-            ExecuteTransactionCommand("COMMIT TRANSACTION");
-
-            if (disableForeignKeys)
-            {
-                EnableAllForeignKeys();
-                ValidateDataIntegrity();
-            }
-
-            Console.WriteLine("✅ Migration terminée avec succès.");
-        }
-        catch (Exception ex)
-        {
-            ExecuteTransactionCommand("ROLLBACK TRANSACTION");
-            Console.WriteLine($"❌ Erreur de migration : {ex.Message}");
-            throw;
-        }
-    }
-
-    // --------------------------
-    // SortTablesByDependencies -> retourne (ordered, cyclicTables)
-    // --------------------------
-    private (List<string> ordered, List<string> cyclicTables) SortTablesByDependencies(IEnumerable<string> tables)
-    {
-        var graph = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var t in tables)
-        {
-            var fks = GetForeignKeyInfo(t).Select(f => f.ReferencedTableName).Where(r => tables.Contains(r)).Distinct().ToList();
-            graph[t] = fks;
-        }
-
-        var ordered = new List<string>();
-        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var cyclic = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        void Visit(string node)
-        {
-            if (visited.Contains(node)) return;
-            if (visiting.Contains(node))
-            {
-                // cycle detected -> mark node and stop deeper recursion on this path
-                cyclic.Add(node);
-                return;
-            }
-
-            visiting.Add(node);
-
-            if (graph.TryGetValue(node, out var deps))
-            {
-                foreach (var d in deps)
-                {
-                    Visit(d);
-                    if (visiting.Contains(d)) // if still in visiting, mark as cyclic
-                        cyclic.Add(d);
-                }
-            }
-
-            visiting.Remove(node);
-            visited.Add(node);
-            ordered.Add(node);
-        }
-
-        foreach (var t in tables)
-            Visit(t);
-
-        // collect cyclic closure (propagate to whole cycle)
-        // simple approach : if A -> B and B in cyclic, mark A too if A depends on B
-        var additional = new List<string>();
-        foreach (var t in graph.Keys)
-        {
-            var deps = graph[t];
-            if (deps.Any(d => cyclic.Contains(d)) && deps.Any(d => graph[d].Contains(t)))
-                additional.Add(t);
-        }
-        foreach (var a in additional) cyclic.Add(a);
-
-        return (ordered, cyclic.ToList());
-    }
-
-    // --------------------------
-    // ImportTableCommon : insertion ligne à ligne via proc batch_safe_insert_with_type_conversion
-    // - forceNullFK = true : on remplace les FK par NULL pour éviter violation lors de cycles
-    // - compte insérés / doublons
-    // - enregistre mapping oldId -> newId si table possède IDENTITY
-    // --------------------------
-    private void ImportTableCommon(string tableName, bool forceNullFK = false)
-    {
-        Console.WriteLine("_______________________");
-        Console.WriteLine($"Import table {tableName}");
-
-        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-        if (!File.Exists(csvPath))
-        {
-            Console.WriteLine($"⚠ CSV introuvable : {tableName}");
-            return;
-        }
-
-        var lines = File.ReadAllLines(csvPath);
-        if (lines.Length < 2)
-        {
-            Console.WriteLine($"⚠ CSV vide : {tableName}");
-            return;
-        }
-
-        var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-        var identityColumn = GetIdentityColumn(tableName); // nom de la colonne identity (ou null)
-        var fkInfos = GetForeignKeyInfo(tableName);
-
-        bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-        int insertedCount = 0;
-        int duplicateCount = 0;
-
-        Console.WriteLine($"{lines.Length - 1} lignes à importer...");
-
-        for (int i = 1; i < lines.Length; i++)
-        {
-            var values = lines[i].Split(';').ToList();
-
-            // Safety: if CSV malformed length mismatch -> skip line and log
-            if (values.Count != columnNames.Count)
-            {
-                Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i+1}: colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count}). Ligne ignorée.");
-                continue;
-            }
-
-            var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
-                                     .ToDictionary(x => x.col, x => x.val);
-
-            // Si table a IDENTITY : conserver oldId pour mapping puis retirer de rowDict
-            string oldId = null;
-            if (hasIdentity && rowDict.ContainsKey(identityColumn))
-            {
-                oldId = rowDict[identityColumn];
-                rowDict.Remove(identityColumn); // on ne réinsère pas l'IDENTITY
-            }
-
-            // Remplacement des FK par les nouveaux IDs (ou NULL si force)
-            foreach (var fk in fkInfos)
-            {
-                if (!rowDict.ContainsKey(fk.ColumnName))
-                    continue; // colonne absente dans CSV -> skip mapping
-
-                if (forceNullFK)
-                {
-                    rowDict[fk.ColumnName] = "NULL";
+                // Filtre insensible à la casse
+                if (_ignoredTables.Any(x => x.Equals(table, StringComparison.OrdinalIgnoreCase)))
                     continue;
-                }
 
-                var oldFkValue = rowDict[fk.ColumnName];
-                if (string.IsNullOrWhiteSpace(oldFkValue))
-                {
-                    // empty value -> keep NULL
-                    rowDict[fk.ColumnName] = "NULL";
-                    continue;
-                }
-
-                if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
-                    map.TryGetValue(oldFkValue, out var newFkValue))
-                {
-                    rowDict[fk.ColumnName] = newFkValue;
-                }
-                else
-                {
-                    // si FK nullable, store NULL, sinon erreur bloquante (problème de dépendance)
-                    if (IsForeignKeyNullable(fk))
-                        rowDict[fk.ColumnName] = "NULL";
-                    else
-                        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
-                }
+                tables.Add(table);
             }
 
-            // Build columns & values formatted for SQL proc
-            var (insertColumns, insertValues) = BuildInsertParameters(rowDict, tableName);
-
-            // Call stored proc
-            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-            string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
-                  @TableName = $table$, 
-                  @Columns = $cols$, 
-                  @Values = $vals$,
-                  @HasIdentity = $identity$";
-
-            sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.SetSecureParam("table", tableName, true, 0);
-            sql.SetSecureParam("cols", insertColumns, true, 0);
-            sql.SetSecureParam("vals", insertValues, true, 0);
-            sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
-
-            sql.Execute();
-
-            string newId = hasIdentity ? sql.GetValueUsingColName(1, "NewID", 1, 1) : null;
-            string errorMessage = sql.GetValueUsingColName(1, "ErrorMessage", 1, 1);
-
-            // Doublon détecté (proc renvoie "Doublon")
-            if (!string.IsNullOrEmpty(errorMessage) && errorMessage.ToLower().Contains("doublon"))
-            {
-                duplicateCount++;
-                continue;
-            }
-
-            // Si insertion ok et table a identity -> sauvegarder mapping oldId -> newId
-            if (hasIdentity && !string.IsNullOrEmpty(newId))
-            {
-                if (oldId != null)
-                {
-                    if (!_idMappings.ContainsKey(tableName))
-                        _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-                    // si duplicate of oldId already mapped, keep first mapping
-                    if (!_idMappings[tableName].ContainsKey(oldId))
-                        _idMappings[tableName][oldId] = newId;
-                }
-            }
-
-            // incrémente insérés seulement si pas doublon et insertion réussie (ou table sans identity)
-            // For non-identity tables, as proc returns NewID=null but ErrorMessage=null => treat as inserted
-            if (string.IsNullOrEmpty(errorMessage))
-                insertedCount++;
+            return tables;
         }
-
-        Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GetAllTables] Proc batch_select_all_tables a échoué : {ex.Message}");
+        // on continue vers le fallback
     }
 
-    // --------------------------
-    // UpdateCyclicForeignKeys
-    // Utilise les procédures SQL existantes pour mettre à jour les FKs après la 1ere passe.
-    // On s'appuie sur ta procédure batch_create_mapping_table / batch_update_circular_references.
-    // --------------------------
-    private void UpdateCyclicForeignKeys(List<string> cyclicTables)
+    // --- Fallback : INFORMATION_SCHEMA.TABLES ---
+    try
     {
-        // Pour chaque table A dans cycle, pour chaque table B référencée par A dans le cycle,
-        // on appelle batch_create_mapping_table pour B (prépare mapping), puis batch_update_circular_references
-        // pour mettre à jour A.ColFk -> newId à partir de mapping.
+        DynamicSql sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql2.AddDirectRequest(
+            @"SELECT TABLE_NAME 
+              FROM INFORMATION_SCHEMA.TABLES 
+              WHERE TABLE_TYPE = 'BASE TABLE' 
+                AND TABLE_SCHEMA = 'dbo'
+              ORDER BY TABLE_NAME",
+            MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql2.Execute(30000);
 
-        foreach (var table in cyclicTables)
+        for (int i = 1; i <= sql2.ReturnedRows(1, 1); i++)
         {
-            // récupérer FK vers d'autres tables cycliques
-            var fks = GetForeignKeyInfo(table).Where(fk => cyclicTables.Contains(fk.ReferencedTableName)).ToList();
-
-            foreach (var fk in fks)
-            {
-                Console.WriteLine($"Mise à jour références circulaires: {table}.{fk.ColumnName} -> {fk.ReferencedTableName}");
-
-                // 1) create temp mapping for referenced table (proc must build temp mapping based on old/new ids)
-                ExecuteProcedure("batch_create_mapping_table", referencedTable: fk.ReferencedTableName);
-
-                // 2) batch_update_circular_references update table's FK column using #ID_Mapping
-                ExecuteProcedure("batch_update_circular_references",
-                    TableName: table,
-                    ColumnName: fk.ColumnName,
-                    referencedTable: fk.ReferencedTableName);
-
-                // 3) drop mapping table
-                ExecuteProcedure("batch_drop_mapping_table");
-            }
+            var table = sql2.GetValueUsingColName(i, "TABLE_NAME", 1, 1);
+            if (string.IsNullOrWhiteSpace(table)) continue;
+            if (_ignoredTables.Any(x => x.Equals(table, StringComparison.OrdinalIgnoreCase)))
+                continue;
+            tables.Add(table);
         }
     }
-
-    // --------------------------
-    // Helpers / stubs (réutilise tes implémentations existantes)
-    // - ExecuteTransactionCommand already exists in ton codebase; si non, utilise ExecuteProcedure wrapper below
-    // - DisableAllForeignKeys / EnableAllForeignKeys / ValidateDataIntegrity etc. are expected present
-    // --------------------------
-
-    private DynamicSql ExecuteProcedure(string procedure, string TableName = null, string ColumnName = null, string referencedTable = null, string ReferenceColumn = null)
+    catch (Exception ex)
     {
-        // Utilise la fonction que tu as déjà. (copie ici si tu veux)
-        string request = @"EXEC [dbo].[" + procedure + "] ";
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-
-        if (!string.IsNullOrEmpty(TableName))
-            request += "@TableName = $table$ ";
-        if (!string.IsNullOrEmpty(ColumnName))
-            request += ", @ColumnName = $col$ ";
-        if (!string.IsNullOrEmpty(referencedTable))
-            request += ", @ReferencedTable = $refTable$ ";
-        if (!string.IsNullOrEmpty(ReferenceColumn))
-            request += ", @ReferenceColumn = $refCol$ ";
-
-        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-        if (!string.IsNullOrEmpty(TableName))
-            sql.SetSecureParam("table", TableName, true, 0);
-        if (!string.IsNullOrEmpty(ColumnName))
-            sql.SetSecureParam("col", ColumnName, true, 0);
-        if (!string.IsNullOrEmpty(referencedTable))
-            sql.SetSecureParam("refTable", referencedTable, true, 0);
-        if (!string.IsNullOrEmpty(ReferenceColumn))
-            sql.SetSecureParam("refCol", ReferenceColumn, true, 0);
-
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-        return sql;
+        Console.WriteLine($"[GetAllTables] Fallback INFORMATION_SCHEMA a échoué : {ex.Message}");
     }
 
-    private void ExecuteTransactionCommand(string command)
-    {
-        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest(command, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-    }
-
-    // Stub wrappers for previously implemented methods (assumed available)
-    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
-    {
-        // utilise ta procédure batch_get_table_foreign_keys (déjà fournie)
-        return /* ta méthode existante */;
-    }
-
-    private string GetIdentityColumn(string tableName)
-    {
-        // utilise ta procédure batch_has_identity_column / batch_get_primary_key_column (déjà fournie)
-        return /* ta méthode existante */;
-    }
-
-    private HashSet<string> GetTableColumns(string tableName)
-    {
-        // utilise batch_get_table_columns
-        return /* ta méthode existante */;
-    }
-
-    private bool IsForeignKeyNullable(ForeignKeyInfo fk)
-    {
-        // appelle INFORMATION_SCHEMA via ExecuteProcedure (tu as déjà une implémentation plus haut)
-        return /* ta méthode existante */;
-    }
-
-    private (string Columns, string Values) BuildInsertParameters(Dictionary<string, object> record, string tableName)
-    {
-        // utilise ta méthode existante BuildInsertParameters pour exclure les computed columns, et FormatValueForSql par colonne
-        return /* ta méthode existante */;
-    }
-
-    private void DisableAllForeignKeys()
-    {
-        ExecuteProcedure("batch_disable_all_foreign_keys");
-    }
-
-    private void EnableAllForeignKeys()
-    {
-        ExecuteProcedure("batch_enable_fk_constraints");
-    }
-
-    private void ValidateDataIntegrity()
-    {
-        ExecuteProcedure("batch_validate_data_integrity");
-    }
-
-    // Classes utilitaires
-    public class ForeignKeyInfo
-    {
-        public string TableName { get; set; }
-        public string ColumnName { get; set; }
-        public string ReferencedTableName { get; set; }
-        public string ReferencedColumnName { get; set; }
-        public bool IsNullable { get; set; }
-    }
+    return tables;
 }
