@@ -1,103 +1,3 @@
-private void ImportTable(string tableName)
-{
-    Console.WriteLine($"▶️ Import de la table : {tableName}");
-
-    var csvPath = Path.Combine(_importDirectory, $"{tableName}.csv");
-    if (!File.Exists(csvPath))
-    {
-        Console.WriteLine($"⚠ Fichier CSV introuvable pour {tableName}, import ignoré.");
-        return;
-    }
-
-    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
-    if (lines.Length <= 1)
-    {
-        Console.WriteLine($"⚠ CSV vide pour {tableName}");
-        return;
-    }
-
-    // 📌 Lecture de l'en-tête
-    var headers = lines[0].Split(';').Select(h => h.Trim()).ToArray();
-
-    // 📌 Récupération de la structure réelle de la table en base
-    var tableColumns = GetTableColumnNames(tableName);
-
-    // 📌 Mapping CSV -> index
-    var headerMap = headers
-        .Select((name, idx) => new { name, idx })
-        .ToDictionary(x => x.name, x => x.idx, StringComparer.OrdinalIgnoreCase);
-
-    ExecuteInTransaction(() =>
-    {
-        // 📌 Boucle sur toutes les lignes de données
-        for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
-        {
-            var cells = lines[lineIndex].Split(';');
-
-            // 🔹 Construction des valeurs pour les colonnes existantes
-            var insertValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var col in tableColumns)
-            {
-                if (headerMap.TryGetValue(col, out var csvIndex) && csvIndex < cells.Length)
-                {
-                    insertValues[col] = string.IsNullOrEmpty(cells[csvIndex]) ? null : cells[csvIndex];
-                }
-                else
-                {
-                    // Colonne manquante dans le CSV → NULL
-                    insertValues[col] = null;
-                }
-            }
-
-            // 📌 Mapping des FK par nom de colonne
-            var fkInfos = GetForeignKeyInfo(tableName);
-            foreach (var fk in fkInfos)
-            {
-                if (insertValues.TryGetValue(fk.ColumnName, out var val) && !string.IsNullOrEmpty(val))
-                {
-                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var mapping) &&
-                        mapping.TryGetValue(val, out var newId))
-                    {
-                        insertValues[fk.ColumnName] = newId;
-                    }
-                    else
-                    {
-                        // Si FK non trouvée mais nullable → mettre NULL
-                        if (fk.IsNullable)
-                            insertValues[fk.ColumnName] = null;
-                        else
-                            throw new Exception($"[Erreur FK] Valeur '{val}' introuvable pour {fk.ColumnName} dans {tableName}");
-                    }
-                }
-            }
-
-            // 📌 Construction de la requête INSERT
-            var colNames = string.Join(", ", insertValues.Keys.Select(c => $"[{c}]"));
-            var colValues = string.Join(", ", insertValues.Values.Select(v => v == null ? "NULL" : $"'{v.Replace("'", "''")}'"));
-
-            var insertSql = $"INSERT INTO [{tableName}] ({colNames}) VALUES ({colValues})";
-
-            // 📌 Exécution via ton framework maison
-            DynamicSql sql = new DynamicSql();
-            sql.Dsn = "PXE1_PXE";
-            sql.AddDirectRequest(insertSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-            sql.Execute(30000);
-        }
-    });
-}
-private void ImportPureRelationTable(string tableName)
-{
-    Console.WriteLine($"▶️ Import de la relation pure : {tableName}");
-    ImportTableCommon(tableName, isPureRelation: true);
-}
-
-private void ImportExtendedRelationTable(string tableName)
-{
-    Console.WriteLine($"▶️ Import de la relation étendue : {tableName}");
-    ImportTableCommon(tableName, isPureRelation: false);
-}
 private void ImportTableCommon(string tableName, bool isPureRelation)
 {
     var csvPath = Path.Combine(_importDirectory, $"{tableName}.csv");
@@ -114,96 +14,94 @@ private void ImportTableCommon(string tableName, bool isPureRelation)
         return;
     }
 
-    // 📌 Lecture de l'en-tête
     var headers = lines[0].Split(';').Select(h => h.Trim()).ToArray();
-
-    // 📌 Colonnes réelles de la table en base
     var tableColumns = GetTableColumnNames(tableName);
 
-    // 📌 Mapping nom colonne CSV -> index
     var headerMap = headers
         .Select((name, idx) => new { name, idx })
         .ToDictionary(x => x.name, x => x.idx, StringComparer.OrdinalIgnoreCase);
 
-    ExecuteInTransaction(() =>
+    for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
     {
-        for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
+        var cells = lines[lineIndex].Split(';');
+        var insertValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        // 🔹 Correspondance colonnes CSV -> colonnes table
+        foreach (var col in tableColumns)
         {
-            var cells = lines[lineIndex].Split(';');
-
-            var insertValues = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var col in tableColumns)
-            {
-                if (headerMap.TryGetValue(col, out var csvIndex) && csvIndex < cells.Length)
-                {
-                    insertValues[col] = string.IsNullOrEmpty(cells[csvIndex]) ? null : cells[csvIndex];
-                }
-                else
-                {
-                    insertValues[col] = null;
-                }
-            }
-
-            // 📌 Mapping FK (même logique pour pure/étendue)
-            var fkInfos = GetForeignKeyInfo(tableName);
-            foreach (var fk in fkInfos)
-            {
-                if (insertValues.TryGetValue(fk.ColumnName, out var val) && !string.IsNullOrEmpty(val))
-                {
-                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var mapping) &&
-                        mapping.TryGetValue(val, out var newId))
-                    {
-                        insertValues[fk.ColumnName] = newId;
-                    }
-                    else
-                    {
-                        if (fk.IsNullable)
-                            insertValues[fk.ColumnName] = null;
-                        else
-                            throw new Exception($"[Erreur FK] Valeur '{val}' introuvable pour {fk.ColumnName} dans {tableName}");
-                    }
-                }
-            }
-
-            // 📌 Construction INSERT
-            var colNames = string.Join(", ", insertValues.Keys.Select(c => $"[{c}]"));
-            var colValues = string.Join(", ", insertValues.Values.Select(v => v == null ? "NULL" : $"'{v.Replace("'", "''")}'"));
-            var insertSql = $"INSERT INTO [{tableName}] ({colNames}) VALUES ({colValues})";
-
-            // 📌 Exécution via framework maison
-            DynamicSql sql = new DynamicSql();
-            sql.Dsn = "PXE1_PXE";
-            sql.AddDirectRequest(insertSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-            sql.Execute(30000);
+            if (headerMap.TryGetValue(col, out var csvIndex) && csvIndex < cells.Length)
+                insertValues[col] = string.IsNullOrEmpty(cells[csvIndex]) ? null : cells[csvIndex];
+            else
+                insertValues[col] = null;
         }
-    });
-}
-private List<string> GetTableColumnNames(string tableName)
-{
-    var query = $@"
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = '{tableName}'
-        ORDER BY ORDINAL_POSITION
-    ";
 
-    DynamicSql sql = new DynamicSql();
-    sql.Dsn = "PXE1_PXE";
-    sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(30000);
+        // 🔹 Gestion FK
+        var fkInfos = GetForeignKeyInfo(tableName);
+        foreach (var fk in fkInfos)
+        {
+            if (insertValues.TryGetValue(fk.ColumnName, out var val) && !string.IsNullOrEmpty(val))
+            {
+                if (_idMappings.TryGetValue(fk.ReferencedTableName, out var mapping) &&
+                    mapping.TryGetValue(val, out var newId))
+                    insertValues[fk.ColumnName] = newId;
+                else if (fk.IsNullable)
+                    insertValues[fk.ColumnName] = null;
+                else
+                    throw new Exception($"[Erreur FK] Valeur '{val}' introuvable pour {fk.ColumnName} dans {tableName}");
+            }
+        }
 
-    var colCount = sql.ReturnedRows(1, 1);
-    var result = new List<string>();
+        // 🔹 Construction requête INSERT
+        var colNames = string.Join(", ", insertValues.Keys.Select(c => $"[{c}]"));
+        var colValues = string.Join(", ", insertValues.Values.Select(v => v == null ? "NULL" : $"'{v.Replace("'", "''")}'"));
+        var insertSql = $"INSERT INTO [{tableName}] ({colNames}) VALUES ({colValues})";
 
-    for (int r = 1; r <= colCount; r++)
-    {
-        var colName = sql.GetValueUsingColName(r, "COLUMN_NAME", 1, 1);
-        if (!string.IsNullOrEmpty(colName))
-            result.Add(colName);
+        // 🔹 Exécution via DynamicSql
+        DynamicSql sql = new DynamicSql();
+        sql.Dsn = "PXE1_PXE";
+        sql.AddDirectRequest(insertSql, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(30000);
     }
+}
+public void PerformMigration()
+{
+    Console.WriteLine("🚀 Début de la migration...");
 
-    return result;
+    // ✅ Transaction globale
+    BeginTransaction();
+
+    try
+    {
+        // 📌 Fusion de toutes les listes en un ordre précis
+        var allTables = new List<(string Name, string Type)>
+        {
+            // Tables sans dépendances
+        };
+        allTables.AddRange(_importOrder.Select(t => (t, "Table normale")));
+        allTables.AddRange(_pureRelations.Select(t => (t, "Relation pure")));
+        allTables.AddRange(_extendedRelations.Select(t => (t, "Relation étendue")));
+
+        foreach (var (tableName, type) in allTables)
+        {
+            try
+            {
+                Console.WriteLine($"▶️ Import {type} : {tableName}");
+                ImportTableCommon(tableName, isPureRelation: type == "Relation pure");
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"[Erreur Import {type}] {tableName} → {ex.Message}", ex);
+            }
+        }
+
+        // ✅ Validation si tout s'est bien passé
+        CommitTransaction();
+        Console.WriteLine("✅ Migration terminée avec succès.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ Migration annulée : {ex.Message}");
+        RollbackTransaction();
+    }
 }
