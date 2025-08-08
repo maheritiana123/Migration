@@ -1,8 +1,15 @@
-private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
+private void GetAllTables()
 {
-    var fkList = new List<ForeignKeyInfo>();
+    _importOrder.Clear();
+    _pureRelations.Clear();
+    _extendedRelations.Clear();
 
-    var query = $"EXEC sp_GetForeignKeyInfo '{tableName}'";
+    var query = @"
+        SELECT TABLE_NAME 
+        FROM INFORMATION_SCHEMA.TABLES 
+        WHERE TABLE_TYPE = 'BASE TABLE'
+        ORDER BY TABLE_NAME
+    ";
 
     DynamicSql sql = new DynamicSql();
     sql.Dsn = "PXE1_PXE";
@@ -11,15 +18,38 @@ private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
     sql.Execute(30000);
 
     var rowCount = sql.ReturnedRows(1, 1);
+
     for (int i = 1; i <= rowCount; i++)
     {
-        fkList.Add(new ForeignKeyInfo
+        var tableName = sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1);
+
+        // Ignorer si table dans la liste noire
+        if (_ignoredTables.Contains(tableName, StringComparer.OrdinalIgnoreCase))
+            continue;
+
+        // Analyse de la structure
+        var columns = GetTableColumnNames(tableName);
+        var fks = GetForeignKeyInfo(tableName);
+        var pkColumns = GetPrimaryKeyColumns(tableName);
+
+        if (fks.Count == 2 && columns.Count == 2 && pkColumns.Count == 2)
         {
-            ColumnName = sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1),
-            ReferencedTableName = sql.GetValueUsingColName(i, "REFERENCED_TABLE", 1, 1),
-            IsNullable = sql.GetValueUsingColName(i, "IS_NULLABLE", 1, 1) == "1"
-        });
+            // Relation pure (2 FK uniquement)
+            _pureRelations.Add(tableName);
+        }
+        else if (fks.Count >= 1 && columns.Count > fks.Count)
+        {
+            // Relation étendue (FK + colonnes supplémentaires)
+            _extendedRelations.Add(tableName);
+        }
+        else
+        {
+            // Table normale
+            _importOrder.Add(tableName);
+        }
     }
 
-    return fkList;
+    Console.WriteLine($"📋 Tables normales : {_importOrder.Count}");
+    Console.WriteLine($"📋 Relations pures : {_pureRelations.Count}");
+    Console.WriteLine($"📋 Relations étendues : {_extendedRelations.Count}");
 }
