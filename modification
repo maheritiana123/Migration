@@ -1,435 +1,188 @@
-IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
-GO
+// ... au début de ImportTableCommon, après avoir lu headers/identity/fkInfos, remplace la préparation des colonnes par :
 
-CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName      NVARCHAR(128),
-    @Columns        NVARCHAR(MAX),   -- ex: [Col1],[Col2],...
-    @ValuesBatch    NVARCHAR(MAX),   -- lignes séparées par CHAR(30), valeurs (tokens) par CHAR(31)
-    @HasIdentity    BIT = 0,
-    @IdentityCol    NVARCHAR(128) = NULL  -- peut rester NULL : auto-détection
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET LOCK_TIMEOUT 5000;          -- évite les blocages trop longs
-    SET DEADLOCK_PRIORITY LOW;      -- limite les deadlocks
+// Colonnes candidates depuis le CSV
+var insertColumnsList = new List<string>(columnNames);
 
-    -------------------------------------------------------------------------
-    -- Prépare la liste des colonnes insérées (ordonnées)
-    -------------------------------------------------------------------------
-    DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
-    INSERT INTO @colList (ColName, Ord)
-    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
-           ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-    FROM STRING_SPLIT(@Columns, ',')
-    WHERE RTRIM(LTRIM(value)) <> '';
+// Enlever l'identity
+if (hasIdentity)
+    insertColumnsList.RemoveAll(c => c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase));
 
-    -------------------------------------------------------------------------
-    -- Détection de la colonne IDENTITY si @HasIdentity = 1 et pas fournie
-    -------------------------------------------------------------------------
-    IF @HasIdentity = 1 AND (@IdentityCol IS NULL OR LEN(@IdentityCol)=0)
-    BEGIN
-        SELECT TOP 1 @IdentityCol = COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = @TableName
-          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
-    END
+// ⚠️ Filtrer les colonnes non insérables (computed, rowversion/ timestamp)
+insertColumnsList = insertColumnsList
+    .Where(c =>
+    {
+        // computed ?
+        if (IsComputedColumn(tableName, c)) return false;
 
-    -------------------------------------------------------------------------
-    -- Colonnes PK/UK hors colonne identity (pour détection des doublons)
-    -------------------------------------------------------------------------
-    DECLARE @pkCols NVARCHAR(MAX) = NULL;
-    SELECT @pkCols = STRING_AGG(QUOTENAME(kcu.COLUMN_NAME), ',')
-    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-      ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-     AND tc.TABLE_NAME = kcu.TABLE_NAME
-    WHERE tc.TABLE_NAME = @TableName
-      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
-      AND kcu.COLUMN_NAME <> ISNULL(@IdentityCol, '');
+        // rowversion/timestamp => non insérable
+        var type = GetColumnType(tableName, c);
+        if (!string.IsNullOrEmpty(type) &&
+            (type.Equals("timestamp", StringComparison.OrdinalIgnoreCase) ||
+             type.Equals("rowversion", StringComparison.OrdinalIgnoreCase)))
+            return false;
 
-    -------------------------------------------------------------------------
-    -- Sépare le batch en lignes (RowIndex = ordre 1..N)
-    -------------------------------------------------------------------------
-    DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
-    INSERT INTO @rows (Tokens)
-    SELECT value
-    FROM STRING_SPLIT(ISNULL(@ValuesBatch, N''), CHAR(30))
-    WHERE LEN(RTRIM(LTRIM(value))) > 0;
+        return true;
+    })
+    .ToList();
 
-    -------------------------------------------------------------------------
-    -- Résultats par ligne : RowIndex / NewID / ErrorMessage
-    -------------------------------------------------------------------------
-    DECLARE @out TABLE (RowIndex INT, NewID NVARCHAR(100), ErrorMessage NVARCHAR(MAX));
+// Colonnes SQL pour la proc (ordre fixe pour toutes les lignes du batch)
+string columnsSql = string.Join(",", insertColumnsList.Select(c => $"[{c}]"));
 
-    DECLARE @i INT = 1, @n INT = (SELECT COUNT(*) FROM @rows);
-    WHILE @i <= @n
-    BEGIN
-        DECLARE @tokens NVARCHAR(MAX) = (SELECT Tokens FROM @rows WHERE RowIndex=@i);
+// Compteurs
+int insertedCount = 0;
+int duplicateCount = 0;
+int errorCount = 0;
+int skippedStructural = 0;
 
-        -- Découpe tokens colonnes (CHAR(31))
-        DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
-        IF @tokens IS NOT NULL AND LEN(@tokens) > 0
-        BEGIN
-            INSERT INTO @valList (Val, Ord)
-            SELECT LTRIM(RTRIM(value)),
-                   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-            FROM STRING_SPLIT(@tokens, CHAR(31))
-            WHERE RTRIM(LTRIM(value)) <> '';
-        END
+// ...
 
-        ---------------------------------------------------------------------
-        -- Détection de doublon selon PK/UK (si présentes)
-        ---------------------------------------------------------------------
-        DECLARE @whereClause NVARCHAR(MAX) = N'';
-        IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
-        BEGIN
-            DECLARE @conds TABLE (Cond NVARCHAR(MAX), Ord INT);
-            INSERT INTO @conds (Cond, Ord)
-            SELECT
-                CASE WHEN UPPER(v.Val) = 'NULL'
-                     THEN QUOTENAME(c.ColName) + ' IS NULL'
-                     ELSE QUOTENAME(c.ColName) + ' = ' + v.Val END,
-                c.Ord
-            FROM @colList c
-            JOIN @valList v ON c.Ord = v.Ord
-            WHERE c.ColName IN (
-                SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value, '[', ''), ']', '')))
-                FROM STRING_SPLIT(@pkCols, ',') p
-            );
+// DANS LA BOUCLE PAR BATCH, remplace la constitution des tokens par :
+var valueTokensPerRow = new List<string>(capacity: end - start);
+var oldIdsForBatch = new List<string>(capacity: end - start);
 
-            SELECT @whereClause = STRING_AGG(Cond, ' AND ') WITHIN GROUP (ORDER BY Ord)
-            FROM @conds;
-
-            IF LEN(@whereClause) > 0
-            BEGIN
-                DECLARE @exists BIT = 0;
-                DECLARE @checkSql NVARCHAR(MAX) =
-                    N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
-                    + QUOTENAME(@TableName) + ' WITH (NOLOCK) WHERE ' + @whereClause + N') THEN 1 ELSE 0 END';
-
-                EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out=@exists OUTPUT;
-
-                IF @exists = 1
-                BEGIN
-                    INSERT INTO @out (RowIndex, NewID, ErrorMessage) VALUES (@i, NULL, N'Doublon');
-                    SET @i += 1;
-                    CONTINUE;
-                END
-            END
-        END
-
-        ---------------------------------------------------------------------
-        -- Construire la liste des valeurs pour INSERT
-        ---------------------------------------------------------------------
-        DECLARE @values NVARCHAR(MAX) = N'';
-        SELECT @values = STRING_AGG(Val, ',') WITHIN GROUP (ORDER BY Ord)
-        FROM @valList;
-
-        IF LEN(ISNULL(@values, '')) = 0
-            SET @values = N'NULL';
-
-        ---------------------------------------------------------------------
-        -- Construire et exécuter l'INSERT (une ligne)
-        ---------------------------------------------------------------------
-        DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
-        IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-            SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@IdentityCol) + ' AS NewID ';
-        SET @sql += N'SELECT ' + @values;
-
-        BEGIN TRY
-            IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-            BEGIN
-                DECLARE @tmp TABLE (NewID NVARCHAR(100));
-                INSERT INTO @tmp EXEC sp_executesql @sql;
-
-                INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-                SELECT @i, NewID, NULL FROM @tmp;
-            END
-            ELSE
-            BEGIN
-                EXEC sp_executesql @sql;
-                INSERT INTO @out (RowIndex, NewID, ErrorMessage) VALUES (@i, NULL, NULL);
-            END
-        END TRY
-        BEGIN CATCH
-            INSERT INTO @out (RowIndex, NewID, ErrorMessage) VALUES (@i, NULL, ERROR_MESSAGE());
-        END CATCH
-
-        SET @i += 1;
-    END
-
-    -------------------------------------------------------------------------
-    -- Retour des résultats du batch
-    -------------------------------------------------------------------------
-    SELECT RowIndex, NewID, ErrorMessage
-    FROM @out
-    ORDER BY RowIndex;
-END
-GO
-
-// ⬇️ À coller dans DatabaseMigrator.cs
-private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 100)
+for (int i = start; i < end; i++)
 {
-    Console.WriteLine("_______________________");
-    Console.WriteLine($"Import table {tableName}");
-
-    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath))
+    var values = lines[i].Split(';').ToList();
+    if (values.Count != columnNames.Count)
     {
-        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
-        return;
+        Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i + 1}: colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count}). Ligne ignorée.");
+        skippedStructural++;
+        continue;
     }
 
-    var lines = File.ReadAllLines(csvPath);
-    if (lines.Length < 2)
+    var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
+                             .ToDictionary(x => x.col, x => (object)x.val);
+
+    string oldId = null;
+    if (hasIdentity && rowDict.ContainsKey(identityColumn))
     {
-        Console.WriteLine($"⚠ CSV vide : {tableName}");
-        return;
+        oldId = (rowDict[identityColumn] ?? "").ToString();
+        rowDict.Remove(identityColumn);
     }
 
-    // En-têtes CSV
-    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-
-    // Colonne identity (si présente)
-    var identityColumn = GetIdentityColumn(tableName); // helper ci-dessous si tu ne l’as pas déjà
-    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-
-    // Infos FK
-    var fkInfos = GetForeignKeyInfo(tableName);
-
-    // On enlève la colonne identity de la liste des colonnes insérées
-    var insertColumnsList = new List<string>(columnNames);
-    if (hasIdentity)
-        insertColumnsList.RemoveAll(c => c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase));
-
-    // Colonnes SQL pour la proc (ordre fixe pour toutes les lignes du batch)
-    string columnsSql = string.Join(",", insertColumnsList.Select(c => $"[{c}]"));
-
-    int insertedCount = 0;
-    int duplicateCount = 0;
-
-    Console.WriteLine($"{lines.Length - 1} lignes à importer (batch={batchSize})...");
-
-    // On parcourt le CSV par batch
-    for (int start = 1; start < lines.Length; start += batchSize)
+    // Mapping FK
+    foreach (var fk in fkInfos)
     {
-        int end = Math.Min(start + batchSize, lines.Length);
-        var valueTokensPerRow = new List<string>(capacity: end - start);
-        var oldIdsForBatch = new List<string>(capacity: end - start); // aligne RowIndex de la proc
+        if (!rowDict.ContainsKey(fk.ColumnName)) continue;
 
-        for (int i = start; i < end; i++)
+        if (forceNullFK)
         {
-            var values = lines[i].Split(';').ToList();
-            if (values.Count != columnNames.Count)
-            {
-                Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i + 1}: colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count}). Ligne ignorée.");
-                continue;
-            }
-
-            // Dictionnaire colonne→valeur (string -> object pour la compat)
-            var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
-                                     .ToDictionary(x => x.col, x => (object)x.val);
-
-            // Sauvegarde oldId puis on n’insert PAS la colonne identity
-            string oldId = null;
-            if (hasIdentity && rowDict.ContainsKey(identityColumn))
-            {
-                oldId = (rowDict[identityColumn] ?? "").ToString();
-                rowDict.Remove(identityColumn);
-            }
-            oldIdsForBatch.Add(oldId); // reste aligné avec l’ordre des lignes du batch
-
-            // Mapping des FK (ou NULL si nullable / forceNullFK)
-            foreach (var fk in fkInfos)
-            {
-                if (!rowDict.ContainsKey(fk.ColumnName))
-                    continue;
-
-                if (forceNullFK)
-                {
-                    rowDict[fk.ColumnName] = null;
-                    continue;
-                }
-
-                var raw = rowDict[fk.ColumnName];
-                var oldFkValueStr = (raw ?? "").ToString();
-                if (string.IsNullOrWhiteSpace(oldFkValueStr))
-                {
-                    rowDict[fk.ColumnName] = null;
-                    continue;
-                }
-
-                // Cherche le mapping du nouvel ID
-                if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
-                    map.TryGetValue(oldFkValueStr, out var mappedObj)) // Dictionary<object,object> -> clé string OK
-                {
-                    rowDict[fk.ColumnName] = mappedObj;
-                }
-                else if (IsForeignKeyNullable(fk))
-                {
-                    rowDict[fk.ColumnName] = null;
-                }
-                else
-                {
-                    throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
-                }
-            }
-
-            // Tokens formatés (même ordre que columnsSql / insertColumnsList)
-            var tokens = new List<string>(insertColumnsList.Count);
-            foreach (var col in insertColumnsList)
-            {
-                var valObj = rowDict.TryGetValue(col, out var v) ? v : null;
-                string token = FormatValueForSql(valObj, GetColumnType(tableName, col));
-                tokens.Add(token);
-            }
-
-            // Concatène les valeurs de la ligne avec CHAR(31)
-            valueTokensPerRow.Add(string.Join(((char)31).ToString(), tokens));
-        }
-
-        if (valueTokensPerRow.Count == 0)
+            rowDict[fk.ColumnName] = null;
             continue;
+        }
 
-        // Concatène toutes les lignes du batch avec CHAR(30)
-        string valuesBatch = string.Join(((char)30).ToString(), valueTokensPerRow);
-
-        // === Un seul appel SQL pour tout le batch ===
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
-            @TableName = $table$,
-            @Columns = $cols$,
-            @ValuesBatch = $valsBatch$,
-            @HasIdentity = $identity$,
-            @IdentityCol = $idCol$";
-
-        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSecureParam("table", tableName, true, 0);
-        sql.SetSecureParam("cols", columnsSql, true, 0);
-        sql.SetSecureParam("valsBatch", valuesBatch, true, 0);
-        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
-        sql.SetSecureParam("idCol", hasIdentity ? identityColumn : null, true, 0);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-
-        // Timeout étendu (5 minutes)
-        sql.Execute(300000);
-
-        // Parcours des retours de la proc : RowIndex / NewID / ErrorMessage
-        int rows = sql.ReturnedRows(1, 1);
-        for (int r = 1; r <= rows; r++)
+        var raw = rowDict[fk.ColumnName];
+        var oldFkValueStr = (raw ?? "").ToString();
+        if (string.IsNullOrWhiteSpace(oldFkValueStr))
         {
-            // RowIndex est 1-based à l’intérieur du batch
-            var rowIndexStr = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
-            int rowIndex = 0;
-            int.TryParse(rowIndexStr, out rowIndex);
+            rowDict[fk.ColumnName] = null;
+            continue;
+        }
 
-            string newId = hasIdentity ? sql.GetValueUsingColName(r, "NewID", 1, 1) : null;
-            string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
-
-            bool isDup = !string.IsNullOrEmpty(errorMessage) &&
-                         errorMessage.IndexOf("doublon", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (isDup)
-            {
-                duplicateCount++;
-                continue;
-            }
-
-            // Mapping oldId -> newId si identity
-            if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsForBatch.Count)
-            {
-                string oldIdAtIndex = oldIdsForBatch[rowIndex - 1];
-                if (!string.IsNullOrEmpty(oldIdAtIndex))
-                {
-                    if (!_idMappings.ContainsKey(tableName))
-                        _idMappings[tableName] = new Dictionary<object, object>();
-
-                    if (!_idMappings[tableName].ContainsKey(oldIdAtIndex))
-                        _idMappings[tableName][oldIdAtIndex] = newId;
-                }
-            }
-
-            // Succès si pas d’erreur
-            if (string.IsNullOrEmpty(errorMessage))
-                insertedCount++;
+        if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
+            map.TryGetValue(oldFkValueStr, out var mappedObj))
+        {
+            rowDict[fk.ColumnName] = mappedObj;
+        }
+        else if (IsForeignKeyNullable(fk))
+        {
+            rowDict[fk.ColumnName] = null;
+        }
+        else
+        {
+            // On ne jette pas toute la migration : on log et saute la ligne
+            Console.WriteLine($"[FK MANQUANTE] {tableName} Ligne {i + 1} : {fk.ColumnName} → {fk.ReferencedTableName} (valeur '{oldFkValueStr}')");
+            errorCount++;
+            goto SkipThisRow;
         }
     }
 
-    Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
+    // Tokens dans l'ORDRE de insertColumnsList (déjà filtrée des colonnes non insérables)
+    {
+        var tokens = new List<string>(insertColumnsList.Count);
+        foreach (var col in insertColumnsList)
+        {
+            var valObj = rowDict.TryGetValue(col, out var v) ? v : null;
+            string token = FormatValueForSql(valObj, GetColumnType(tableName, col));
+            tokens.Add(token);
+        }
+        valueTokensPerRow.Add(string.Join(((char)31).ToString(), tokens));
+        oldIdsForBatch.Add(oldId);
+    }
+
+SkipThisRow:
+    ;
 }
 
-// Helper: si tu ne l’as pas déjà
-private string GetIdentityColumn(string tableName)
+// ... puis exécution d’un SEUL exec pour le batch (inchangé sauf petits ajouts) :
+
+if (valueTokensPerRow.Count == 0)
+    continue;
+
+string valuesBatch = string.Join(((char)30).ToString(), valueTokensPerRow);
+
+DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
+    @TableName = $table$,
+    @Columns = $cols$,
+    @ValuesBatch = $valsBatch$,
+    @HasIdentity = $identity$,
+    @IdentityCol = $idCol$";
+
+sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+sql.SetSecureParam("table", tableName, true, 0);
+sql.SetSecureParam("cols", columnsSql, true, 0);
+sql.SetSecureParam("valsBatch", valuesBatch, true, 0);
+sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
+sql.SetSecureParam("idCol", hasIdentity ? identityColumn : "", true, 0); // ⚠️ passer chaîne vide plutôt que NULL
+sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+sql.Execute(300000);
+
+// Lecture des retours
+int rows = sql.ReturnedRows(1, 1);
+for (int r = 1; r <= rows; r++)
 {
-    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-    sql.AddDirectRequest(@"
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = $t$
-          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1",
-        MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    var rowIndexStr   = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
+    var newId         = hasIdentity ? sql.GetValueUsingColName(r, "NewID", 1, 1) : null;
+    var errorMessage  = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
 
-    sql.SetSecureParam("t", tableName, true, 0);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(30000);
+    int rowIndex = 0;
+    int.TryParse(rowIndexStr, out rowIndex);
 
-    return sql.ReturnedRows(1, 1) > 0 ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1) : null;
+    bool isDup = !string.IsNullOrEmpty(errorMessage) &&
+                 errorMessage.IndexOf("doublon", StringComparison.OrdinalIgnoreCase) >= 0;
+
+    if (isDup)
+    {
+        duplicateCount++;
+        continue;
+    }
+
+    if (!string.IsNullOrEmpty(errorMessage))
+    {
+        errorCount++;
+        // Log les 3 premières erreurs du batch pour aider au diag
+        if (errorCount <= 3)
+            Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {errorMessage}");
+        continue;
+    }
+
+    // Succès → mapping ID si identity
+    if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsForBatch.Count)
+    {
+        string oldIdAtIndex = oldIdsForBatch[rowIndex - 1];
+        if (!string.IsNullOrEmpty(oldIdAtIndex))
+        {
+            if (!_idMappings.ContainsKey(tableName))
+                _idMappings[tableName] = new Dictionary<object, object>();
+
+            if (!_idMappings[tableName].ContainsKey(oldIdAtIndex))
+                _idMappings[tableName][oldIdAtIndex] = newId;
+        }
+    }
+
+    insertedCount++;
 }
 
-// Helper: formate les valeurs pour SQL (NULL, quotes, dates, numériques…)
-private string FormatValueForSql(object value, string columnType)
-{
-    if (value == null) return "NULL";
-
-    string s = value.ToString();
-    if (string.IsNullOrWhiteSpace(s)) return "NULL";
-
-    string t = (columnType ?? "").ToLowerInvariant();
-
-    // numériques
-    if (t == "int" || t == "bigint" || t == "smallint" || t == "tinyint")
-        return int.TryParse(s, out var i) ? i.ToString() : "NULL";
-
-    if (t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "float" || t == "real")
-    {
-        // utilise invariant pour le point décimal
-        if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dec))
-            return dec.ToString(System.Globalization.CultureInfo.InvariantCulture);
-        return "NULL";
-    }
-
-    // bool
-    if (t == "bit")
-    {
-        if (s.Equals("1") || s.Equals("true", StringComparison.OrdinalIgnoreCase)) return "1";
-        if (s.Equals("0") || s.Equals("false", StringComparison.OrdinalIgnoreCase)) return "0";
-        return "NULL";
-    }
-
-    // dates
-    if (t.StartsWith("date"))
-    {
-        // on laisse la proc SQL convertir (le token doit être quoted)
-        if (DateTime.TryParse(s, out var _))
-            return $"'{s.Replace("'", "''")}'";
-        return "NULL";
-    }
-    if (t.Contains("time"))
-    {
-        if (DateTime.TryParse(s, out var _))
-            return $"'{s.Replace("'", "''")}'";
-        return "NULL";
-    }
-
-    // uniqueidentifier
-    if (t == "uniqueidentifier")
-    {
-        if (Guid.TryParse(s, out var _))
-            return $"'{s}'";
-        return "NULL";
-    }
-
-    // par défaut: chaîne
-    return $"'{s.Replace("'", "''")}'";
-}
+// ... et à la fin du method, remplace le log final par :
+Console.WriteLine($"✅ Table {tableName} : {insertedCount} insérées, {duplicateCount} doublons ignorés, {errorCount} erreurs, {skippedStructural} lignes sautées (structure).");
