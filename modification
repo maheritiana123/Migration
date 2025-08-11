@@ -1,24 +1,61 @@
----------------------------------------------------------------------
-        -- DEBUG : vérifier nb colonnes vs nb valeurs, et montrer un extrait
-        ---------------------------------------------------------------------
-        DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-        DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+-- 3) construire liste colonnes et valeurs ordonnées
+IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
+BEGIN
+    DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
+    DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
 
-        IF @valCount <> @colCount
-        BEGIN
-            DECLARE @tokensPreview NVARCHAR(400) = REPLACE(@tokens, CHAR(31), N'|');
-            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-            VALUES (
-                @i, NULL,
-                CONCAT(
-                    N'Mismatch cols/vals: cols=', @colCount, N' / vals=', @valCount,
-                    N' | Columns=', @Columns,
-                    N' | Tokens=', @tokensPreview
-                )
-            );
-            SET @i += 1;
-            CONTINUE;
-        END
+    -- colonnes
+    INSERT INTO @colList (ColName, Ord)
+    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    FROM STRING_SPLIT(@Columns, ',') c
+    WHERE RTRIM(LTRIM(value)) <> '';
+
+    -- valeurs
+    IF @ValueTokens IS NOT NULL
+    BEGIN
+        INSERT INTO @valList (Val, Ord)
+        SELECT LTRIM(RTRIM(value)),
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@ValueTokens, CHAR(31)) v
+        WHERE RTRIM(LTRIM(value)) <> '';
+    END
+    ELSE
+    BEGIN
+        INSERT INTO @valList (Val, Ord)
+        SELECT LTRIM(RTRIM(value)),
+               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+        FROM STRING_SPLIT(@Values, ',') v
+        WHERE RTRIM(LTRIM(value)) <> '';
+    END
+
+    ---------------------------------------------------------------------
+    -- DEBUG : vérifier nb colonnes vs nb valeurs
+    ---------------------------------------------------------------------
+    DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+    DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+
+    IF @valCount <> @colCount
+    BEGIN
+        PRINT 'DEBUG: mismatch colonne/valeurs';
+        PRINT 'Cols = ' + CAST(@colCount AS NVARCHAR(10)) + ' / Vals = ' + CAST(@valCount AS NVARCHAR(10));
+        PRINT 'Columns = ' + @Columns;
+        PRINT 'ValueTokens (séparateur |) = ' + REPLACE(ISNULL(@ValueTokens, ''), CHAR(31), '|');
+    END
+    ---------------------------------------------------------------------
+
+    -- Construire WHERE uniquement pour les colonnes PK/UK trouvées :
+    SELECT @whereClause = 
+           COALESCE(@whereClause + ' AND ', '') +
+           CASE WHEN UPPER(v.Val) = 'NULL' THEN QUOTENAME(c.ColName) + ' IS NULL'
+                ELSE QUOTENAME(c.ColName) + ' = ' + v.Val END
+    FROM @colList c
+    JOIN @valList v ON c.Ord = v.Ord
+    WHERE c.ColName IN (
+        SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value, '[', ''), ']', '')) )
+        FROM STRING_SPLIT(@pkCols, ',') p
+    );
+END
 
 
 
