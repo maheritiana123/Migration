@@ -1,58 +1,52 @@
--- AVANT
-INSERT INTO @colList (ColName, Ord)
-SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
-       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-FROM STRING_SPLIT(@Columns, ',')
-WHERE RTRIM(LTRIM(value)) <> '';
+---------------------------------------------------------------------
+        -- DEBUG : vérifier nb colonnes vs nb valeurs, et montrer un extrait
+        ---------------------------------------------------------------------
+        DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+        DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
 
--- APRÈS
-INSERT INTO @colList (ColName, Ord)
-SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
-       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-FROM STRING_SPLIT(@Columns, ',');
-
-
-
-
--- AVANT
-INSERT INTO @valList (Val, Ord)
-SELECT LTRIM(RTRIM(value)),
-       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-FROM STRING_SPLIT(@tokens, CHAR(31))
-WHERE RTRIM(LTRIM(value)) <> '';
-
--- APRÈS
-INSERT INTO @valList (Val, Ord)
-SELECT LTRIM(RTRIM(value)),
-       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-FROM STRING_SPLIT(@tokens, CHAR(31));
-
-
-garde fou
-
-DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
-IF @valCount <> @colCount
-BEGIN
-    INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-    VALUES (
-        @i, NULL,
-        CONCAT(N'Mismatch colonnes/valeurs: cols=', @colCount,
-               N' / vals=', @valCount,
-               N'  (vérifier @Columns vs tokens de la ligne)')
-    );
-    SET @i += 1;
-    CONTINUE;
-END
+        IF @valCount <> @colCount
+        BEGIN
+            DECLARE @tokensPreview NVARCHAR(400) = REPLACE(@tokens, CHAR(31), N'|');
+            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
+            VALUES (
+                @i, NULL,
+                CONCAT(
+                    N'Mismatch cols/vals: cols=', @colCount, N' / vals=', @valCount,
+                    N' | Columns=', @Columns,
+                    N' | Tokens=', @tokensPreview
+                )
+            );
+            SET @i += 1;
+            CONTINUE;
+        END
 
 
 
 
+// DEBUG : on s'assure qu'on envoie bien autant de tokens que de colonnes
+if (tokens.Count != insertColumnsList.Count)
+{
+    Console.WriteLine($"[DEBUG] {tableName} CSV line #{i+1}: tokens={tokens.Count} vs cols={insertColumnsList.Count}");
+}
 
-BEGIN CATCH
-    INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-    VALUES (
-        @i, NULL,
-        LEFT(CONCAT(N'ERR: ', ERROR_MESSAGE(), N' | vals=', @values), 400)
-    );
-END CATCH
+// DEBUG : aucun token ne contient les séparateurs spéciaux
+char RS = (char)30, US = (char)31;
+for (int k = 0; k < tokens.Count; k++)
+{
+    if (tokens[k].IndexOf(RS) >= 0 || tokens[k].IndexOf(US) >= 0)
+    {
+        Console.WriteLine($"[DEBUG] {tableName} CSV line #{i+1}: token {k} contient un séparateur (caractère 30/31).");
+    }
+}
+
+
+
+string EscapeToken(string t)
+{
+    if (t == null) return null;
+    return t.Replace(((char)31).ToString(), ""); // retire le US
+}
+
+...
+var safeTokens = tokens.Select(EscapeToken).ToList();
+valueTokensPerRow.Add(string.Join(((char)31).ToString(), safeTokens));
