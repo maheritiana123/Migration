@@ -19,9 +19,9 @@ BEGIN
     -------------------------------------------------------------------------
     DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
     INSERT INTO @colList (ColName, Ord)
-	SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
-		   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-	FROM STRING_SPLIT(@Columns, ',');
+    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    FROM STRING_SPLIT(@Columns, ',');
 
     -------------------------------------------------------------------------
     -- Détection de la colonne IDENTITY si @HasIdentity = 1 et pas fournie
@@ -66,17 +66,62 @@ BEGIN
     BEGIN
         DECLARE @tokens NVARCHAR(MAX) = (SELECT Tokens FROM @rows WHERE RowIndex=@i);
 
-        -- Découpe tokens colonnes (CHAR(31))
+        -- 1) Split des valeurs (CHAR(31)) dans @valList
         DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
         IF @tokens IS NOT NULL AND LEN(@tokens) > 0
         BEGIN
-			INSERT INTO @valList (Val, Ord)
-			SELECT LTRIM(RTRIM(value)),
-				   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-			FROM STRING_SPLIT(@tokens, CHAR(31));
-        END		
+            INSERT INTO @valList (Val, Ord)
+            SELECT LTRIM(RTRIM(value)),
+                   ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+            FROM STRING_SPLIT(@tokens, CHAR(31));
+        END
+
+        -- 2) ⚖️ Normaliser: nb valeurs == nb colonnes
+        DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+        DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+
+        IF @valCount <> @colCount
+        BEGIN
+            -- Message d'info (non bloquant) pour diagnostiquer
+            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
+            VALUES (
+                @i, NULL,
+                CONCAT(
+                    N'Mismatch cols/vals (auto-fix): cols=', @colCount, N' / vals=', @valCount,
+                    N' | Columns=', @Columns,
+                    N' | Tokens=', REPLACE(ISNULL(@tokens, N''), CHAR(31), N'|')
+                )
+            );
+
+            -- Trop de valeurs → tronquer aux @colCount premières
+            IF @valCount > @colCount
+            BEGIN
+                ;WITH v AS (
+                    SELECT Val, Ord, ROW_NUMBER() OVER (ORDER BY Ord) AS rn
+                    FROM @valList
+                )
+                DELETE FROM @valList;
+
+                INSERT INTO @valList (Val, Ord)
+                SELECT Val, rn
+                FROM v
+                WHERE rn <= @colCount
+                ORDER BY rn;
+            END
+            -- Pas assez de valeurs → compléter avec NULL
+            ELSE
+            BEGIN
+                DECLARE @k INT = @valCount + 1;
+                WHILE @k <= @colCount
+                BEGIN
+                    INSERT INTO @valList (Val, Ord) VALUES (N'NULL', @k);
+                    SET @k += 1;
+                END
+            END
+        END
+
         ---------------------------------------------------------------------
-        -- Détection de doublon selon PK/UK (si présentes)
+        -- 3) Détection de doublon selon PK/UK (si présentes)
         ---------------------------------------------------------------------
         DECLARE @whereClause NVARCHAR(MAX) = N'';
         IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
@@ -116,22 +161,8 @@ BEGIN
             END
         END
 
-		---------------------------------------------------------------------
-    -- DEBUG : vérifier nb colonnes vs nb valeurs
-    ---------------------------------------------------------------------
-    DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-    DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
-
-    IF @valCount <> @colCount
-    BEGIN
-        PRINT 'DEBUG: mismatch colonne/valeurs';
-        PRINT 'Cols = ' + CAST(@colCount AS NVARCHAR(10)) + ' / Vals = ' + CAST(@valCount AS NVARCHAR(10));
-        PRINT 'Columns = ' + @Columns;
-        PRINT 'ValueTokens (séparateur |) = ' + REPLACE(ISNULL(@ValueTokens, ''), CHAR(31), '|');
-    END
-
         ---------------------------------------------------------------------
-        -- Construire la liste des valeurs pour INSERT
+        -- 4) Construire la liste des valeurs pour INSERT
         ---------------------------------------------------------------------
         DECLARE @values NVARCHAR(MAX) = N'';
         SELECT @values = STRING_AGG(Val, ',') WITHIN GROUP (ORDER BY Ord)
@@ -141,7 +172,7 @@ BEGIN
             SET @values = N'NULL';
 
         ---------------------------------------------------------------------
-        -- Construire et exécuter l'INSERT (une ligne)
+        -- 5) Construire et exécuter l'INSERT (une ligne)
         ---------------------------------------------------------------------
         DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
         IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
@@ -164,18 +195,18 @@ BEGIN
             END
         END TRY
         BEGIN CATCH
-		INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-		VALUES (
-			@i, NULL,
-			LEFT(CONCAT(N'ERR: ', ERROR_MESSAGE(), N' | vals=', @values), 400)
-		);
-		END CATCH
+            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
+            VALUES (
+                @i, NULL,
+                LEFT(CONCAT(N'ERR: ', ERROR_MESSAGE(), N' | vals=', @values), 400)
+            );
+        END CATCH
 
         SET @i += 1;
     END
-	
+
     -------------------------------------------------------------------------
-    -- Retour des résultats du batch
+    -- Retour des résultats du batch (1 ligne par ligne d'entrée)
     -------------------------------------------------------------------------
     SELECT RowIndex, NewID, ErrorMessage
     FROM @out
