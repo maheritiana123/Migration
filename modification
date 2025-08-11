@@ -1,228 +1,50 @@
-public void PerformMigration(bool disableForeignKeys = true)
+/// <summary>
+/// Charge les tables de relation pures et étendues.
+/// - Pure relation = uniquement des colonnes FK + éventuellement PK (aucune autre donnée métier)
+/// - Relation étendue = FK + autres colonnes métier.
+/// Remplit les collections _pureRelations et _extendedRelations.
+/// </summary>
+private void LoadRelationTables()
 {
-    Console.WriteLine("=== DÉBUT MIGRATION ===");
+    _pureRelations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    _extendedRelations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    // 0) Découverte des tables de relation (pures/étendues) via ta SP
-    LoadRelationTables(); // alimente _pureRelations & _extendedRelations
-
-    // 1) Récupère toutes les tables à migrer (déjà filtrées par _ignoredTables)
     var allTables = GetAllTables();
 
-    // 2) Construit le graphe de dépendances (table -> tables référencées)
-    var depGraph = BuildDependencyGraph(allTables);
-
-    // 3) Tri topologique + détection de cycles
-    var (orderedAcyclic, cycles) = TopoSortWithCycles(depGraph);
-
-    // Sépare les catégories (hors cycles)
-    var relationTables = new HashSet<string>(_pureRelations.Concat(_extendedRelations), StringComparer.OrdinalIgnoreCase);
-    var cycleTables = new HashSet<string>(cycles.SelectMany(c => c), StringComparer.OrdinalIgnoreCase);
-
-    var normalTables = orderedAcyclic
-        .Where(t => !relationTables.Contains(t) && !cycleTables.Contains(t))
-        .ToList();
-
-    var pureRelations = orderedAcyclic
-        .Where(t => _pureRelations.Contains(t) && !cycleTables.Contains(t))
-        .ToList();
-
-    var extendedRelations = orderedAcyclic
-        .Where(t => _extendedRelations.Contains(t) && !cycleTables.Contains(t))
-        .ToList();
-
-    if (disableForeignKeys) DisableAllForeignKeys();
-
-    ExecuteTransactionCommand("BEGIN TRANSACTION");
-    try
+    foreach (var table in allTables)
     {
-        // 4) Import des tables "normales" (pas relations) dans l'ordre
-        Console.WriteLine("\n--- Import tables normales ---");
-        foreach (var t in normalTables)
-            SafeImport(t);
+        var fks = GetForeignKeyInfo(table).ToList();
+        if (fks.Count == 0)
+            continue; // pas une table de relation
 
-        // 5) Import des tables de relation pures (IDs only)
-        Console.WriteLine("\n--- Import tables de relation PURES ---");
-        foreach (var t in pureRelations)
-            SafeImport(t);
+        // Liste des colonnes de la table
+        var cols = GetTableColumns(table).ToList();
 
-        // 6) Import des tables de relation ÉTENDUES (IDs + autres colonnes)
-        Console.WriteLine("\n--- Import tables de relation ÉTENDUES ---");
-        foreach (var t in extendedRelations)
-            SafeImport(t);
+        // Colonnes PK
+        var pkCols = GetPrimaryKeyColumn(table).ToList();
 
-        // 7) Gestion des cycles
-        if (cycles.Count > 0)
-        {
-            Console.WriteLine("\n--- Cycles détectés : traitement en 2 passes ---");
-            foreach (var cycle in cycles)
-            {
-                Console.WriteLine("Cycle : " + string.Join(" -> ", cycle));
-
-                // 7.1) Première passe : insertion avec FK=NULL pour casser la circularité
-                foreach (var t in cycle)
-                    SafeImport(t, forceNullFK: true);
-
-                // 7.2) Deuxième passe : mise à jour des FK maintenant que les ID mappings existent
-                FixCycleForeignKeys(cycle);
-            }
-        }
-
-        ExecuteTransactionCommand("COMMIT TRANSACTION");
-    }
-    catch (Exception ex)
-    {
-        ExecuteTransactionCommand("ROLLBACK TRANSACTION");
-        Console.WriteLine($"❌ ROLLBACK — Erreur de migration : {ex.Message}");
-        throw;
-    }
-    finally
-    {
-        if (disableForeignKeys)
-        {
-            // Réactive + auto-répare si besoin (tu as déjà ces méthodes)
-            EnableAllForeignKeys();
-        }
-
-        // Contrôle final d’intégrité si tu veux le garder strict
-        ValidateDataIntegrity();
-        Console.WriteLine("=== FIN MIGRATION ===");
-    }
-}
-
-/// <summary>
-/// Import protégé avec logs + option FK forcées à NULL (utile pour cycles).
-/// Repose sur ta méthode ImportTableCommon (batch) que tu utilises déjà.
-/// </summary>
-private void SafeImport(string tableName, bool forceNullFK = false)
-{
-    try
-    {
-        Console.WriteLine($"[IMPORT] {tableName}" + (forceNullFK ? " (FK=NULL)" : ""));
-        ImportTableCommon(tableName, forceNullFK);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[ERREUR] {tableName} : {ex.Message}");
-        throw;
-    }
-}
-
-/// <summary>
-/// Construit le graphe des dépendances: table -> liste des tables référencées par des FK
-/// </summary>
-private Dictionary<string, List<string>> BuildDependencyGraph(IEnumerable<string> tables)
-{
-    var graph = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-    foreach (var t in tables)
-    {
-        var deps = GetForeignKeyInfo(t)
-            .Select(fk => fk.ReferencedTableName)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
+        // Colonnes non-FK
+        var nonFkCols = cols
+            .Where(c => !fks.Any(fk => fk.ColumnName.Equals(c, StringComparison.OrdinalIgnoreCase)))
             .ToList();
 
-        graph[t] = deps;
-    }
-    return graph;
-}
-
-/// <summary>
-/// Tri topologique avec détection de cycles (DFS).
-/// Retourne : (ordre acyclique, liste de cycles [chaque cycle est une liste de tables]).
-/// </summary>
-private (List<string> ordered, List<List<string>> cycles) TopoSortWithCycles(Dictionary<string, List<string>> graph)
-{
-    var ordered = new List<string>();
-    var cycles = new List<List<string>>();
-    var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var stack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var path = new Stack<string>();
-
-    void Dfs(string node)
-    {
-        if (visited.Contains(node)) return;
-        if (stack.Contains(node))
-        {
-            // cycle détecté — reconstitue le cycle depuis la pile
-            var cyc = path.Reverse().TakeWhile(x => !x.Equals(node, StringComparison.OrdinalIgnoreCase))
-                                   .Reverse().Concat(new[] { node }).ToList();
-            // sécurise : inclut aussi le noeud de départ
-            if (!cyc.Contains(node, StringComparer.OrdinalIgnoreCase))
-                cyc.Add(node);
-            cycles.Add(cyc);
-            return;
-        }
-
-        stack.Add(node);
-        path.Push(node);
-
-        if (graph.TryGetValue(node, out var deps))
-        {
-            foreach (var d in deps)
-                if (graph.ContainsKey(d))
-                    Dfs(d);
-        }
-
-        path.Pop();
-        stack.Remove(node);
-        visited.Add(node);
-        ordered.Add(node);
-    }
-
-    foreach (var n in graph.Keys)
-        if (!visited.Contains(n))
-            Dfs(n);
-
-    // L’ordre renvoyé est du bas vers le haut (dépendances avant dépendants)
-    // Ici ça nous va : les dépendances apparaissent avant les consommateurs.
-    // Si tu veux l’inverse : ordered.Reverse();
-
-    // Retire les tables cycliques de l’ordre acyclique
-    var cycleSet = new HashSet<string>(cycles.SelectMany(c => c), StringComparer.OrdinalIgnoreCase);
-    var acyclicOrdered = ordered.Where(t => !cycleSet.Contains(t)).ToList();
-
-    return (acyclicOrdered, cycles);
-}
-
-/// <summary>
-/// Remise à jour des FK pour les tables d’un même cycle, après insertion initiale FK=NULL.
-/// Utilise tes procédures stockées dédiées si dispo (create mapping + update + drop),
-/// sinon bascule sur un update générique par FK.
-/// </summary>
-private void FixCycleForeignKeys(List<string> cycle)
-{
-    // Option 1 : si tu as déjà ces SP côté SQL (d’après tes versions précédentes)
-    // - batch_create_mapping_table @ReferencedTable
-    // - batch_update_circular_references @TableName, @ColumnName, @ReferencedTable
-    // - batch_drop_mapping_table
-    // On parcourt les arcs FK internes au cycle et on met à jour.
-
-    Console.WriteLine("  > Remise à jour des FK pour le cycle…");
-
-    foreach (var table in cycle)
-    {
-        var fks = GetForeignKeyInfo(table)
-            .Where(fk => cycle.Contains(fk.ReferencedTableName, StringComparer.OrdinalIgnoreCase))
+        // On ignore la PK si elle est aussi une FK (cas de table de jointure)
+        var nonFkNonPkCols = nonFkCols
+            .Where(c => !pkCols.Contains(c, StringComparer.OrdinalIgnoreCase))
             .ToList();
 
-        foreach (var fk in fks)
+        if (nonFkNonPkCols.Count == 0)
         {
-            try
-            {
-                // Créer la table de mapping pour la table référencée (si ta SP la crée à partir de la PK actuelle)
-                ExecuteProcedure("batch_create_mapping_table", referencedTable: fk.ReferencedTableName);
-
-                // Mettre à jour la colonne FK de 'table' pointant vers 'ReferencedTableName'
-                ExecuteProcedure("batch_update_circular_references",
-                    TableName: table,
-                    ColumnName: fk.ColumnName,
-                    referencedTable: fk.ReferencedTableName);
-            }
-            finally
-            {
-                // Nettoyer la table de mapping temporaire
-                ExecuteProcedure("batch_drop_mapping_table");
-            }
+            // uniquement des FK (et PK) => pure relation
+            _pureRelations.Add(table);
+        }
+        else
+        {
+            // FK + autres colonnes => relation étendue
+            _extendedRelations.Add(table);
         }
     }
-    Console.WriteLine("  > FK rétablies pour le cycle.");
+
+    Console.WriteLine($"Tables relation pures  : {string.Join(", ", _pureRelations)}");
+    Console.WriteLine($"Tables relation étendues: {string.Join(", ", _extendedRelations)}");
 }
