@@ -1,50 +1,35 @@
 /// <summary>
-/// Charge les tables de relation pures et étendues.
-/// - Pure relation = uniquement des colonnes FK + éventuellement PK (aucune autre donnée métier)
-/// - Relation étendue = FK + autres colonnes métier.
-/// Remplit les collections _pureRelations et _extendedRelations.
+/// Récupère toutes les colonnes de la clé primaire d'une table.
+/// Retourne une liste (pour gérer les PK composites).
 /// </summary>
-private void LoadRelationTables()
+private List<string> GetPrimaryKeyColumn(string tableName)
 {
-    _pureRelations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    _extendedRelations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var pkCols = new List<string>();
 
-    var allTables = GetAllTables();
+    string query = @"
+        SELECT kcu.COLUMN_NAME
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+          ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+         AND tc.TABLE_NAME = kcu.TABLE_NAME
+        WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+          AND tc.TABLE_NAME = @table
+        ORDER BY kcu.ORDINAL_POSITION";
 
-    foreach (var table in allTables)
+    DynamicSql sql = new DynamicSql
     {
-        var fks = GetForeignKeyInfo(table).ToList();
-        if (fks.Count == 0)
-            continue; // pas une table de relation
+        Dsn = "PXE1_PXE"
+    };
+    sql.AddDirectRequest(query, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    sql.SetSecureParam("table", tableName, true, 0);
+    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
 
-        // Liste des colonnes de la table
-        var cols = GetTableColumns(table).ToList();
+    sql.Execute();
 
-        // Colonnes PK
-        var pkCols = GetPrimaryKeyColumn(table).ToList();
-
-        // Colonnes non-FK
-        var nonFkCols = cols
-            .Where(c => !fks.Any(fk => fk.ColumnName.Equals(c, StringComparison.OrdinalIgnoreCase)))
-            .ToList();
-
-        // On ignore la PK si elle est aussi une FK (cas de table de jointure)
-        var nonFkNonPkCols = nonFkCols
-            .Where(c => !pkCols.Contains(c, StringComparer.OrdinalIgnoreCase))
-            .ToList();
-
-        if (nonFkNonPkCols.Count == 0)
-        {
-            // uniquement des FK (et PK) => pure relation
-            _pureRelations.Add(table);
-        }
-        else
-        {
-            // FK + autres colonnes => relation étendue
-            _extendedRelations.Add(table);
-        }
+    for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+    {
+        pkCols.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
     }
 
-    Console.WriteLine($"Tables relation pures  : {string.Join(", ", _pureRelations)}");
-    Console.WriteLine($"Tables relation étendues: {string.Join(", ", _extendedRelations)}");
+    return pkCols;
 }
