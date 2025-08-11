@@ -1,29 +1,58 @@
----------------------------------------------------------------------
-        -- 🔎 Sécurité : vérifier nb colonnes vs nb valeurs pour CETTE ligne
-        ---------------------------------------------------------------------
-        DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-        DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+-- AVANT
+INSERT INTO @colList (ColName, Ord)
+SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM STRING_SPLIT(@Columns, ',')
+WHERE RTRIM(LTRIM(value)) <> '';
 
-        IF @valCount <> @colCount
-        BEGIN
-            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-            VALUES (@i, NULL,
-                    CONCAT(N'Mismatch colonnes/valeurs: cols=', @colCount,
-                           N' / vals=', @valCount,
-                           N' (vérifier @Columns côté C# vs tokens de la ligne)'));
-            SET @i += 1;
-            CONTINUE;
-        END
+-- APRÈS
+INSERT INTO @colList (ColName, Ord)
+SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM STRING_SPLIT(@Columns, ',');
 
 
 
 
-// DEBUG (temporaire)
-if (tokens.Count != insertColumnsList.Count)
-{
-    Console.WriteLine($"[DEBUG] {tableName} ligne CSV #{i+1} : tokens={tokens.Count} vs cols={insertColumnsList.Count}");
-}
+-- AVANT
+INSERT INTO @valList (Val, Ord)
+SELECT LTRIM(RTRIM(value)),
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM STRING_SPLIT(@tokens, CHAR(31))
+WHERE RTRIM(LTRIM(value)) <> '';
+
+-- APRÈS
+INSERT INTO @valList (Val, Ord)
+SELECT LTRIM(RTRIM(value)),
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM STRING_SPLIT(@tokens, CHAR(31));
 
 
-// DEBUG une fois
-Console.WriteLine($"[DEBUG] {tableName} columnsSql count = {insertColumnsList.Count}");
+garde fou
+
+DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+IF @valCount <> @colCount
+BEGIN
+    INSERT INTO @out (RowIndex, NewID, ErrorMessage)
+    VALUES (
+        @i, NULL,
+        CONCAT(N'Mismatch colonnes/valeurs: cols=', @colCount,
+               N' / vals=', @valCount,
+               N'  (vérifier @Columns vs tokens de la ligne)')
+    );
+    SET @i += 1;
+    CONTINUE;
+END
+
+
+
+
+
+BEGIN CATCH
+    INSERT INTO @out (RowIndex, NewID, ErrorMessage)
+    VALUES (
+        @i, NULL,
+        LEFT(CONCAT(N'ERR: ', ERROR_MESSAGE(), N' | vals=', @values), 400)
+    );
+END CATCH
