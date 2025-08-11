@@ -167,3 +167,269 @@ BEGIN
     ORDER BY RowIndex;
 END
 GO
+
+// ⬇️ À coller dans DatabaseMigrator.cs
+private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 100)
+{
+    Console.WriteLine("_______________________");
+    Console.WriteLine($"Import table {tableName}");
+
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath))
+    {
+        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
+        return;
+    }
+
+    var lines = File.ReadAllLines(csvPath);
+    if (lines.Length < 2)
+    {
+        Console.WriteLine($"⚠ CSV vide : {tableName}");
+        return;
+    }
+
+    // En-têtes CSV
+    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+
+    // Colonne identity (si présente)
+    var identityColumn = GetIdentityColumn(tableName); // helper ci-dessous si tu ne l’as pas déjà
+    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+
+    // Infos FK
+    var fkInfos = GetForeignKeyInfo(tableName);
+
+    // On enlève la colonne identity de la liste des colonnes insérées
+    var insertColumnsList = new List<string>(columnNames);
+    if (hasIdentity)
+        insertColumnsList.RemoveAll(c => c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase));
+
+    // Colonnes SQL pour la proc (ordre fixe pour toutes les lignes du batch)
+    string columnsSql = string.Join(",", insertColumnsList.Select(c => $"[{c}]"));
+
+    int insertedCount = 0;
+    int duplicateCount = 0;
+
+    Console.WriteLine($"{lines.Length - 1} lignes à importer (batch={batchSize})...");
+
+    // On parcourt le CSV par batch
+    for (int start = 1; start < lines.Length; start += batchSize)
+    {
+        int end = Math.Min(start + batchSize, lines.Length);
+        var valueTokensPerRow = new List<string>(capacity: end - start);
+        var oldIdsForBatch = new List<string>(capacity: end - start); // aligne RowIndex de la proc
+
+        for (int i = start; i < end; i++)
+        {
+            var values = lines[i].Split(';').ToList();
+            if (values.Count != columnNames.Count)
+            {
+                Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i + 1}: colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count}). Ligne ignorée.");
+                continue;
+            }
+
+            // Dictionnaire colonne→valeur (string -> object pour la compat)
+            var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
+                                     .ToDictionary(x => x.col, x => (object)x.val);
+
+            // Sauvegarde oldId puis on n’insert PAS la colonne identity
+            string oldId = null;
+            if (hasIdentity && rowDict.ContainsKey(identityColumn))
+            {
+                oldId = (rowDict[identityColumn] ?? "").ToString();
+                rowDict.Remove(identityColumn);
+            }
+            oldIdsForBatch.Add(oldId); // reste aligné avec l’ordre des lignes du batch
+
+            // Mapping des FK (ou NULL si nullable / forceNullFK)
+            foreach (var fk in fkInfos)
+            {
+                if (!rowDict.ContainsKey(fk.ColumnName))
+                    continue;
+
+                if (forceNullFK)
+                {
+                    rowDict[fk.ColumnName] = null;
+                    continue;
+                }
+
+                var raw = rowDict[fk.ColumnName];
+                var oldFkValueStr = (raw ?? "").ToString();
+                if (string.IsNullOrWhiteSpace(oldFkValueStr))
+                {
+                    rowDict[fk.ColumnName] = null;
+                    continue;
+                }
+
+                // Cherche le mapping du nouvel ID
+                if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
+                    map.TryGetValue(oldFkValueStr, out var mappedObj)) // Dictionary<object,object> -> clé string OK
+                {
+                    rowDict[fk.ColumnName] = mappedObj;
+                }
+                else if (IsForeignKeyNullable(fk))
+                {
+                    rowDict[fk.ColumnName] = null;
+                }
+                else
+                {
+                    throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+                }
+            }
+
+            // Tokens formatés (même ordre que columnsSql / insertColumnsList)
+            var tokens = new List<string>(insertColumnsList.Count);
+            foreach (var col in insertColumnsList)
+            {
+                var valObj = rowDict.TryGetValue(col, out var v) ? v : null;
+                string token = FormatValueForSql(valObj, GetColumnType(tableName, col));
+                tokens.Add(token);
+            }
+
+            // Concatène les valeurs de la ligne avec CHAR(31)
+            valueTokensPerRow.Add(string.Join(((char)31).ToString(), tokens));
+        }
+
+        if (valueTokensPerRow.Count == 0)
+            continue;
+
+        // Concatène toutes les lignes du batch avec CHAR(30)
+        string valuesBatch = string.Join(((char)30).ToString(), valueTokensPerRow);
+
+        // === Un seul appel SQL pour tout le batch ===
+        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
+            @TableName = $table$,
+            @Columns = $cols$,
+            @ValuesBatch = $valsBatch$,
+            @HasIdentity = $identity$,
+            @IdentityCol = $idCol$";
+
+        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("table", tableName, true, 0);
+        sql.SetSecureParam("cols", columnsSql, true, 0);
+        sql.SetSecureParam("valsBatch", valuesBatch, true, 0);
+        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
+        sql.SetSecureParam("idCol", hasIdentity ? identityColumn : null, true, 0);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+
+        // Timeout étendu (5 minutes)
+        sql.Execute(300000);
+
+        // Parcours des retours de la proc : RowIndex / NewID / ErrorMessage
+        int rows = sql.ReturnedRows(1, 1);
+        for (int r = 1; r <= rows; r++)
+        {
+            // RowIndex est 1-based à l’intérieur du batch
+            var rowIndexStr = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
+            int rowIndex = 0;
+            int.TryParse(rowIndexStr, out rowIndex);
+
+            string newId = hasIdentity ? sql.GetValueUsingColName(r, "NewID", 1, 1) : null;
+            string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
+
+            bool isDup = !string.IsNullOrEmpty(errorMessage) &&
+                         errorMessage.IndexOf("doublon", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (isDup)
+            {
+                duplicateCount++;
+                continue;
+            }
+
+            // Mapping oldId -> newId si identity
+            if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsForBatch.Count)
+            {
+                string oldIdAtIndex = oldIdsForBatch[rowIndex - 1];
+                if (!string.IsNullOrEmpty(oldIdAtIndex))
+                {
+                    if (!_idMappings.ContainsKey(tableName))
+                        _idMappings[tableName] = new Dictionary<object, object>();
+
+                    if (!_idMappings[tableName].ContainsKey(oldIdAtIndex))
+                        _idMappings[tableName][oldIdAtIndex] = newId;
+                }
+            }
+
+            // Succès si pas d’erreur
+            if (string.IsNullOrEmpty(errorMessage))
+                insertedCount++;
+        }
+    }
+
+    Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
+}
+
+// Helper: si tu ne l’as pas déjà
+private string GetIdentityColumn(string tableName)
+{
+    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+    sql.AddDirectRequest(@"
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = $t$
+          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1",
+        MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+    sql.SetSecureParam("t", tableName, true, 0);
+    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+    sql.Execute(30000);
+
+    return sql.ReturnedRows(1, 1) > 0 ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1) : null;
+}
+
+// Helper: formate les valeurs pour SQL (NULL, quotes, dates, numériques…)
+private string FormatValueForSql(object value, string columnType)
+{
+    if (value == null) return "NULL";
+
+    string s = value.ToString();
+    if (string.IsNullOrWhiteSpace(s)) return "NULL";
+
+    string t = (columnType ?? "").ToLowerInvariant();
+
+    // numériques
+    if (t == "int" || t == "bigint" || t == "smallint" || t == "tinyint")
+        return int.TryParse(s, out var i) ? i.ToString() : "NULL";
+
+    if (t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "float" || t == "real")
+    {
+        // utilise invariant pour le point décimal
+        if (decimal.TryParse(s, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dec))
+            return dec.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return "NULL";
+    }
+
+    // bool
+    if (t == "bit")
+    {
+        if (s.Equals("1") || s.Equals("true", StringComparison.OrdinalIgnoreCase)) return "1";
+        if (s.Equals("0") || s.Equals("false", StringComparison.OrdinalIgnoreCase)) return "0";
+        return "NULL";
+    }
+
+    // dates
+    if (t.StartsWith("date"))
+    {
+        // on laisse la proc SQL convertir (le token doit être quoted)
+        if (DateTime.TryParse(s, out var _))
+            return $"'{s.Replace("'", "''")}'";
+        return "NULL";
+    }
+    if (t.Contains("time"))
+    {
+        if (DateTime.TryParse(s, out var _))
+            return $"'{s.Replace("'", "''")}'";
+        return "NULL";
+    }
+
+    // uniqueidentifier
+    if (t == "uniqueidentifier")
+    {
+        if (Guid.TryParse(s, out var _))
+            return $"'{s}'";
+        return "NULL";
+    }
+
+    // par défaut: chaîne
+    return $"'{s.Replace("'", "''")}'";
+}
