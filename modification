@@ -1,6 +1,30 @@
+-- 2 colonnes : [VENom] (nvarchar) et [ADVAR] (int)
 EXEC dbo.batch_safe_insert_with_type_conversion
     @TableName   = N'VarEnv',
     @Columns     = N'[VENom],[ADVAR]',
-    @ValuesBatch = N'''NouveauNom''||''NouvelleValeur''$$''EncoreNom''||NULL',
+    @ValuesBatch = N'''NouveauNom''||20$$''EncoreNom''||NULL',
     @HasIdentity = 1,
     @IdentityCol = N'VEId';
+
+
+
+-- Normaliser les tokens: '' ou 'NULL' (insensible à la casse) -> NULL
+UPDATE @valList
+SET Val = N'NULL'
+WHERE UPPER(REPLACE(Val, '''','')) IN (N'NULL', N'');
+
+-- Si on a plus de valeurs que de colonnes et que les extra sont toutes NULL,
+-- on les supprime silencieusement pour éviter le message "Mismatch".
+DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+
+IF @valCount > @colCount
+AND NOT EXISTS (
+   SELECT 1 FROM @valList
+   WHERE Ord > @colCount
+     AND UPPER(REPLACE(Val, '''','')) NOT IN (N'NULL', N'')
+)
+BEGIN
+   DELETE FROM @valList WHERE Ord > @colCount;
+   SET @valCount = @colCount;
+END
