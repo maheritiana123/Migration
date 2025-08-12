@@ -1,163 +1,58 @@
-IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
+USE [PXE1_PXE_NI];
 GO
 
-CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName      NVARCHAR(128),
-    @Columns        NVARCHAR(MAX),     -- ex: [Col1],[Col2],...
-    @ValuesBatch    NVARCHAR(MAX),     -- lignes séparées par NCHAR(30), colonnes par NCHAR(29)
-    @HasIdentity    BIT = 0,
-    @IdentityCol    NVARCHAR(128) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
+-- Séparateurs (doivent correspondre à ceux attendus par la PS)
+DECLARE @RS  NCHAR(1) = NCHAR(30); -- Row Separator
+DECLARE @CS  NCHAR(1) = NCHAR(29); -- Column Separator
 
-    -------------------------------------------------------------------------
-    -- 1) Colonnes ordonnées (on retire les [ ])
-    -------------------------------------------------------------------------
-    DECLARE @colList TABLE (ColName NVARCHAR(128), Ord INT);
-    INSERT INTO @colList (ColName, Ord)
-    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', ''))),
-           ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-    FROM STRING_SPLIT(@Columns, ',');
+-- Paramètres d'appel
+DECLARE @TableName   NVARCHAR(128) = N'VarEnv';
+DECLARE @Columns     NVARCHAR(MAX) = N'[VENom],[ADVAR]';
+DECLARE @ValuesBatch NVARCHAR(MAX);
 
-    -------------------------------------------------------------------------
-    -- 2) Détection de la colonne IDENTITY si non fournie
-    -------------------------------------------------------------------------
-    IF @HasIdentity = 1 AND (ISNULL(@IdentityCol,'') = '')
-    BEGIN
-        SELECT TOP (1) @IdentityCol = COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = @TableName
-          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
-    END
+-- (Optionnel) petite fonction d’échappement pour les quotes simples
+-- Remplace ' par '' puis entoure par des quotes
+DECLARE @v1 NVARCHAR(200) = N'improbable_12055';
+DECLARE @v2 NVARCHAR(200) = N'vraimentimprobable_23055';
 
-    -------------------------------------------------------------------------
-    -- 3) Colonnes PK/UK (hors identity) pour la détection de doublon
-    -------------------------------------------------------------------------
-    DECLARE @pkCols NVARCHAR(MAX) = NULL;
-    SELECT @pkCols = STRING_AGG(QUOTENAME(kcu.COLUMN_NAME), ',')
-    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-      ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-     AND tc.TABLE_NAME      = kcu.TABLE_NAME
-    WHERE tc.TABLE_NAME = @TableName
-      AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
-      AND kcu.COLUMN_NAME <> ISNULL(@IdentityCol, '');
+-- Construit chaque ligne (NB: texte entre quotes, numériques / NULL sans quotes)
+DECLARE @row1 NVARCHAR(MAX) =
+    N'''' + REPLACE(@v1, N'''', N'''''''') + N'''' + @CS + N'2055';
 
-    -------------------------------------------------------------------------
-    -- 4) PATCH: découpe des lignes via NCHAR(30)
-    -------------------------------------------------------------------------
-    DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
+DECLARE @row2 NVARCHAR(MAX) =
+    N'''' + REPLACE(@v2, N'''', N'''''''') + N'''' + @CS + N'NULL';
 
-    INSERT INTO @rows (Tokens)
-    SELECT value
-    FROM STRING_SPLIT(@ValuesBatch, NCHAR(30));  -- <<< LIGNE = NCHAR(30)
+-- Concatène les lignes avec le séparateur de lignes
+SET @ValuesBatch = @row1 + @RS + @row2;
 
-    IF NOT EXISTS (SELECT 1 FROM @rows)
-    BEGIN
-        SELECT 0 AS RowIndex, NULL AS NewID, N'Batch vide (aucune ligne découpée)' AS ErrorMessage;
-        RETURN;
-    END
+----------------------------------------------------------------------
+-- Vérifications rapides (diagnostic)
+----------------------------------------------------------------------
+PRINT N'--- Aperçu ValuesBatch (lisible) ---';
+SELECT REPLACE(REPLACE(@ValuesBatch, @RS, N'␞'), @CS, N'␝') AS ValuesBatchPreview;
 
-    -------------------------------------------------------------------------
-    -- 5) Boucle des lignes + split colonnes NCHAR(29) + doublons + INSERT
-    -------------------------------------------------------------------------
-    DECLARE @out TABLE (RowIndex INT, NewID NVARCHAR(100), ErrorMessage NVARCHAR(MAX));
-    DECLARE @i INT = 1, @n INT = (SELECT COUNT(*) FROM @rows);
+PRINT N'--- Découpage lignes ---';
+SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS RowIdx, value AS Ligne
+FROM STRING_SPLIT(@ValuesBatch, @RS);
 
-    WHILE @i <= @n
-    BEGIN
-        DECLARE @tokens NVARCHAR(MAX) = (SELECT Tokens FROM @rows WHERE RowIndex = @i);
+PRINT N'--- Découpage colonnes (1ère ligne) ---';
+DECLARE @firstLine NVARCHAR(MAX) =
+(SELECT TOP 1 value FROM STRING_SPLIT(@ValuesBatch, @RS) WHERE value <> N'');
 
-        -- Split colonnes (PATCH: NCHAR(29) explicit)
-        DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
-        INSERT INTO @valList (Val, Ord)
-        SELECT LTRIM(RTRIM(value)),
-               ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-        FROM STRING_SPLIT(@tokens, NCHAR(29));    -- <<< COLONNE = NCHAR(29)
+SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS ColIdx, value AS Colonne
+FROM STRING_SPLIT(@firstLine, @CS);
 
-        -- Détection doublons si PK/UK connus
-        DECLARE @whereClause NVARCHAR(MAX) = N'';
-        IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
-        BEGIN
-            DECLARE @conds TABLE (Cond NVARCHAR(MAX), Ord INT);
+----------------------------------------------------------------------
+-- Appel de la procédure
+----------------------------------------------------------------------
+DECLARE @return_value INT;
 
-            INSERT INTO @conds (Cond, Ord)
-            SELECT
-                CASE WHEN UPPER(v.Val) = 'NULL'
-                     THEN QUOTENAME(c.ColName) + ' IS NULL'
-                     ELSE QUOTENAME(c.ColName) + ' = ' + v.Val END,
-                c.Ord
-            FROM @colList c
-            JOIN @valList v ON c.Ord = v.Ord
-            WHERE c.ColName IN (
-                SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[', ''), ']', '')))
-                FROM STRING_SPLIT(@pkCols, ',')
-            );
+EXEC @return_value = [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName   = @TableName,
+    @Columns     = @Columns,
+    @ValuesBatch = @ValuesBatch,
+    @HasIdentity = 1,
+    @IdentityCol = N'VEId'; -- adapte si besoin
 
-            SELECT @whereClause = STRING_AGG(Cond, ' AND ')
-            FROM @conds;
-
-            IF LEN(@whereClause) > 0
-            BEGIN
-                DECLARE @exists BIT = 0;
-                DECLARE @checkSql NVARCHAR(MAX) =
-                    N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM ' +
-                    QUOTENAME(@TableName) + ' WITH (NOLOCK) WHERE ' + @whereClause + N') THEN 1 ELSE 0 END';
-
-                EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out = @exists OUTPUT;
-
-                IF @exists = 1
-                BEGIN
-                    INSERT INTO @out (RowIndex, NewID, ErrorMessage) VALUES (@i, NULL, N'Doublon');
-                    SET @i += 1;
-                    CONTINUE;
-                END
-            END
-        END
-
-        -- Construit la liste des valeurs pour l'INSERT
-        DECLARE @values NVARCHAR(MAX) = N'';
-        SELECT @values = STRING_AGG(Val, ',') WITHIN GROUP (ORDER BY Ord)
-        FROM @valList;
-
-        IF @values IS NULL OR LEN(@values) = 0
-            SET @values = N'NULL';
-
-        -- INSERT
-        DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + ' (' + @Columns + ') ';
-        IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-            SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@IdentityCol) + ' AS NewID ';
-        SET @sql += N'SELECT ' + @values;
-
-        BEGIN TRY
-            IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-            BEGIN
-                DECLARE @tmp TABLE (NewID NVARCHAR(100));
-                INSERT INTO @tmp EXEC sp_executesql @sql;
-                INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-                SELECT @i, NewID, NULL FROM @tmp;
-            END
-            ELSE
-            BEGIN
-                EXEC sp_executesql @sql;
-                INSERT INTO @out (RowIndex, NewID, ErrorMessage) VALUES (@i, NULL, NULL);
-            END
-        END TRY
-        BEGIN CATCH
-            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-            VALUES (@i, NULL, LEFT(CONCAT(N'ERR: ', ERROR_MESSAGE(), N' | vals=', @values), 400));
-        END CATCH
-
-        SET @i += 1;
-    END
-
-    -------------------------------------------------------------------------
-    -- 6) Résultat agrégé
-    -------------------------------------------------------------------------
-    SELECT RowIndex, NewID, ErrorMessage
-    FROM @out
-    ORDER BY RowIndex;
-END
+SELECT 'Return Value' = @return_value;
 GO
