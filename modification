@@ -1,17 +1,32 @@
--- Trop de valeurs → tronquer aux @colCount premières (sans CTE)
-IF @valCount > @colCount
+-- Sépare le batch en lignes (RowIndex = ordre 1..N)
+DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
+INSERT INTO @rows (Tokens)
+SELECT value
+FROM STRING_SPLIT(@VB, NCHAR(30))           -- <-- au lieu de @ValuesBatch, CHAR(30)
+WHERE LEN(value) > 0;                        -- pas de trim ici, on garde tout
+
+...
+
+-- 1) Split des valeurs (CHAR(31)) dans @valList
+DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
+IF @tokens IS NOT NULL AND LEN(@tokens) > 0
 BEGIN
-    DECLARE @tmp TABLE (Val NVARCHAR(MAX), rn INT);
-
-    INSERT INTO @tmp (Val, rn)
-    SELECT Val, ROW_NUMBER() OVER (ORDER BY Ord)
-    FROM @valList;
-
-    DELETE FROM @valList;
-
     INSERT INTO @valList (Val, Ord)
-    SELECT Val, rn
-    FROM @tmp
-    WHERE rn <= @colCount
-    ORDER BY rn;
+    SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    FROM STRING_SPLIT(@tokens, NCHAR(31));   -- <-- pas de TRIM ni WHERE
 END
+
+
+
+
+// Séparateurs sûrs (imprimables) :
+const string COL_SEP = "||";   // entre colonnes
+const string ROW_SEP = "§§";   // entre lignes
+
+// ... à l’endroit où on construit les tokens d’une ligne :
+valueTokensPerRow.Add(string.Join(COL_SEP, tokens)); // au lieu de CHAR(31)
+
+// ... à l’endroit où on construit le batch :
+string valuesBatch = string.Join(ROW_SEP, valueTokensPerRow); // au lieu de CHAR(30)
+
+// (le reste ne change pas : on passe toujours @ValuesBatch via SetSecureParam)
