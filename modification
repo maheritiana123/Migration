@@ -10,6 +10,7 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
         return;
     }
 
+    // Lecture unique
     var lines = File.ReadAllLines(csvPath);
     if (lines.Length < 2)
     {
@@ -17,39 +18,47 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
         return;
     }
 
-    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-    var identityColumn = GetIdentityColumn(tableName);
+    // En-têtes
+    var columnNamesAll = lines[0].Split(';').Select(c => c.Trim()).ToList();
+    var identityColumn = GetIdentityColumn(tableName); // string? (null si pas d'identity)
     var fkInfos = GetForeignKeyInfo(tableName);
-
     bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-    int insertedCount = 0;
-    int duplicateCount = 0;
+
+    // Colonnes réellement insérées (on enlève l’identity si présent)
+    var columnNamesInserted = hasIdentity
+        ? columnNamesAll.Where(c => !string.Equals(c, identityColumn, StringComparison.OrdinalIgnoreCase)).ToList()
+        : new List<string>(columnNamesAll);
+
+    // Chaîne @Columns pour la PS, figée une fois pour toutes
+    string columnsForProc = string.Join(",", columnNamesInserted.Select(c => $"[{c}]"));
 
     Console.WriteLine($"{lines.Length - 1} lignes à importer...");
 
-    // Préparer un batch complet
-    List<string> batchRows = new List<string>();
+    // Construit le batch en une passe
+    var rowSep = ((char)30).ToString(); // NCHAR(30)
+    var colSep = ((char)31).ToString(); // NCHAR(31)
+    var batchRows = new List<string>();
+    int duplicateCount = 0;
+    int insertedCount = 0;
 
     for (int i = 1; i < lines.Length; i++)
     {
         var values = lines[i].Split(';').ToList();
-        if (values.Count != columnNames.Count)
+        if (values.Count != columnNamesAll.Count)
         {
-            Console.WriteLine($"[Erreur Structurelle] Ligne {i + 1} ignorée : colonnes CSV ({values.Count}) != colonnes table ({columnNames.Count})");
+            Console.WriteLine($"[Erreur Structurelle] {tableName} Ligne {i + 1}: colonnes CSV ({values.Count}) != colonnes table ({columnNamesAll.Count}). Ligne ignorée.");
             continue;
         }
 
-        var rowDict = columnNames.Zip(values, (col, val) => new { col, val })
-                                 .ToDictionary(x => x.col, x => (object)x.val);
+        // Dictionnaire de la ligne
+        var rowDict = columnNamesAll.Zip(values, (col, val) => new { col, val })
+                                    .ToDictionary(x => x.col, x => (object)x.val);
 
-        string oldId = null;
+        // Retire l’identity de la ligne si présent (on n’insère jamais la PK auto)
         if (hasIdentity && rowDict.ContainsKey(identityColumn))
-        {
-            oldId = (rowDict[identityColumn] ?? "").ToString();
             rowDict.Remove(identityColumn);
-        }
 
-        // Remplacement des FK
+        // Mapping des FK
         foreach (var fk in fkInfos)
         {
             if (!rowDict.ContainsKey(fk.ColumnName))
@@ -64,7 +73,7 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
             var oldFkValue = (rowDict[fk.ColumnName] ?? "").ToString();
             if (string.IsNullOrWhiteSpace(oldFkValue))
             {
-                rowDict[fk.ColumnName] = null;
+                rowDict[fk.ColumnName] = null; // valeur vide -> NULL
                 continue;
             }
 
@@ -75,7 +84,7 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
             }
             else if (IsForeignKeyNullable(fk))
             {
-                rowDict[fk.ColumnName] = null;
+                rowDict[fk.ColumnName] = null; // FK nullable -> on met NULL
             }
             else
             {
@@ -83,57 +92,57 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false)
             }
         }
 
-        // Construction des tokens pour la PS
-        List<string> tokens = new List<string>();
-        foreach (var col in rowDict.Keys)
+        // Formate chaque valeur selon son type SQL, dans l’ordre de columnNamesInserted
+        var tokens = new List<string>(capacity: columnNamesInserted.Count);
+        foreach (var col in columnNamesInserted)
         {
-            var formattedValue = FormatValueForSql(rowDict[col], GetColumnType(tableName, col));
-            tokens.Add(formattedValue);
+            var sqlType = GetColumnType(tableName, col);
+            rowDict.TryGetValue(col, out var val);
+            tokens.Add(FormatValueForSql(val, sqlType));
         }
 
-        // Concatène les colonnes avec NCHAR(31)
-        string rowToken = string.Join(((char)31).ToString(), tokens);
-        batchRows.Add(rowToken);
+        // Ajoute la ligne formatée (séparateur colonnes = CHAR(31))
+        batchRows.Add(string.Join(colSep, tokens));
     }
 
-    // Concatène toutes les lignes avec NCHAR(30)
-    string valuesBatch = string.Join(((char)30).ToString(), batchRows);
+    if (batchRows.Count == 0)
+    {
+        Console.WriteLine("Aucune ligne exploitable dans ce CSV.");
+        return;
+    }
 
-    // Exécution d'un seul batch
-    DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+    // Concatène toutes les lignes (séparateur lignes = CHAR(30))
+    string valuesBatch = string.Join(rowSep, batchRows);
 
+    // Exécute la PS une seule fois
+    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
     string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
-          @TableName = $table$, 
-          @Columns = $cols$, 
-          @ValuesBatch = $valsBatch$,
-          @HasIdentity = $identity$,
-          @IdentityCol = $identityCol$";
+        @TableName = $table$, 
+        @Columns = $cols$, 
+        @ValuesBatch = $valsBatch$,
+        @HasIdentity = $identity$,
+        @IdentityCol = $idCol$";
 
     sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
     sql.SetSecureParam("table", tableName, true, 0);
-    sql.SetSecureParam("cols", string.Join(",", rowDict.Keys.Select(c => $"[{c}]")), true, 0);
+    sql.SetSecureParam("cols", columnsForProc, true, 0);
     sql.SetSecureParam("valsBatch", valuesBatch, true, 0);
     sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
-    sql.SetSecureParam("identityCol", identityColumn ?? "", true, 0);
+    sql.SetSecureParam("idCol", identityColumn ?? "", true, 0);
     sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
 
-    sql.Execute();
+    sql.Execute(300000); // augmente le timeout si nécessaire
 
-    // Lecture du résultat batch
-    int nbRows = sql.GetNbRows();
-    for (int r = 1; r <= nbRows; r++)
+    // Parcours du résultat renvoyé par la PS (une ligne par ligne traitée)
+    int rows = sql.ReturnedRows(1, 1);
+    for (int r = 1; r <= rows; r++)
     {
-        string newId = sql.GetValueUsingColName(r, "NewID", 1, 1);
-        string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
-
-        if (!string.IsNullOrEmpty(errorMessage) && errorMessage.ToLower().Contains("doublon"))
-        {
+        string err = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
+        if (!string.IsNullOrEmpty(err) && err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
             duplicateCount++;
-        }
-        else
-        {
+        else if (string.IsNullOrEmpty(err))
             insertedCount++;
-        }
+        // sinon : c’est une erreur bloquante, tu peux logger err ici si tu veux
     }
 
     Console.WriteLine($"✅ Table {tableName} : {insertedCount} lignes insérées, {duplicateCount} doublons ignorés.");
