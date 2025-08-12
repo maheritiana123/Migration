@@ -1,8 +1,17 @@
-DECLARE @VB nvarchar(max) = /* colle ICI exactement ce que tu envoies */ N'...';
-
-SELECT
-  RS_Count = LEN(@VB) - LEN(REPLACE(@VB, NCHAR(30), N'')),
-  CS_Count = LEN(@VB) - LEN(REPLACE(@VB, NCHAR(29), N''));
-
--- Aperçu lisible
-SELECT REPLACE(REPLACE(@VB, NCHAR(30), N'␞'), NCHAR(29), N'␝') AS Preview;
+-- Scinde une liste séparée par des virgules en conservant l'ordre
+IF OBJECT_ID('dbo.SplitByCommaOrdered') IS NULL
+EXEC('CREATE FUNCTION dbo.SplitByCommaOrdered(@s nvarchar(max))
+RETURNS @t TABLE (Item nvarchar(max), Ord int)
+AS
+BEGIN
+  DECLARE @p int=1, @o int=1, @n int, @x nvarchar(max);
+  WHILE 1=1
+  BEGIN
+    SET @n = CHARINDEX('','', @s, @p);
+    IF @n=0 SET @x = SUBSTRING(@s, @p, LEN(@s)-@p+1);
+    ELSE    SET @x = SUBSTRING(@s, @p, @n-@p);
+    INSERT INTO @t(Item, Ord) VALUES(LTRIM(RTRIM(@x)), @o);
+    SET @o=@o+1; IF @n=0 BREAK; SET @p=@n+1;
+  END
+  RETURN
+END');
