@@ -1,19 +1,8 @@
--- Séparateurs utilisés par la proc
-DECLARE @RS nchar(1) = NCHAR(30);  -- record/ligne
-DECLARE @CS nchar(1) = NCHAR(29);  -- colonne
+DECLARE @VB nvarchar(max) = /* colle ICI exactement ce que tu envoies */ N'...';
 
--- Construire un batch VALIDE de 2 lignes / 2 colonnes
-DECLARE @row1 nvarchar(max) = N'''improbable_12055''' + @CS + N'12055';
-DECLARE @row2 nvarchar(max) = N'''vraimentimprobable_23055''' + @CS + N'NULL';
-DECLARE @ValuesBatch nvarchar(max) = @row1 + @RS + @row2;
+SELECT
+  RS_Count = LEN(@VB) - LEN(REPLACE(@VB, NCHAR(30), N'')),
+  CS_Count = LEN(@VB) - LEN(REPLACE(@VB, NCHAR(29), N''));
 
--- Vérifier visuellement (␞ = ligne, ␝ = colonne)
-SELECT REPLACE(REPLACE(@ValuesBatch, @RS, N'␞'), @CS, N'␝') AS Preview;
-
--- Appel proc
-EXEC dbo.batch_safe_insert_with_type_conversion
-     @TableName   = N'VarEnv',
-     @Columns     = N'[VENom],[ADVAR]',
-     @ValuesBatch = @ValuesBatch,
-     @HasIdentity = 1,
-     @IdentityCol = N'VEId';
+-- Aperçu lisible
+SELECT REPLACE(REPLACE(@VB, NCHAR(30), N'␞'), NCHAR(29), N'␝') AS Preview;
