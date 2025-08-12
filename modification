@@ -1,16 +1,14 @@
-DECLARE @row1 NVARCHAR(MAX) = N'''Venom_1''' + NCHAR(31) + N'123';
-DECLARE @row2 NVARCHAR(MAX) = N'''Venom_2''' + NCHAR(31) + N'456';
+DECLARE @ValuesBatch NVARCHAR(MAX) = N'''Venom_1''' + NCHAR(31) + N'123' + 
+                                     NCHAR(30) + 
+                                     N'''Venom_2''' + NCHAR(31) + N'456';
 
-DECLARE @ValuesBatch NVARCHAR(MAX) = @row1 + NCHAR(30) + @row2;
-
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName = N'VarEnv',
-    @Columns = N'[VENom],[ADVAR]',
-    @ValuesBatch = @ValuesBatch,
-    @HasIdentity = 1,
-    @IdentityCol = N'VEId';
-
-
-PRINT 'HEX: ' + STRING_AGG(CONVERT(varchar(max), CONVERT(varbinary(max), SUBSTRING(@ValuesBatch, n, 1)), 2), ' ')
-FROM (SELECT TOP (LEN(@ValuesBatch)) n = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-      FROM sys.objects) AS x;
+;WITH Numbers AS (
+    SELECT TOP (LEN(@ValuesBatch))
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+    FROM sys.objects
+)
+SELECT 
+    n AS Position,
+    SUBSTRING(@ValuesBatch, n, 1) AS Char,
+    CONVERT(VARBINARY(1), SUBSTRING(@ValuesBatch, n, 1)) AS HexValue
+FROM Numbers;
