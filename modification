@@ -1,30 +1,36 @@
--- 2 colonnes : [VENom] (nvarchar) et [ADVAR] (int)
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName   = N'VarEnv',
-    @Columns     = N'[VENom],[ADVAR]',
-    @ValuesBatch = N'''NouveauNom''||20$$''EncoreNom''||NULL',
-    @HasIdentity = 1,
-    @IdentityCol = N'VEId';
-
-
-
--- Normaliser les tokens: '' ou 'NULL' (insensible à la casse) -> NULL
+---------------------------------------------------------------------
+-- (à placer juste après avoir rempli @valList et calculé @colCount)
+-- 1) Normaliser les tokens :
+--    - '' ou 'NULL' (peu importe la casse) -> NULL (sans quotes)
+--    - trim léger
+---------------------------------------------------------------------
 UPDATE @valList
 SET Val = N'NULL'
-WHERE UPPER(REPLACE(Val, '''','')) IN (N'NULL', N'');
+WHERE UPPER(REPLACE(LTRIM(RTRIM(Val)), '''','')) IN (N'NULL', N'');
 
--- Si on a plus de valeurs que de colonnes et que les extra sont toutes NULL,
--- on les supprime silencieusement pour éviter le message "Mismatch".
-DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+---------------------------------------------------------------------
+-- 2) Construire EXACTEMENT @colCount valeurs, dans l'ordre 1..@colCount :
+--    - si trop de valeurs -> on ignore les extras
+--    - si pas assez -> on complète avec NULL
+--    => plus aucune erreur "plus d'éléments que la liste d'insertion"
+---------------------------------------------------------------------
+DECLARE @values NVARCHAR(MAX);
 
-IF @valCount > @colCount
-AND NOT EXISTS (
-   SELECT 1 FROM @valList
-   WHERE Ord > @colCount
-     AND UPPER(REPLACE(Val, '''','')) NOT IN (N'NULL', N'')
+;WITH norm AS (
+    SELECT 
+        Ord,
+        LTRIM(RTRIM(Val)) AS Val
+    FROM @valList
+),
+nums AS (
+    SELECT TOP (@colCount) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS Ord
+    FROM sys.all_objects   -- source de nombres
 )
-BEGIN
-   DELETE FROM @valList WHERE Ord > @colCount;
-   SET @valCount = @colCount;
-END
+SELECT @values =
+       STRING_AGG( COALESCE(n.Val, N'NULL'), ',' )
+         WITHIN GROUP (ORDER BY nums.Ord)
+FROM nums
+LEFT JOIN norm n ON n.Ord = nums.Ord;
+
+IF LEN(ISNULL(@values, N'')) = 0
+    SET @values = N'NULL';
