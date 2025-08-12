@@ -1,33 +1,34 @@
 USE [PXE1_PXE_NI];
 GO
 
--- Séparateurs (doivent correspondre à ceux attendus par la PS)
-DECLARE @RS  NCHAR(1) = NCHAR(30); -- Row Separator
-DECLARE @CS  NCHAR(1) = NCHAR(29); -- Column Separator
+-- Séparateurs attendus par la proc
+DECLARE @RS  NCHAR(1) = NCHAR(30); -- Row Separator  ␞
+DECLARE @CS  NCHAR(1) = NCHAR(29); -- Col Separator  ␝
 
--- Paramètres d'appel
+-- Paramètres
 DECLARE @TableName   NVARCHAR(128) = N'VarEnv';
 DECLARE @Columns     NVARCHAR(MAX) = N'[VENom],[ADVAR]';
 DECLARE @ValuesBatch NVARCHAR(MAX);
 
--- (Optionnel) petite fonction d’échappement pour les quotes simples
--- Remplace ' par '' puis entoure par des quotes
+-- Données de test
 DECLARE @v1 NVARCHAR(200) = N'improbable_12055';
 DECLARE @v2 NVARCHAR(200) = N'vraimentimprobable_23055';
 
--- Construit chaque ligne (NB: texte entre quotes, numériques / NULL sans quotes)
+-- Lignes correctement construites :
+--  - texte entre quotes
+--  - numérique / NULL sans quotes
 DECLARE @row1 NVARCHAR(MAX) =
-    N'''' + REPLACE(@v1, N'''', N'''''''') + N'''' + @CS + N'2055';
+       N'''' + REPLACE(@v1, N'''', N'''''''') + N'''' + @CS + N'2055';
 
 DECLARE @row2 NVARCHAR(MAX) =
-    N'''' + REPLACE(@v2, N'''', N'''''''') + N'''' + @CS + N'NULL';
+       N'''' + REPLACE(@v2, N'''', N'''''''') + N'''' + @CS + N'NULL';  -- <- CS présent ici
 
--- Concatène les lignes avec le séparateur de lignes
+-- Batch = ligne1 + RS + ligne2
 SET @ValuesBatch = @row1 + @RS + @row2;
 
-----------------------------------------------------------------------
--- Vérifications rapides (diagnostic)
-----------------------------------------------------------------------
+-- ----------------------------------------------------------
+-- Diagnostics (aperçu lisible et découpages)
+-- ----------------------------------------------------------
 PRINT N'--- Aperçu ValuesBatch (lisible) ---';
 SELECT REPLACE(REPLACE(@ValuesBatch, @RS, N'␞'), @CS, N'␝') AS ValuesBatchPreview;
 
@@ -37,14 +38,13 @@ FROM STRING_SPLIT(@ValuesBatch, @RS);
 
 PRINT N'--- Découpage colonnes (1ère ligne) ---';
 DECLARE @firstLine NVARCHAR(MAX) =
-(SELECT TOP 1 value FROM STRING_SPLIT(@ValuesBatch, @RS) WHERE value <> N'');
-
+ (SELECT TOP 1 value FROM STRING_SPLIT(@ValuesBatch, @RS) WHERE value <> N'');
 SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS ColIdx, value AS Colonne
 FROM STRING_SPLIT(@firstLine, @CS);
 
-----------------------------------------------------------------------
+-- ----------------------------------------------------------
 -- Appel de la procédure
-----------------------------------------------------------------------
+-- ----------------------------------------------------------
 DECLARE @return_value INT;
 
 EXEC @return_value = [dbo].[batch_safe_insert_with_type_conversion]
@@ -52,7 +52,7 @@ EXEC @return_value = [dbo].[batch_safe_insert_with_type_conversion]
     @Columns     = @Columns,
     @ValuesBatch = @ValuesBatch,
     @HasIdentity = 1,
-    @IdentityCol = N'VEId'; -- adapte si besoin
+    @IdentityCol = N'VEId';
 
 SELECT 'Return Value' = @return_value;
 GO
