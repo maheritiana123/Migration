@@ -1,17 +1,25 @@
--- DEBUG: montrer la clé normale utilisée pour la détection
-DECLARE @keyDebug NVARCHAR(MAX) = N'';
-SELECT @keyDebug = STRING_AGG(
-         QUOTENAME(c.ColName) + N'=' +
-         CASE WHEN UPPER(a.Val) = 'NULL' THEN 'NULL' ELSE a.Val END
-       , N' , '
-       ) WITHIN GROUP (ORDER BY c.Ord)
-FROM @colList c
-JOIN @aligned a ON a.Ord = c.Ord
-WHERE c.ColName IN (
-    SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value,'[',''),']','')))
-    FROM STRING_SPLIT(@pkCols, ',') p
-);
+INSERT INTO @rows (Tokens)
+SELECT value
+FROM STRING_SPLIT(@VB, NCHAR(30));
 
-PRINT N'[DEBUG] Row ' + CAST(@i AS NVARCHAR(10)) 
-    + N' | WHERE=' + @whereClause 
-    + N' | KEY=' + @keyDebug;
+DECLARE @xmlRows XML =
+    CAST(('<x><i>' + REPLACE(@VB, NCHAR(30), '</i><i>') + '</i></x>') AS XML);
+
+INSERT INTO @rows (Tokens)
+SELECT T.N.value('.', 'nvarchar(max)')
+FROM @xmlRows.nodes('/x/i') AS T(N);
+
+
+
+INSERT INTO @valList (Val, Ord)
+SELECT LTRIM(RTRIM(value)),
+       ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM STRING_SPLIT(@tokens, NCHAR(31));
+
+DECLARE @xmlVals XML =
+    CAST(('<x><i>' + REPLACE(@tokens, NCHAR(31), '</i><i>') + '</i></x>') AS XML);
+
+INSERT INTO @valList (Val, Ord)
+SELECT LTRIM(RTRIM(T.N.value('.', 'nvarchar(max)'))) AS Val,
+       ROW_NUMBER() OVER (ORDER BY (SELECT 1))       AS Ord
+FROM @xmlVals.nodes('/x/i') AS T(N);
