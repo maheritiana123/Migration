@@ -1,38 +1,45 @@
--- Normaliser les séparateurs sûrs -> chars de contrôle internes à la proc
+-- Normaliser les séparateurs "sûrs" (venant du C#) vers des séparateurs internes
 DECLARE @VB NVARCHAR(MAX) = ISNULL(@ValuesBatch, N'');
-SET @VB = REPLACE(@VB, N'§§', NCHAR(30));  -- lignes
-SET @VB = REPLACE(@VB, N'||', NCHAR(31));  -- colonnes
+
+-- Séparateur de lignes : accepter §§ ou $$ (les deux)
+SET @VB = REPLACE(@VB, N'§§', NCHAR(30));
+SET @VB = REPLACE(@VB, N'$$', NCHAR(30));
+
+-- Séparateur de colonnes : ||
+SET @VB = REPLACE(@VB, N'||', NCHAR(31));
 
 
+
+---------------------------------------------------------------------
 -- Sépare le batch en lignes (RowIndex = ordre 1..N)
+---------------------------------------------------------------------
 DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
+
 INSERT INTO @rows (Tokens)
 SELECT value
-FROM STRING_SPLIT(@VB, NCHAR(30))           -- <-- au lieu de @ValuesBatch, CHAR(30)
-WHERE LEN(value) > 0;                        -- pas de trim ici, on garde tout
+FROM STRING_SPLIT(@VB, NCHAR(30));   -- pas de WHERE : on garde tout
 
-...
+-- Filet de sécurité : si rien n'a été inséré, pousser 1 ligne quand même
+IF NOT EXISTS (SELECT 1 FROM @rows)
+BEGIN
+    INSERT INTO @rows (Tokens) VALUES (@VB);
+END
 
--- 1) Split des valeurs (CHAR(31)) dans @valList
+
+-- 1) Split des valeurs (séparateur colonnes)
 DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
 IF @tokens IS NOT NULL AND LEN(@tokens) > 0
 BEGIN
     INSERT INTO @valList (Val, Ord)
     SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-    FROM STRING_SPLIT(@tokens, NCHAR(31));   -- <-- pas de TRIM ni WHERE
+    FROM STRING_SPLIT(@tokens, NCHAR(31));   -- pas de TRIM/WHERE
 END
 
 
 
+const string COL_SEP = "||";  // entre colonnes
+const string ROW_SEP = "$$";  // entre lignes  (tu utilises déjà $$ d’après la capture)
 
-// Séparateurs sûrs (imprimables) :
-const string COL_SEP = "||";   // entre colonnes
-const string ROW_SEP = "§§";   // entre lignes
-
-// ... à l’endroit où on construit les tokens d’une ligne :
-valueTokensPerRow.Add(string.Join(COL_SEP, tokens)); // au lieu de CHAR(31)
-
-// ... à l’endroit où on construit le batch :
-string valuesBatch = string.Join(ROW_SEP, valueTokensPerRow); // au lieu de CHAR(30)
-
-// (le reste ne change pas : on passe toujours @ValuesBatch via SetSecureParam)
+// ...
+valueTokensPerRow.Add(string.Join(COL_SEP, tokens));
+string valuesBatch = string.Join(ROW_SEP, valueTokensPerRow);
