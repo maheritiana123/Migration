@@ -1,22 +1,29 @@
-USE [PXE1_PXE_NI];
-GO
+-- (optionnel) USE TonBase;
+SET NOCOUNT ON;
 
--- Séparateurs (mêmes que la proc)
-DECLARE @RS nchar(1) = NCHAR(30); -- séparateur de lignes
-DECLARE @CS nchar(1) = NCHAR(29); -- séparateur de colonnes
+------------------------------------------------------------
+-- 1) Construire @ValuesBatch correctement
+--    Row1  : VENom='improbable_12055', ADVAR=12055
+--    Row2  : VENom='vraimentimprobable_23055', ADVAR=NULL
+--    Séparateur de colonnes = NCHAR(29), de lignes = NCHAR(30)
+------------------------------------------------------------
+DECLARE @row1 NVARCHAR(MAX) = N'''improbable_12055''' + NCHAR(29) + N'12055';
+DECLARE @row2 NVARCHAR(MAX) = N'''vraimentimprobable_23055''' + NCHAR(29) + N'NULL';
 
--- 2 lignes d'exemple pour VarEnv : [VENom] (string), [ADVAR] (int/nullable)
-DECLARE @row1 nvarchar(max) = N'''' + N'improbable_12055'        + N'''' + @CS + N'12055';
-DECLARE @row2 nvarchar(max) = N'''' + N'vraimentimprobable_23055' + N'''' + @CS + N'NULL';
+DECLARE @ValuesBatch NVARCHAR(MAX) = @row1 + NCHAR(30) + @row2;
 
--- Batch (ligne1 ␞ ligne2)
-DECLARE @ValuesBatch nvarchar(max) = @row1 + @RS + @row2;
+-- Aperçu lisible des séparateurs (␝ = col, ␞ = row)
+SELECT REPLACE(REPLACE(@ValuesBatch, NCHAR(30), N'␞'), NCHAR(29), N'␝') AS Preview;
 
--- Aperçu lisible (on remplace juste pour voir ce qu’on envoie)
-SELECT REPLACE(REPLACE(@ValuesBatch, @RS, N'␞'), @CS, N'␝') AS Preview;
+------------------------------------------------------------
+-- 2) Appel de la procédure
+--    IMPORTANT :
+--      - @Columns doit être dans le même ordre que les tokens de chaque ligne
+--      - Les valeurs texte DOIVENT être entre quotes dans @ValuesBatch (ex: ''foo'')
+--      - Les NULL ne doivent pas être quotés (N'NULL')
+------------------------------------------------------------
+DECLARE @return_value INT;
 
--- Appel de la procédure
-DECLARE @return_value int;
 EXEC @return_value = dbo.batch_safe_insert_with_type_conversion
     @TableName   = N'VarEnv',
     @Columns     = N'[VENom],[ADVAR]',
@@ -24,5 +31,15 @@ EXEC @return_value = dbo.batch_safe_insert_with_type_conversion
     @HasIdentity = 1,
     @IdentityCol = N'VEId';
 
+-- La proc renvoie un jeu de résultats : RowIndex | NewID | ErrorMessage
+-- RowIndex = numéro de ligne du batch (1, 2, ...)
+
 SELECT 'Return Value' = @return_value;
-GO
+
+------------------------------------------------------------
+-- 3) Vérification rapide côté table
+------------------------------------------------------------
+SELECT TOP (10) VEId, VENom, ADVAR
+FROM dbo.VarEnv
+WHERE VENom IN (N'improbable_12055', N'vraimentimprobable_23055')
+ORDER BY VEId DESC;
