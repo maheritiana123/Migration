@@ -1,3 +1,9 @@
+-- Normaliser les séparateurs sûrs -> chars de contrôle internes à la proc
+DECLARE @VB NVARCHAR(MAX) = ISNULL(@ValuesBatch, N'');
+SET @VB = REPLACE(@VB, N'§§', NCHAR(30));  -- lignes
+SET @VB = REPLACE(@VB, N'||', NCHAR(31));  -- colonnes
+
+
 -- Sépare le batch en lignes (RowIndex = ordre 1..N)
 DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
 INSERT INTO @rows (Tokens)
