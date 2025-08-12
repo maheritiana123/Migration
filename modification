@@ -1,39 +1,12 @@
-DECLARE @vb NVARCHAR(MAX) = 
-       N'''' + N'improbable_12055' + N'''' + NCHAR(29) + N'12055'
-    +  NCHAR(30) +
-       N'''' + N'vraimentimprobable_23055' + N'''' + NCHAR(29) + N'NULL';
-
--- (facultatif) Aperçu rapide
-SELECT 'PreviewValuesBatch' AS Label,
-       REPLACE(REPLACE(@vb, NCHAR(30), N'␞'), NCHAR(29), N'␝') AS Preview;
-
--- Appel de la procédure
-EXEC dbo.batch_safe_insert_with_type_conversion
-     @TableName   = N'VarEnv',
-     @Columns     = N'[VENom],[ADVAR]',
-     @ValuesBatch = @vb,
-     @HasIdentity = 1,
-     @IdentityCol = N'VEId';
-
-
--- Compter les séparateurs dans @vb
-SELECT
-  TotalLen    = LEN(@vb),
-  RowsSep     = (LEN(@vb) - LEN(REPLACE(@vb, NCHAR(30), N''))),
-  ColsSep     = (LEN(@vb) - LEN(REPLACE(@vb, NCHAR(29), N'')));
-
-
-
-
 IF OBJECT_ID(N'dbo.batch_safe_insert_with_type_conversion', N'P') IS NOT NULL
     DROP PROCEDURE dbo.batch_safe_insert_with_type_conversion;
 GO
 CREATE PROCEDURE dbo.batch_safe_insert_with_type_conversion
-    @TableName      NVARCHAR(128),
-    @Columns        NVARCHAR(MAX),     -- ex: [Col1],[Col2]
-    @ValuesBatch    NVARCHAR(MAX),     -- lignes: NCHAR(30), colonnes: NCHAR(29)
-    @HasIdentity    BIT = 0,
-    @IdentityCol    NVARCHAR(128) = NULL  -- si NULL et @HasIdentity=1 => auto-détection
+    @TableName    NVARCHAR(128),
+    @Columns      NVARCHAR(MAX),     -- ex: [Col1],[Col2]
+    @ValuesBatch  NVARCHAR(MAX),     -- lignes: NCHAR(30), colonnes: NCHAR(29)
+    @HasIdentity  BIT = 0,
+    @IdentityCol  NVARCHAR(128) = NULL   -- si NULL et @HasIdentity=1 : auto-détection
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -41,35 +14,50 @@ BEGIN
     DECLARE @RS NCHAR(1) = NCHAR(30);  -- séparateur de lignes
     DECLARE @CS NCHAR(1) = NCHAR(29);  -- séparateur de colonnes
 
-    -- Auto-détection de la colonne identity si nécessaire
+    -- Auto-détection colonne IDENTITY si besoin
     IF @HasIdentity = 1 AND (ISNULL(@IdentityCol, N'') = N'')
     BEGIN
-        SELECT TOP 1 @IdentityCol = COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = @TableName
-          AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') = 1;
+        SELECT TOP (1) @IdentityCol = c.COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        WHERE c.TABLE_NAME = @TableName
+          AND COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1;
     END
 
-    -- Colonnes PK/UNIQUE hors identity pour la détection de doublons
-    DECLARE @pkCols NVARCHAR(MAX);
-    SELECT @pkCols = STRING_AGG(QUOTENAME(kcu.COLUMN_NAME), ',')
+    -- Colonnes PK/UNIQUE (hors identity) -> dans une table variable (pas de STRING_AGG en 2016)
+    DECLARE @pkCols TABLE (ColName NVARCHAR(128) PRIMARY KEY);
+    INSERT INTO @pkCols(ColName)
+    SELECT DISTINCT LTRIM(RTRIM(kc.COLUMN_NAME))
     FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-      ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-     AND tc.TABLE_NAME = kcu.TABLE_NAME
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kc
+      ON kc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+     AND kc.TABLE_NAME      = tc.TABLE_NAME
     WHERE tc.TABLE_NAME = @TableName
       AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
-      AND kcu.COLUMN_NAME <> ISNULL(@IdentityCol, N'');
+      AND kc.COLUMN_NAME <> ISNULL(@IdentityCol, N'');
 
-    -- Normaliser: supprimer CR/LF parasites éventuels
+    -- Normalisation: enlève CR/LF parasites
     SET @ValuesBatch = REPLACE(REPLACE(@ValuesBatch, NCHAR(13), N''), NCHAR(10), N'');
 
-    -- Découpage des lignes avec ordinal (préserve l’ordre)
-    DECLARE @rows TABLE(RowIndex INT, Line NVARCHAR(MAX));
-    INSERT INTO @rows(RowIndex, Line)
-    SELECT s.[ordinal], s.[value]
-    FROM STRING_SPLIT(@ValuesBatch, @RS, 1) AS s
-    WHERE s.[value] IS NOT NULL AND LEN(s.[value]) > 0;
+    ----------------------------------------------------------------------
+    -- Découpe des LIGNES en conservant l'ordre (via XML)
+    ----------------------------------------------------------------------
+    DECLARE @escapedBatch NVARCHAR(MAX) =
+        REPLACE(REPLACE(REPLACE(COALESCE(@ValuesBatch, N''), N'&', N'&amp;'), N'<', N'&lt;'), N'>', N'&gt;');
+
+    SET @escapedBatch = N'<root><r>' + REPLACE(@escapedBatch, @RS, N'</r><r>') + N'</r></root>';
+
+    DECLARE @xmlRows XML = TRY_CAST(@escapedBatch AS XML);
+
+    IF @xmlRows IS NULL
+    BEGIN
+        SELECT 0 AS RowIndex, NULL AS NewID, N'Batch vide (XML invalide ou aucun séparateur de lignes)' AS ErrorMessage;
+        RETURN;
+    END
+
+    DECLARE @rows TABLE(RowIndex INT IDENTITY(1,1), Line NVARCHAR(MAX));
+    INSERT INTO @rows(Line)
+    SELECT T.N.value('.', 'nvarchar(max)')
+    FROM @xmlRows.nodes('/root/r') AS T(N);
 
     IF NOT EXISTS (SELECT 1 FROM @rows)
     BEGIN
@@ -77,91 +65,146 @@ BEGIN
         RETURN;
     END
 
-    -- Préparer les colonnes d’INSERT dans l’ordre
-    DECLARE @colList TABLE(ColName NVARCHAR(128), Ord INT);
-    INSERT INTO @colList(ColName, Ord)
-    SELECT LTRIM(RTRIM(REPLACE(REPLACE(value, '[',''),']',''))),
-           ROW_NUMBER() OVER (ORDER BY (SELECT 1))
-    FROM STRING_SPLIT(@Columns, ',')
-    WHERE RTRIM(LTRIM(value)) <> N'';
+    ----------------------------------------------------------------------
+    -- Découpe des COLONNES (@Columns) en conservant l'ordre (via XML)
+    ----------------------------------------------------------------------
+    DECLARE @columnsXml NVARCHAR(MAX) =
+        REPLACE(REPLACE(REPLACE(@Columns, N'&', N'&amp;'), N'<', N'&lt;'), N'>', N'&gt;');
+    SET @columnsXml = N'<x><c>' + REPLACE(@columnsXml, N',', N'</c><c>') + N'</c></x>';
 
+    DECLARE @xmlColsDef XML = TRY_CAST(@columnsXml AS XML);
+    IF @xmlColsDef IS NULL
+    BEGIN
+        SELECT 0 AS RowIndex, NULL AS NewID, N'Colonnes invalides (XML)' AS ErrorMessage;
+        RETURN;
+    END
+
+    DECLARE @colList TABLE (Ord INT IDENTITY(1,1), ColName NVARCHAR(128));
+    INSERT INTO @colList(ColName)
+    SELECT LTRIM(RTRIM(REPLACE(REPLACE(T.N.value('.','nvarchar(max)'), '[',''),']','')))
+    FROM @xmlColsDef.nodes('/x/c') AS T(N)
+    WHERE LTRIM(RTRIM(T.N.value('.','nvarchar(max)'))) <> N'';
+
+    DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
+
+    ----------------------------------------------------------------------
+    -- Table de sortie
+    ----------------------------------------------------------------------
     DECLARE @out TABLE(RowIndex INT, NewID NVARCHAR(100), ErrorMessage NVARCHAR(MAX));
 
+    ----------------------------------------------------------------------
+    -- Boucle sur chaque LIGNE (ordre préservé)
+    ----------------------------------------------------------------------
     DECLARE @i INT = 1, @n INT = (SELECT COUNT(*) FROM @rows);
     WHILE @i <= @n
     BEGIN
         DECLARE @line NVARCHAR(MAX) = (SELECT Line FROM @rows WHERE RowIndex=@i);
 
-        -- Découper les valeurs de la ligne (avec ordinal)
-        DECLARE @valList TABLE(Val NVARCHAR(MAX), Ord INT);
-        INSERT INTO @valList(Val, Ord)
-        SELECT s.[value], s.[ordinal]
-        FROM STRING_SPLIT(@line, @CS, 1) AS s;
+        -- Découpe des VALEURS de la ligne (via XML pour garder l’ordre)
+        DECLARE @escapedLine NVARCHAR(MAX) =
+            REPLACE(REPLACE(REPLACE(COALESCE(@line, N''), N'&', N'&amp;'), N'<', N'&lt;'), N'>', N'&gt;');
+        SET @escapedLine = N'<x><c>' + REPLACE(@escapedLine, @CS, N'</c><c>') + N'</c></x>';
 
-        -- Construire WHERE pour doublons si pkCols présent
-        DECLARE @where NVARCHAR(MAX) = N'';
-        IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
+        DECLARE @xmlVals XML = TRY_CAST(@escapedLine AS XML);
+        IF @xmlVals IS NULL
         BEGIN
-            DECLARE @conds TABLE(Cond NVARCHAR(MAX), Ord INT);
-            INSERT INTO @conds(Cond, Ord)
-            SELECT
-                CASE WHEN UPPER(v.Val)=N'NULL'
-                     THEN QUOTENAME(c.ColName) + N' IS NULL'
-                     ELSE QUOTENAME(c.ColName) + N' = ' + v.Val END,
-                c.Ord
-            FROM @colList c
-            JOIN @valList v ON v.Ord = c.Ord
-            WHERE c.ColName IN (
-                SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value, '[',''),']','')))
-                FROM STRING_SPLIT(@pkCols, ',') p
+            INSERT INTO @out VALUES (@i, NULL, N'ERR: Ligne invalide (XML).');
+            SET @i += 1;
+            CONTINUE;
+        END
+
+        DECLARE @valList TABLE (Ord INT IDENTITY(1,1), Val NVARCHAR(MAX));
+        INSERT INTO @valList(Val)
+        SELECT T.N.value('.', 'nvarchar(max)')
+        FROM @xmlVals.nodes('/x/c') AS T(N);
+
+        DECLARE @valCount INT = (SELECT COUNT(*) FROM @valList);
+
+        -- Vérifie le nombre de colonnes
+        IF @valCount <> @colCount
+        BEGIN
+            INSERT INTO @out VALUES (
+                @i, NULL,
+                N'ERR: Nombre de colonnes != table. attendu='
+                + CAST(@colCount AS NVARCHAR(10)) + N' | trouvé='
+                + CAST(@valCount AS NVARCHAR(10))
             );
+            SET @i += 1;
+            CONTINUE;
+        END
 
-            SELECT @where = STRING_AGG(Cond, N' AND ') WITHIN GROUP (ORDER BY Ord)
-            FROM @conds;
+        ------------------------------------------------------------------
+        -- WHERE de détection des doublons (PK/UNIQUE hors identity)
+        ------------------------------------------------------------------
+        DECLARE @where NVARCHAR(MAX) = N'';
+        SELECT @where = STUFF((
+            SELECT N' AND ' + 
+                   CASE WHEN UPPER(LTRIM(RTRIM(v.Val))) = N'NULL'
+                        THEN QUOTENAME(c.ColName) + N' IS NULL'
+                        ELSE QUOTENAME(c.ColName) + N' = ' + v.Val END
+            FROM @pkCols k
+            JOIN @colList c ON c.ColName = k.ColName
+            JOIN @valList v ON v.Ord = c.Ord
+            ORDER BY c.Ord
+            FOR XML PATH(''), TYPE).value('.','nvarchar(max)')
+        ,1,5,N'');
 
-            IF LEN(@where) > 0
+        IF ISNULL(@where, N'') <> N''
+        BEGIN
+            DECLARE @exists BIT = 0;
+            DECLARE @chk NVARCHAR(MAX) =
+                N'SELECT @o = CASE WHEN EXISTS (SELECT 1 FROM ' +
+                QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @where +
+                N') THEN 1 ELSE 0 END';
+            EXEC sp_executesql @chk, N'@o bit OUTPUT', @o=@exists OUTPUT;
+
+            IF @exists = 1
             BEGIN
-                DECLARE @exists BIT;
-                DECLARE @chk NVARCHAR(MAX) = N'SELECT @o = CASE WHEN EXISTS (SELECT 1 FROM '
-                                           + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @where + N') THEN 1 ELSE 0 END';
-                EXEC sp_executesql @chk, N'@o bit OUTPUT', @o=@exists OUTPUT;
-                IF @exists = 1
-                BEGIN
-                    INSERT INTO @out VALUES(@i, NULL, N'Doublon');
-                    SET @i += 1;
-                    CONTINUE;
-                END
+                INSERT INTO @out VALUES (@i, NULL, N'Doublon');
+                SET @i += 1;
+                CONTINUE;
             END
         END
 
-        -- Assembler la liste des valeurs pour l’INSERT (ordre des colonnes)
-        DECLARE @values NVARCHAR(MAX);
-        SELECT @values = STRING_AGG(Val, N',') WITHIN GROUP (ORDER BY Ord)
-        FROM @valList;
+        ------------------------------------------------------------------
+        -- Concatène les valeurs (ordre) pour INSERT SELECT
+        ------------------------------------------------------------------
+        DECLARE @values NVARCHAR(MAX) =
+            STUFF((
+                SELECT N',' + v.Val
+                FROM @valList v
+                ORDER BY v.Ord
+                FOR XML PATH(''), TYPE).value('.','nvarchar(max)')
+            ,1,1,N'');
 
         IF ISNULL(@values, N'') = N'' SET @values = N'NULL';
 
+        ------------------------------------------------------------------
+        -- INSERT
+        ------------------------------------------------------------------
         DECLARE @sql NVARCHAR(MAX) = N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') ';
-        IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
+        IF @HasIdentity = 1 AND ISNULL(@IdentityCol,N'') <> N''
             SET @sql += N'OUTPUT INSERTED.' + QUOTENAME(@IdentityCol) + N' AS NewID ';
         SET @sql += N'SELECT ' + @values;
 
         BEGIN TRY
-            IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
+            IF @HasIdentity = 1 AND ISNULL(@IdentityCol,N'') <> N''
             BEGIN
-                DECLARE @tmp TABLE(NewID NVARCHAR(100));
+                DECLARE @tmp TABLE (NewID NVARCHAR(100));
                 INSERT INTO @tmp EXEC sp_executesql @sql;
-                INSERT INTO @out
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
                 SELECT @i, NewID, NULL FROM @tmp;
             END
             ELSE
             BEGIN
                 EXEC sp_executesql @sql;
-                INSERT INTO @out VALUES(@i, NULL, NULL);
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES (@i, NULL, NULL);
             END
         END TRY
         BEGIN CATCH
-            INSERT INTO @out VALUES(@i, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + ISNULL(@values,N''));
+            INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+            VALUES (@i, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + ISNULL(@values,N''));
         END CATCH
 
         SET @i += 1;
@@ -172,3 +215,22 @@ BEGIN
     ORDER BY RowIndex;
 END
 GO
+
+
+DECLARE @RS NCHAR(1) = NCHAR(30);
+DECLARE @CS NCHAR(1) = NCHAR(29);
+
+DECLARE @row1 NVARCHAR(MAX) = N'''' + N'improbable_12055' + N'''' + @CS + N'12055';
+DECLARE @row2 NVARCHAR(MAX) = N'''' + N'vraimentimprobable_23055' + N'''' + @CS + N'NULL';
+
+DECLARE @vb NVARCHAR(MAX) = @row1 + @RS + @row2;
+
+-- Aperçu lisible
+SELECT REPLACE(REPLACE(@vb, @RS, N'␞'), @CS, N'␝') AS Preview;
+
+EXEC dbo.batch_safe_insert_with_type_conversion
+     @TableName   = N'VarEnv',
+     @Columns     = N'[VENom],[ADVAR]',
+     @ValuesBatch = @vb,
+     @HasIdentity = 1,
+     @IdentityCol = N'VEId';
