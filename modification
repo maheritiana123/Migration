@@ -1,12 +1,11 @@
-DECLARE @TableName   nvarchar(128) = N'VarEnv';
-DECLARE @Columns     nvarchar(max) = N'[VENom],[ADVAR]';
-DECLARE @HasIdentity bit          = 1;
-DECLARE @IdentityCol nvarchar(128) = N'VEId';
+-- DEBUG: compter les lignes reçues
+DECLARE @dbgCount INT = (SELECT COUNT(*) FROM @rows);
+PRINT N'[PS DEBUG] rows=' + CAST(@dbgCount AS nvarchar(10))
+      + N' len(@ValuesBatch)=' + CAST(LEN(ISNULL(@ValuesBatch,N'')) AS nvarchar(20));
 
-DECLARE @row1 nvarchar(max) = N'''debug_1''' + NCHAR(31) + N'101';
-DECLARE @row2 nvarchar(max) = N'''debug_2''' + NCHAR(31) + N'NULL';
-DECLARE @ValuesBatch nvarchar(max) = @row1 + NCHAR(30) + @row2;
-
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName=@TableName, @Columns=@Columns, @ValuesBatch=@ValuesBatch,
-    @HasIdentity=@HasIdentity, @IdentityCol=@IdentityCol;
+-- Si 0, renvoyer un resultset "debug" (pour que le C# voie au moins 1 ligne)
+IF @dbgCount = 0
+BEGIN
+    SELECT 0 AS RowIndex, NULL AS NewID, N'Batch vide (aucune ligne découpée)' AS ErrorMessage;
+    RETURN;
+END
