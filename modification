@@ -1,45 +1,48 @@
--- Normaliser les séparateurs "sûrs" (venant du C#) vers des séparateurs internes
+@TableName   = N'VarEnv',
+@Columns     = N'[VENom],[ADVAR]',
+@ValuesBatch = N'''WPNumStat''||NULL$$''WPED''||NULL',
+@HasIdentity = 1,
+@IdentityCol = N'VEId'
+
+
+-- Debug: afficher longueur et début du batch après normalisation
 DECLARE @VB NVARCHAR(MAX) = ISNULL(@ValuesBatch, N'');
 
--- Séparateur de lignes : accepter §§ ou $$ (les deux)
+-- Si tu as déjà mis la normalisation, garde la même variable (@VB)
 SET @VB = REPLACE(@VB, N'§§', NCHAR(30));
 SET @VB = REPLACE(@VB, N'$$', NCHAR(30));
-
--- Séparateur de colonnes : ||
 SET @VB = REPLACE(@VB, N'||', NCHAR(31));
 
+RAISERROR(N'VB len=%d head=%s', 10, 1, LEN(@VB), LEFT(REPLACE(@VB, NCHAR(31), N'|'), 200)) WITH NOWAIT;
 
 
----------------------------------------------------------------------
--- Sépare le batch en lignes (RowIndex = ordre 1..N)
----------------------------------------------------------------------
-DECLARE @rows TABLE (RowIndex INT IDENTITY(1,1), Tokens NVARCHAR(MAX));
+DECLARE @rowsCount INT = (SELECT COUNT(*) FROM @rows);
+RAISERROR(N'rows=%d', 10, 1, @rowsCount) WITH NOWAIT;
 
-INSERT INTO @rows (Tokens)
-SELECT value
-FROM STRING_SPLIT(@VB, NCHAR(30));   -- pas de WHERE : on garde tout
+-- (temporaire) voir la première ligne de tokens
+IF @rowsCount > 0
+BEGIN
+    DECLARE @first NVARCHAR(MAX) = (SELECT TOP(1) Tokens FROM @rows ORDER BY RowIndex);
+    RAISERROR(N'first tokens=%s', 10, 1, LEFT(REPLACE(@first, NCHAR(31), N'|'), 200)) WITH NOWAIT;
+END
 
--- Filet de sécurité : si rien n'a été inséré, pousser 1 ligne quand même
+
 IF NOT EXISTS (SELECT 1 FROM @rows)
 BEGIN
+    -- on pousse le batch complet comme UNE ligne pour avoir au moins un retour
     INSERT INTO @rows (Tokens) VALUES (@VB);
+    RAISERROR(N'rows empty → pushed 1', 10, 1) WITH NOWAIT;
 END
 
 
--- 1) Split des valeurs (séparateur colonnes)
-DECLARE @valList TABLE (Val NVARCHAR(MAX), Ord INT);
-IF @tokens IS NOT NULL AND LEN(@tokens) > 0
-BEGIN
-    INSERT INTO @valList (Val, Ord)
-    SELECT value, ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-    FROM STRING_SPLIT(@tokens, NCHAR(31));   -- pas de TRIM/WHERE
-END
+const string COL_SEP = "||";
+const string ROW_SEP = "$$";
 
-
-
-const string COL_SEP = "||";  // entre colonnes
-const string ROW_SEP = "$$";  // entre lignes  (tu utilises déjà $$ d’après la capture)
-
-// ...
+// tokens = FormatValueForSql(value, type)  → '...' ou NULL (sans quotes)
 valueTokensPerRow.Add(string.Join(COL_SEP, tokens));
+
 string valuesBatch = string.Join(ROW_SEP, valueTokensPerRow);
+sql.SetSecureParam("ValuesBatch", valuesBatch, true, 0);
+
+Console.WriteLine($"[DEBUG] columnsSql = {columnsSql}  (count={insertColumnsList.Count})");
+Console.WriteLine($"[DEBUG] first row tokens = {valueTokensPerRow.FirstOrDefault()}");
