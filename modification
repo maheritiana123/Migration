@@ -1,77 +1,17 @@
-/* 5.3) Construire EXACTEMENT @colCount valeurs dans l’ordre 1..@colCount
-        et conserver la liste alignée pour le WHERE */
-DECLARE @colCount INT = (SELECT COUNT(*) FROM @colList);
-DECLARE @values NVARCHAR(MAX);
+-- DEBUG: montrer la clé normale utilisée pour la détection
+DECLARE @keyDebug NVARCHAR(MAX) = N'';
+SELECT @keyDebug = STRING_AGG(
+         QUOTENAME(c.ColName) + N'=' +
+         CASE WHEN UPPER(a.Val) = 'NULL' THEN 'NULL' ELSE a.Val END
+       , N' , '
+       ) WITHIN GROUP (ORDER BY c.Ord)
+FROM @colList c
+JOIN @aligned a ON a.Ord = c.Ord
+WHERE c.ColName IN (
+    SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value,'[',''),']','')))
+    FROM STRING_SPLIT(@pkCols, ',') p
+);
 
-DECLARE @aligned TABLE (Ord INT PRIMARY KEY, Val NVARCHAR(MAX));
-
-;WITH norm AS (
-    SELECT Ord, LTRIM(RTRIM(Val)) AS Val
-    FROM @valList
-),
-nums AS (
-    SELECT TOP (@colCount) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS Ord
-    FROM sys.all_objects
-)
-INSERT INTO @aligned(Ord, Val)
-SELECT nums.Ord, COALESCE(n.Val, N'NULL')
-FROM nums
-LEFT JOIN norm n ON n.Ord = nums.Ord;
-
-SELECT @values = STRING_AGG(Val, ',') WITHIN GROUP (ORDER BY Ord)
-FROM @aligned;
-
-IF LEN(ISNULL(@values, N'')) = 0
-    SET @values = N'NULL';
-
-/* 5.4) Détection de doublon (si PK/UK dispo), en utilisant @aligned (aligné) */
-DECLARE @whereClause NVARCHAR(MAX) = N'';
-
-IF @pkCols IS NOT NULL AND LEN(@pkCols) > 0
-BEGIN
-    DECLARE @conds TABLE (Cond NVARCHAR(MAX), Ord INT);
-
-    INSERT INTO @conds (Cond, Ord)
-    SELECT
-        CASE WHEN UPPER(LTRIM(RTRIM(a.Val))) = 'NULL'
-             THEN QUOTENAME(c.ColName) + ' IS NULL'
-             ELSE QUOTENAME(c.ColName) + ' = ' + a.Val END,
-        c.Ord
-    FROM @colList c
-    JOIN @aligned a ON a.Ord = c.Ord
-    WHERE c.ColName IN (
-        SELECT LTRIM(RTRIM(REPLACE(REPLACE(p.value,'[',''),']','')))
-        FROM STRING_SPLIT(@pkCols, ',') p
-    );
-
-    SELECT @whereClause = STRING_AGG(Cond, ' AND ') WITHIN GROUP (ORDER BY Ord)
-    FROM @conds;
-
-    IF LEN(@whereClause) > 0
-    BEGIN
-        DECLARE @exists BIT = 0;
-        DECLARE @checkSql NVARCHAR(MAX) =
-            N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
-            + QUOTENAME(@TableName) + ' WITH (NOLOCK) WHERE ' + @whereClause + N') THEN 1 ELSE 0 END';
-
-        EXEC sp_executesql @checkSql, N'@out BIT OUTPUT', @out=@exists OUTPUT;
-
-        IF @exists = 1
-        BEGIN
-            INSERT INTO @out (RowIndex, NewID, ErrorMessage)
-            VALUES (@i, NULL, N'Doublon');
-            SET @i += 1;
-            CONTINUE;
-        END
-    END
-END
-
-
-
-
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName   = N'VarEnv',
-    @Columns     = N'[VENom],[ADVAR]',
-    @ValuesBatch = N'''improbable_1''||2055$$''vraimentimprobable''||NULL',
-    @HasIdentity = 1,
-    @IdentityCol = N'VEId';
+PRINT N'[DEBUG] Row ' + CAST(@i AS NVARCHAR(10)) 
+    + N' | WHERE=' + @whereClause 
+    + N' | KEY=' + @keyDebug;
