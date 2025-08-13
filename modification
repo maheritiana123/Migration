@@ -1,174 +1,214 @@
-private const char RS = (char)0x1E; // lignes
-private const char CS = (char)0x1D; // colonnes
-
-private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 100)
+public void PerformMigration()
 {
-    Console.WriteLine("_______________________");
-    Console.WriteLine($"[IMPORT] {tableName}");
+    Console.WriteLine("=== MIGRATION START ===");
 
-    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
+    // 1) Tables (déjà filtrées par GetAllTables)
+    var allTables = GetAllTables(); // List<string>
 
-    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
-    if (lines.Length < 2) { Console.WriteLine($"? CSV vide : {tableName}"); return; }
+    // 2) Partition (tu as déjà les règles de détection côté projet)
+    LoadRelationTables(allTables, out var normalTables, out var extendedRelations, out var pureRelations);
 
-    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-    var fkInfos = GetForeignKeyInfo(tableName);
-    var identityColumn = GetIdentityColumn(tableName);
-    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+    // 3) Dépendances & cycles (SCC)
+    var fkMap = GetForeignKeysByTable(allTables); // Dictionary<string, List<ForeignKeyInfo>>
+    var plan = BuildPlan(normalTables, extendedRelations, fkMap);
 
-    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
-
-    var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
-    var oldIdPerRow = new List<string>();
-    int structureSkipped = 0;
-
-    for (int i = 1; i < lines.Length; i++)
+    // 4) Transaction globale (tu avais déjà)
+    BeginTransaction();
+    try
     {
-        var vals = lines[i].Split(';');
-        if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
-
-        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
-
-        string oldId = null;
-        if (hasIdentity && row.ContainsKey(identityColumn))
+        // 4.1) Parents (ordre topologique + cycles gérés par FK différées)
+        foreach (var step in plan.NormalOrder)
         {
-            oldId = (row[identityColumn] ?? "").ToString();
-            row.Remove(identityColumn); // ne jamais insérer l'IDENTITY
+            var nullCols = plan.DeferredFkByTable.TryGetValue(step, out var set) ? set : null;
+            ImportTableCommon(step, forceNullFK:false, batchSize:500, nullFkColumns:nullCols);
         }
-        oldIdPerRow.Add(oldId);
+        // Fix-up des FK différées (celles mises à NULL dans les cycles)
+        foreach (var kv in plan.DeferredFkByTable)
+            FixupDeferredForeignKeys(kv.Key, kv.Value);
 
-        foreach (var fk in fkInfos)
+        // 4.2) Relations étendues (mêmes règles que parents, mais après eux)
+        foreach (var rel in plan.ExtendedOrder)
         {
-            if (!row.ContainsKey(fk.ColumnName)) continue;
-
-            if (forceNullFK) { row[fk.ColumnName] = null; continue; }
-
-            var oldFk = (row[fk.ColumnName] ?? "").ToString();
-            if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
-
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
-                row[fk.ColumnName] = newFk;
-            else if (IsForeignKeyNullable(fk))
-                row[fk.ColumnName] = null;
-            else
-                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+            var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
+            ImportTableCommon(rel, forceNullFK:false, batchSize:500, nullFkColumns:nullCols);
+            if (nullCols != null && nullCols.Count > 0)
+                FixupDeferredForeignKeys(rel, nullCols);
         }
 
-        prepared.Add(row);
+        // 4.3) Relations pures (FK–FK, pas d’IDENTITY). On boucle jusqu’à stabilisation.
+        ImportPureRelationsUntilStable(pureRelations);
+
+        CommitTransaction();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("[FATAL] " + ex.Message);
+        RollbackTransaction();
+        throw;
     }
 
-    if (prepared.Count == 0) { Console.WriteLine($"? Table {tableName} : 0 ligne exploitable (structure)."); return; }
+    Console.WriteLine("=== MIGRATION DONE ===");
+}
 
-    var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
-    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
 
-    int inserted = 0, duplicates = 0, errors = 0;
-    Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+private sealed class ImportPlan
+{
+    public List<string> NormalOrder { get; } = new();           // ordre topo
+    public List<string> ExtendedOrder { get; } = new();          // ordre topo sur étendues
+    public Dictionary<string, HashSet<string>> DeferredFkByTable { get; } = new(); // table -> FK à mettre à NULL puis fix-up
+}
 
-    for (int start = 0; start < prepared.Count; start += batchSize)
+// Clé: table; Valeur: liste de ses FK sortantes
+private Dictionary<string, List<ForeignKeyInfo>> GetForeignKeysByTable(IEnumerable<string> tables)
+{
+    var res = new Dictionary<string, List<ForeignKeyInfo>>(StringComparer.OrdinalIgnoreCase);
+    foreach (var t in tables)
+        res[t] = GetForeignKeyInfo(t); // tu as déjà
+    return res;
+}
+
+private ImportPlan BuildPlan(List<string> normalTables,
+                             List<string> extendedTables,
+                             Dictionary<string, List<ForeignKeyInfo>> fkMap)
+{
+    var plan = new ImportPlan();
+
+    // Tri topo parents
+    var (orderParents, sccParents) = TopoSortWithCycles(normalTables, fkMap);
+    plan.NormalOrder.AddRange(orderParents);
+    MarkDeferredFksForCycles(sccParents, fkMap, plan);
+
+    // Tri topo étendues
+    var (orderExt, sccExt) = TopoSortWithCycles(extendedTables, fkMap);
+    plan.ExtendedOrder.AddRange(orderExt);
+    MarkDeferredFksForCycles(sccExt, fkMap, plan);
+
+    return plan;
+}
+
+// Kahn + SCC: renvoie ordre topo partiel + SCC (cycles)
+private (List<string> order, List<HashSet<string>> sccs) TopoSortWithCycles(
+    List<string> nodes,
+    Dictionary<string, List<ForeignKeyInfo>> fkMap)
+{
+    // Graphe: edge A->B si A a une FK vers B (A dépend de B)
+    var deps = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    var rev  = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var n in nodes)
     {
-        int count = Math.Min(batchSize, prepared.Count - start);
-        var batchRows = prepared.GetRange(start, count);
-        var oldIdsBatch = oldIdPerRow.GetRange(start, count);
+        deps[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        rev[n]  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
 
-        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes); // RS/CS
-
-        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        string req = @"
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName   = $t$,
-    @Columns     = $cols$,
-    @ValuesBatch = $vb$,
-    @HasIdentity = $hid$,
-    @IdentityCol = $idcol$;";
-        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSecureParam("t", tableName, true, 0);
-        sql.SetSecureParam("cols", columnsSql, true, 0);
-        sql.SetSecureParam("vb", valuesBatch, true, 0);
-        sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
-        sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(60000);
-
-        int rows = sql.ReturnedRows(1, 1);
-        for (int i = 1; i <= rows; i++)
+    foreach (var n in nodes)
+    {
+        if (!fkMap.TryGetValue(n, out var fks)) continue;
+        foreach (var fk in fks)
         {
-            int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
-            string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
-            string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+            if (!nodes.Contains(fk.ReferencedTableName, StringComparer.OrdinalIgnoreCase)) continue;
+            deps[n].Add(fk.ReferencedTableName);
+            rev[fk.ReferencedTableName].Add(n);
+        }
+    }
 
-            if (!string.IsNullOrEmpty(err))
+    var order = new List<string>();
+    var q = new Queue<string>(deps.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key));
+    var inDeg = deps.ToDictionary(kv => kv.Key, kv => kv.Value.Count, StringComparer.OrdinalIgnoreCase);
+
+    while (q.Count > 0)
+    {
+        var u = q.Dequeue();
+        order.Add(u);
+        foreach (var v in rev[u])
+        {
+            inDeg[v]--;
+            if (inDeg[v] == 0) q.Enqueue(v);
+        }
+    }
+
+    // SCC (Kosaraju simple)
+    var remaining = inDeg.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+    var sccs = ComputeSccs(remaining, deps, rev);
+
+    // Ajoute les nœuds cycliques en fin d’ordre pour être parcourus quand même
+    foreach (var scc in sccs)
+        order.AddRange(scc);
+
+    return (order.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sccs);
+}
+
+private List<HashSet<string>> ComputeSccs(HashSet<string> nodes,
+    Dictionary<string, HashSet<string>> deps,
+    Dictionary<string, HashSet<string>> rev)
+{
+    var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var stack = new Stack<string>();
+    void Dfs1(string u)
+    {
+        visited.Add(u);
+        foreach (var v in deps[u])
+            if (nodes.Contains(v) && !visited.Contains(v)) Dfs1(v);
+        stack.Push(u);
+    }
+    foreach (var n in nodes) if (!visited.Contains(n)) Dfs1(n);
+
+    var visited2 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var comps = new List<HashSet<string>>();
+    void Dfs2(string u, HashSet<string> comp)
+    {
+        visited2.Add(u);
+        comp.Add(u);
+        foreach (var v in rev[u])
+            if (nodes.Contains(v) && !visited2.Contains(v)) Dfs2(v, comp);
+    }
+    while (stack.Count > 0)
+    {
+        var u = stack.Pop();
+        if (visited2.Contains(u)) continue;
+        var comp = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Dfs2(u, comp);
+        if (comp.Count >= 2 || HasSelfRefNonTrivial(u)) // auto-cycle si FK vers soi-même
+            comps.Add(comp);
+    }
+    return comps;
+
+    bool HasSelfRefNonTrivial(string t)
+        => deps.TryGetValue(t, out var d) && d.Contains(t);
+}
+
+// Marque, pour chaque table d’un cycle, les colonnes FK vers des tables du même cycle
+// -> on les mettra à NULL à l’insert, puis on fera un fix-up UPDATE.
+private void MarkDeferredFksForCycles(List<HashSet<string>> sccs,
+                                      Dictionary<string, List<ForeignKeyInfo>> fkMap,
+                                      ImportPlan plan)
+{
+    foreach (var scc in sccs)
+    {
+        foreach (var table in scc)
+        {
+            if (!fkMap.TryGetValue(table, out var fks)) continue;
+            foreach (var fk in fks)
             {
-                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) duplicates++;
-                else { errors++; Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}"); }
-                continue;
-            }
-
-            inserted++;
-
-            if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
-            {
-                var oldId = oldIdsBatch[rowIndex - 1];
-                if (!string.IsNullOrEmpty(oldId))
+                if (!scc.Contains(fk.ReferencedTableName)) continue; // pas intra-cycle
+                // Si FK nullable -> on peut différer
+                if (IsForeignKeyNullable(fk))
                 {
-                    if (!_idMappings.ContainsKey(tableName))
-                        _idMappings[tableName] = new Dictionary<object, object>();
-                    if (!_idMappings[tableName].ContainsKey(oldId))
-                        _idMappings[tableName][oldId] = newId;
+                    if (!plan.DeferredFkByTable.TryGetValue(table, out var set))
+                    {
+                        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        plan.DeferredFkByTable[table] = set;
+                    }
+                    set.Add(fk.ColumnName);
+                }
+                else
+                {
+                    Console.WriteLine($"[INFO] Cycle non-nullable détecté: {table}.{fk.ColumnName} → {fk.ReferencedTableName}. " +
+                                      $"Solution conseillée: DISABLE/ENABLE ciblé de la contrainte le temps de l'import, puis CHECK.");
                 }
             }
         }
     }
-
-    Console.WriteLine($"✓ Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
 }
 
-private string BuildValuesBatch(List<Dictionary<string, object>> rows, List<string> colOrder, Dictionary<string, string> columnTypes)
-{
-    var sb = new StringBuilder(rows.Count * 64);
-    for (int i = 0; i < rows.Count; i++)
-    {
-        if (i > 0) sb.Append(RS);
-        var row = rows[i];
-        for (int c = 0; c < colOrder.Count; c++)
-        {
-            if (c > 0) sb.Append(CS);
-            var col = colOrder[c];
-            var sqlType = columnTypes[col];
-            row.TryGetValue(col, out var value);
-            sb.Append(FormatValueForSqlToken(value, sqlType));
-        }
-    }
-    return sb.ToString();
-}
 
-private string FormatValueForSqlToken(object value, string sqlType)
-{
-    if (value == null) return "NULL";
-    string s = value.ToString();
-    if (string.IsNullOrWhiteSpace(s)) return "NULL";
-
-    string t = (sqlType ?? "").ToLowerInvariant();
-
-    if (t == "int" || t == "bigint" || t == "smallint" || t == "tinyint")
-        return long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out _) ? s : "NULL";
-
-    if (t == "bit") return (s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase)) ? "1" : "0";
-
-    if (t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "float" || t == "real")
-        return decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d.ToString(CultureInfo.InvariantCulture) : "NULL";
-
-    if (t == "date")
-        return DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d0) ? $"'{d0:yyyy-MM-dd}'" : "NULL";
-
-    if (t == "datetime" || t == "datetime2" || t == "smalldatetime")
-        return DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d1) ? $"'{d1:yyyy-MM-dd HH:mm:ss}'" : "NULL";
-
-    if (t == "uniqueidentifier")
-        return Guid.TryParse(s, out var g) ? $"'{g}'" : "NULL";
-
-    // par défaut: nvarchar
-    return $"'{s.Replace("'", "''")}'";
-}
