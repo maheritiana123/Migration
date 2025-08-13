@@ -108,10 +108,32 @@ private void ImportTableCommon(string tableName, bool forceNullFK = false, int b
             int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
             string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
             string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+
             if (!string.IsNullOrEmpty(err))
             {
-                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) duplicates++;
-                else { errors++; Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}"); }
+                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    duplicates++;
+
+                    // ✅ NEW: mapping aussi quand Doublon si la PS renvoie l'ID existant
+                    if (hasIdentity && !string.IsNullOrEmpty(newId)
+                        && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+                    {
+                        var oldId = oldIdsBatch[rowIndex - 1];
+                        if (!string.IsNullOrEmpty(oldId))
+                        {
+                            if (!_idMappings.ContainsKey(tableName))
+                                _idMappings[tableName] = new Dictionary<object, object>();
+
+                            _idMappings[tableName][oldId] = newId; // on mappe même en doublon
+                        }
+                    }
+                }
+                else
+                {
+                    errors++;
+                    Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
+                }
                 continue;
             }
 
