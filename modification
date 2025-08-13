@@ -1,93 +1,89 @@
-foreach (var fk in fkInfos)
+private void ImportPureRelationsUntilStable(List<string> pureRelations)
 {
-    if (!row.ContainsKey(fk.ColumnName)) continue;
+    if (pureRelations == null || pureRelations.Count == 0) return;
 
-    // 1) FK marquée "différée" -> on force NULL à l'insert
-    if (nullFkColumns != null && nullFkColumns.Contains(fk.ColumnName))
+    bool progress;
+    int pass = 0;
+    do
     {
-        row[fk.ColumnName] = null;
-        continue;
-    }
+        progress = false;
+        pass++;
+        Console.WriteLine($"[PURE] Pass {pass}");
 
-    // 2) forceNullFK global (rare)
-    if (forceNullFK)
-    {
-        row[fk.ColumnName] = null;
-        continue;
-    }
-
-    // 3) mapping normal
-    var oldFk = (row[fk.ColumnName] ?? "").ToString();
-    if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
-
-    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
-        row[fk.ColumnName] = newFk;
-    else if (IsForeignKeyNullable(fk))
-        row[fk.ColumnName] = null;
-    else
-        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+        foreach (var table in pureRelations)
+        {
+            int before = _lastInsertedCount;
+            ImportPureRelation(table);
+            progress |= (_lastInsertedCount > before);
+        }
+    } while (progress && pass < 5); // borne de sécurité
 }
 
+// Petit compteur partagé (à mettre au niveau classe)
+private int _lastInsertedCount = 0;
 
-private void FixupDeferredForeignKeys(string tableName, HashSet<string> columns)
+private void ImportPureRelation(string tableName)
 {
-    if (columns == null || columns.Count == 0) return;
-
-    Console.WriteLine($"[FIXUP] {tableName} : mise à jour FK différées ({string.Join(",", columns)})");
-
     string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath)) { Console.WriteLine($"[FIXUP] CSV introuvable {tableName}"); return; }
+    if (!File.Exists(csvPath)) return;
 
     var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
     if (lines.Length < 2) return;
 
-    var cols = lines[0].Split(';').Select(s => s.Trim()).ToList();
-    var idCol = GetIdentityColumn(tableName);
-    if (string.IsNullOrEmpty(idCol))
-    {
-        Console.WriteLine($"[FIXUP] {tableName} sans IDENTITY : skip (utiliser clé business si besoin).");
-        return;
-    }
+    var columnNames = lines[0].Split(';').Select(s => s.Trim()).ToList();
+    var fkInfos = GetForeignKeyInfo(tableName);
+    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
 
-    // pour chaque ligne CSV : retrouver le newId et construire SET col = mappedId
+    // On prépare uniquement les lignes pour lesquelles TOUTES les FK ont un mapping
+    var batchRows = new List<Dictionary<string, object>>();
     for (int i = 1; i < lines.Length; i++)
     {
         var vals = lines[i].Split(';');
-        if (vals.Length != cols.Count) continue;
+        if (vals.Length != columnNames.Count) continue;
 
-        var row = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        for (int c = 0; c < cols.Count; c++) row[cols[c]] = vals[c];
+        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
 
-        var oldId = row.ContainsKey(idCol) ? row[idCol] : null;
-        if (string.IsNullOrEmpty(oldId)) continue;
-
-        if (!_idMappings.TryGetValue(tableName, out var tableMap) || !tableMap.TryGetValue(oldId, out var newId))
-            continue; // ligne non insérée (doublon/erreur)
-
-        // Build SET ...
-        var setParts = new List<string>();
-        foreach (var col in columns)
+        bool ok = true;
+        foreach (var fk in fkInfos)
         {
-            if (!row.TryGetValue(col, out var oldFkVal) || string.IsNullOrWhiteSpace(oldFkVal))
-            {
-                setParts.Add($"[{col}]=NULL");
-                continue;
-            }
-            // retrouver la table référencée
-            var fk = GetForeignKeyInfo(tableName).FirstOrDefault(f => f.ColumnName.Equals(col, StringComparison.OrdinalIgnoreCase));
-            if (fk == null) { setParts.Add($"[{col}]=NULL"); continue; }
+            var oldVal = (row[fk.ColumnName] ?? "").ToString();
+            if (string.IsNullOrWhiteSpace(oldVal)) { row[fk.ColumnName] = null; continue; }
 
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFkVal, out var mapped))
-                setParts.Add($"[{col}]={mapped}");
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldVal, out var newVal))
+                row[fk.ColumnName] = newVal;
             else
-                setParts.Add($"[{col}]=NULL"); // faute de mieux (sinon lever une erreur)
+            {
+                ok = false; break; // on attend un prochain pass
+            }
         }
-        if (setParts.Count == 0) continue;
-
-        string sqlTxt = $"UPDATE [{tableName}] SET {string.Join(",", setParts)} WHERE [{idCol}]={newId};";
-        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest(sqlTxt, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
+        if (ok) batchRows.Add(row);
     }
+
+    if (batchRows.Count == 0) { _lastInsertedCount = 0; return; }
+
+    string columnsSql = string.Join(",", columnNames.Select(c => $"[{c}]"));
+    string valuesBatch = BuildValuesBatch(batchRows, columnNames, columnTypes); // réutilise le helper
+    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+    string req = @"
+EXEC dbo.batch_safe_insert_with_type_conversion
+  @TableName=$t$, @Columns=$cols$, @ValuesBatch=$vb$, @HasIdentity=0, @IdentityCol=NULL;";
+    sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+    sql.SetSecureParam("t", tableName, true, 0);
+    sql.SetSecureParam("cols", columnsSql, true, 0);
+    sql.SetSecureParam("vb", valuesBatch, true, 0);
+    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+    sql.Execute(60000);
+
+    int inserted = 0;
+    int rows = sql.ReturnedRows(1, 1);
+    for (int r = 1; r <= rows; r++)
+    {
+        string err = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
+        if (string.IsNullOrEmpty(err)) inserted++;
+        else if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) { /* ignore */ }
+        else Console.WriteLine($"[PURE ERR] {tableName}: {err}");
+    }
+    _lastInsertedCount = inserted;
+    Console.WriteLine($"[PURE] {tableName}: {inserted} lignes insérées (pass).");
 }
