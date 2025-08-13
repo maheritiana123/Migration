@@ -1,29 +1,174 @@
--- 4) INSERT : version SCOPE_IDENTITY() via param OUTPUT (1 ID par ligne, garanti)
-DECLARE @sql nvarchar(max);
-SET @sql = N'SET NOCOUNT ON; '
-         + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
-         + N'SELECT ' + @values + N'; '
-         + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
+private const char RS = (char)0x1E; // lignes
+private const char CS = (char)0x1D; // colonnes
 
-BEGIN TRY
-    DECLARE @newId nvarchar(100) = NULL;  -- réinitialisé à chaque ligne
-    EXEC sp_executesql
-        @sql,
-        N'@nid nvarchar(100) OUTPUT',
-        @nid = @newId OUTPUT;
+private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 100)
+{
+    Console.WriteLine("_______________________");
+    Console.WriteLine($"[IMPORT] {tableName}");
 
-    IF @newId IS NULL OR @newId = N''
-    BEGIN
-        INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-        VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
-    END
-    ELSE
-    BEGIN
-        INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-        VALUES(@rowIdx, @newId, NULL);
-    END
-END TRY
-BEGIN CATCH
-    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-    VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
-END CATCH
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
+
+    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+    if (lines.Length < 2) { Console.WriteLine($"? CSV vide : {tableName}"); return; }
+
+    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+    var fkInfos = GetForeignKeyInfo(tableName);
+    var identityColumn = GetIdentityColumn(tableName);
+    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+
+    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
+
+    var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
+    var oldIdPerRow = new List<string>();
+    int structureSkipped = 0;
+
+    for (int i = 1; i < lines.Length; i++)
+    {
+        var vals = lines[i].Split(';');
+        if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
+
+        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
+
+        string oldId = null;
+        if (hasIdentity && row.ContainsKey(identityColumn))
+        {
+            oldId = (row[identityColumn] ?? "").ToString();
+            row.Remove(identityColumn); // ne jamais insérer l'IDENTITY
+        }
+        oldIdPerRow.Add(oldId);
+
+        foreach (var fk in fkInfos)
+        {
+            if (!row.ContainsKey(fk.ColumnName)) continue;
+
+            if (forceNullFK) { row[fk.ColumnName] = null; continue; }
+
+            var oldFk = (row[fk.ColumnName] ?? "").ToString();
+            if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
+
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+                row[fk.ColumnName] = newFk;
+            else if (IsForeignKeyNullable(fk))
+                row[fk.ColumnName] = null;
+            else
+                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+        }
+
+        prepared.Add(row);
+    }
+
+    if (prepared.Count == 0) { Console.WriteLine($"? Table {tableName} : 0 ligne exploitable (structure)."); return; }
+
+    var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
+    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+
+    int inserted = 0, duplicates = 0, errors = 0;
+    Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+
+    for (int start = 0; start < prepared.Count; start += batchSize)
+    {
+        int count = Math.Min(batchSize, prepared.Count - start);
+        var batchRows = prepared.GetRange(start, count);
+        var oldIdsBatch = oldIdPerRow.GetRange(start, count);
+
+        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes); // RS/CS
+
+        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        string req = @"
+EXEC dbo.batch_safe_insert_with_type_conversion
+    @TableName   = $t$,
+    @Columns     = $cols$,
+    @ValuesBatch = $vb$,
+    @HasIdentity = $hid$,
+    @IdentityCol = $idcol$;";
+        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("t", tableName, true, 0);
+        sql.SetSecureParam("cols", columnsSql, true, 0);
+        sql.SetSecureParam("vb", valuesBatch, true, 0);
+        sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
+        sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(60000);
+
+        int rows = sql.ReturnedRows(1, 1);
+        for (int i = 1; i <= rows; i++)
+        {
+            int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+            string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
+            string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+
+            if (!string.IsNullOrEmpty(err))
+            {
+                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) duplicates++;
+                else { errors++; Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}"); }
+                continue;
+            }
+
+            inserted++;
+
+            if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+            {
+                var oldId = oldIdsBatch[rowIndex - 1];
+                if (!string.IsNullOrEmpty(oldId))
+                {
+                    if (!_idMappings.ContainsKey(tableName))
+                        _idMappings[tableName] = new Dictionary<object, object>();
+                    if (!_idMappings[tableName].ContainsKey(oldId))
+                        _idMappings[tableName][oldId] = newId;
+                }
+            }
+        }
+    }
+
+    Console.WriteLine($"✓ Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
+}
+
+private string BuildValuesBatch(List<Dictionary<string, object>> rows, List<string> colOrder, Dictionary<string, string> columnTypes)
+{
+    var sb = new StringBuilder(rows.Count * 64);
+    for (int i = 0; i < rows.Count; i++)
+    {
+        if (i > 0) sb.Append(RS);
+        var row = rows[i];
+        for (int c = 0; c < colOrder.Count; c++)
+        {
+            if (c > 0) sb.Append(CS);
+            var col = colOrder[c];
+            var sqlType = columnTypes[col];
+            row.TryGetValue(col, out var value);
+            sb.Append(FormatValueForSqlToken(value, sqlType));
+        }
+    }
+    return sb.ToString();
+}
+
+private string FormatValueForSqlToken(object value, string sqlType)
+{
+    if (value == null) return "NULL";
+    string s = value.ToString();
+    if (string.IsNullOrWhiteSpace(s)) return "NULL";
+
+    string t = (sqlType ?? "").ToLowerInvariant();
+
+    if (t == "int" || t == "bigint" || t == "smallint" || t == "tinyint")
+        return long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out _) ? s : "NULL";
+
+    if (t == "bit") return (s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase)) ? "1" : "0";
+
+    if (t == "decimal" || t == "numeric" || t == "money" || t == "smallmoney" || t == "float" || t == "real")
+        return decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d.ToString(CultureInfo.InvariantCulture) : "NULL";
+
+    if (t == "date")
+        return DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d0) ? $"'{d0:yyyy-MM-dd}'" : "NULL";
+
+    if (t == "datetime" || t == "datetime2" || t == "smalldatetime")
+        return DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d1) ? $"'{d1:yyyy-MM-dd HH:mm:ss}'" : "NULL";
+
+    if (t == "uniqueidentifier")
+        return Guid.TryParse(s, out var g) ? $"'{g}'" : "NULL";
+
+    // par défaut: nvarchar
+    return $"'{s.Replace("'", "''")}'";
+}
