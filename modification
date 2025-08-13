@@ -1,89 +1,43 @@
-private void ImportPureRelationsUntilStable(List<string> pureRelations)
+/// <summary>
+/// Sépare les tables en trois catégories :
+/// 1. normalTables : toutes les tables “classiques”
+/// 2. extendedRelations : tables relationnelles qui ont AU MOINS une FK + colonnes additionnelles
+/// 3. pureRelations : tables relationnelles contenant UNIQUEMENT des FKs (ex : tables de jonction N-N)
+/// </summary>
+private void LoadRelationTables(
+    List<string> allTables,
+    out List<string> normalTables,
+    out List<string> extendedRelations,
+    out List<string> pureRelations)
 {
-    if (pureRelations == null || pureRelations.Count == 0) return;
+    normalTables = new List<string>();
+    extendedRelations = new List<string>();
+    pureRelations = new List<string>();
 
-    bool progress;
-    int pass = 0;
-    do
+    foreach (var table in allTables)
     {
-        progress = false;
-        pass++;
-        Console.WriteLine($"[PURE] Pass {pass}");
+        var fkInfos = GetForeignKeyInfo(table);
+        var cols = GetTableColumns(table); // List<string> noms de colonnes
+        var fkCols = new HashSet<string>(fkInfos.Select(f => f.ColumnName), StringComparer.OrdinalIgnoreCase);
 
-        foreach (var table in pureRelations)
+        if (fkCols.Count == 0)
         {
-            int before = _lastInsertedCount;
-            ImportPureRelation(table);
-            progress |= (_lastInsertedCount > before);
+            // Pas de FK => table normale
+            normalTables.Add(table);
         }
-    } while (progress && pass < 5); // borne de sécurité
-}
-
-// Petit compteur partagé (à mettre au niveau classe)
-private int _lastInsertedCount = 0;
-
-private void ImportPureRelation(string tableName)
-{
-    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath)) return;
-
-    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
-    if (lines.Length < 2) return;
-
-    var columnNames = lines[0].Split(';').Select(s => s.Trim()).ToList();
-    var fkInfos = GetForeignKeyInfo(tableName);
-    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
-
-    // On prépare uniquement les lignes pour lesquelles TOUTES les FK ont un mapping
-    var batchRows = new List<Dictionary<string, object>>();
-    for (int i = 1; i < lines.Length; i++)
-    {
-        var vals = lines[i].Split(';');
-        if (vals.Length != columnNames.Count) continue;
-
-        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
-
-        bool ok = true;
-        foreach (var fk in fkInfos)
+        else if (fkCols.Count == cols.Count)
         {
-            var oldVal = (row[fk.ColumnName] ?? "").ToString();
-            if (string.IsNullOrWhiteSpace(oldVal)) { row[fk.ColumnName] = null; continue; }
-
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldVal, out var newVal))
-                row[fk.ColumnName] = newVal;
-            else
-            {
-                ok = false; break; // on attend un prochain pass
-            }
+            // Tous les champs sont des FK => pure relation (jonction)
+            pureRelations.Add(table);
         }
-        if (ok) batchRows.Add(row);
+        else
+        {
+            // Table relationnelle avec colonnes supplémentaires => étendue
+            extendedRelations.Add(table);
+        }
     }
 
-    if (batchRows.Count == 0) { _lastInsertedCount = 0; return; }
-
-    string columnsSql = string.Join(",", columnNames.Select(c => $"[{c}]"));
-    string valuesBatch = BuildValuesBatch(batchRows, columnNames, columnTypes); // réutilise le helper
-    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-    string req = @"
-EXEC dbo.batch_safe_insert_with_type_conversion
-  @TableName=$t$, @Columns=$cols$, @ValuesBatch=$vb$, @HasIdentity=0, @IdentityCol=NULL;";
-    sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql.SetSecureParam("t", tableName, true, 0);
-    sql.SetSecureParam("cols", columnsSql, true, 0);
-    sql.SetSecureParam("vb", valuesBatch, true, 0);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(60000);
-
-    int inserted = 0;
-    int rows = sql.ReturnedRows(1, 1);
-    for (int r = 1; r <= rows; r++)
-    {
-        string err = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
-        if (string.IsNullOrEmpty(err)) inserted++;
-        else if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) { /* ignore */ }
-        else Console.WriteLine($"[PURE ERR] {tableName}: {err}");
-    }
-    _lastInsertedCount = inserted;
-    Console.WriteLine($"[PURE] {tableName}: {inserted} lignes insérées (pass).");
+    Console.WriteLine($"[LOAD] Normal tables      : {string.Join(", ", normalTables)}");
+    Console.WriteLine($"[LOAD] Extended relations : {string.Join(", ", extendedRelations)}");
+    Console.WriteLine($"[LOAD] Pure relations     : {string.Join(", ", pureRelations)}");
 }
