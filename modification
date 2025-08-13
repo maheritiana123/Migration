@@ -1,72 +1,155 @@
-var oldIdsBatch = new List<string>();     // indexé par RowIndex-1 renvoyé par la PS
-var rowsInBatch = 0;
-
-
-string oldIdForThisRow = null;
-if (hasIdentity && rowDict.ContainsKey(identityColumn))
+private void ImportTableCommon(string tableName, string csvPath, bool hasIdentity, string identityColumn, int batchSize = 500)
 {
-    oldIdForThisRow = Convert.ToString(rowDict[identityColumn]);
-    rowDict.Remove(identityColumn); // on n’insère pas l’identité
+    Console.WriteLine($"[IMPORT] {tableName}");
+
+    if (!File.Exists(csvPath))
+    {
+        Console.WriteLine($"? CSV introuvable : {Path.GetFileNameWithoutExtension(csvPath)}");
+        return;
+    }
+
+    var insertedCount = 0;
+    var duplicateCount = 0;
+    var errorCount = 0;
+    var skippedCount = 0;
+
+    // Lecture CSV
+    using (var reader = new StreamReader(csvPath))
+    {
+        var headerLine = reader.ReadLine();
+        if (headerLine == null)
+        {
+            Console.WriteLine("Fichier vide");
+            return;
+        }
+
+        var columns = headerLine.Split(';').Select(c => $"[{c}]").ToArray();
+        var colList = string.Join(",", columns);
+
+        var valuesBatch = new StringBuilder();
+        int batchRowCount = 0;
+
+        // ⬅️ Nouveau : tampon pour mapper oldId par batch
+        var oldIdsBatch = new List<string>();
+
+        string line;
+        while ((line = reader.ReadLine()) != null)
+        {
+            var values = line.Split(';');
+            var rowDict = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+            for (int i = 0; i < columns.Length; i++)
+                rowDict[columns[i].Trim('[', ']')] = values[i];
+
+            // Gestion identity : sauvegarde de l’oldId, puis suppression de la colonne
+            string oldIdForThisRow = null;
+            if (hasIdentity && rowDict.ContainsKey(identityColumn))
+            {
+                oldIdForThisRow = Convert.ToString(rowDict[identityColumn]);
+                rowDict.Remove(identityColumn);
+            }
+            oldIdsBatch.Add(oldIdForThisRow);
+
+            // Construction de la ligne batch
+            var tokens = rowDict.Values.Select(v =>
+                v == null || string.Equals(v.ToString(), "NULL", StringComparison.OrdinalIgnoreCase)
+                    ? "NULL"
+                    : $"N'{v.ToString().Replace("'", "''")}'"
+            );
+            var rowString = string.Join(((char)29).ToString(), tokens);
+            valuesBatch.Append(rowString).Append((char)30);
+
+            batchRowCount++;
+
+            // Exécuter batch si plein
+            if (batchRowCount >= batchSize)
+            {
+                ExecuteBatch(tableName, colList, hasIdentity, identityColumn,
+                             valuesBatch.ToString(), oldIdsBatch,
+                             ref insertedCount, ref duplicateCount, ref errorCount);
+
+                // Reset
+                valuesBatch.Clear();
+                batchRowCount = 0;
+                oldIdsBatch.Clear();
+            }
+        }
+
+        // Dernier batch s’il reste des lignes
+        if (batchRowCount > 0)
+        {
+            ExecuteBatch(tableName, colList, hasIdentity, identityColumn,
+                         valuesBatch.ToString(), oldIdsBatch,
+                         ref insertedCount, ref duplicateCount, ref errorCount);
+        }
+    }
+
+    Console.WriteLine($"Table {tableName} : {insertedCount} insérées, {duplicateCount} doublons ignorés, {errorCount} erreurs, {skippedCount} lignes sautées (structure).");
 }
-oldIdsBatch.Add(oldIdForThisRow);
-rowsInBatch++;
 
-
-
-
-int returned = sql.ReturnedRows(1, 1);
-for (int r = 1; r <= returned; r++)
+/// <summary>
+/// Exécute un batch via la procédure et met à jour les compteurs + mapping
+/// </summary>
+private void ExecuteBatch(string tableName, string colList, bool hasIdentity, string identityColumn,
+                          string valuesBatch, List<string> oldIdsBatch,
+                          ref int insertedCount, ref int duplicateCount, ref int errorCount)
 {
-    // RowIndex renvoyé par la PS (1..N)
-    var rowIndexStr = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
-    int rowIndex = 0;
-    int.TryParse(rowIndexStr, out rowIndex);
-    int idx = Math.Max(0, rowIndex - 1); // sécurité
+    var sql = new SQLLib(_connectionString);
+    sql.StoredProcedure("dbo.batch_safe_insert_with_type_conversion");
+    sql.AddParameter("@TableName", tableName);
+    sql.AddParameter("@Columns", colList);
+    sql.AddParameter("@ValuesBatch", valuesBatch);
+    sql.AddParameter("@HasIdentity", hasIdentity ? 1 : 0);
+    sql.AddParameter("@IdentityCol", identityColumn);
 
-    string newId = sql.GetValueUsingColName(r, "NewID", 1, 1);
-    string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
-    string oldId = (idx >= 0 && idx < oldIdsBatch.Count) ? oldIdsBatch[idx] : null;
+    sql.Execute();
 
-    bool isDoublon = !string.IsNullOrEmpty(errorMessage) &&
-                     string.Equals(errorMessage, "Doublon", StringComparison.OrdinalIgnoreCase);
-
-    if (isDoublon)
+    int returned = sql.ReturnedRows(1, 1);
+    for (int r = 1; r <= returned; r++)
     {
-        duplicateCount++;
+        var rowIndexStr = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
+        int rowIndex = 0;
+        int.TryParse(rowIndexStr, out rowIndex);
+        int idx = Math.Max(0, rowIndex - 1); // sécurité
 
-        // ⬅️ NOUVEAU : même en doublon, si la PS nous renvoie l'ID existant, on crée le mapping
-        if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+        string newId = sql.GetValueUsingColName(r, "NewID", 1, 1);
+        string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
+        string oldId = (idx >= 0 && idx < oldIdsBatch.Count) ? oldIdsBatch[idx] : null;
+
+        bool isDoublon = !string.IsNullOrEmpty(errorMessage) &&
+                         string.Equals(errorMessage, "Doublon", StringComparison.OrdinalIgnoreCase);
+
+        if (isDoublon)
         {
-            if (!_idMappings.ContainsKey(tableName))
-                _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            duplicateCount++;
 
-            _idMappings[tableName][oldId] = newId;
+            // Correction : mapping même en doublon
+            if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+            {
+                if (!_idMappings.ContainsKey(tableName))
+                    _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                _idMappings[tableName][oldId] = newId;
+            }
+            continue;
         }
-        continue;
-    }
 
-    // Succès : pas d'erreur => compter et mapper si Identity
-    if (string.IsNullOrEmpty(errorMessage))
-    {
-        insertedCount++;
-
-        if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+        if (string.IsNullOrEmpty(errorMessage))
         {
-            if (!_idMappings.ContainsKey(tableName))
-                _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            insertedCount++;
 
-            _idMappings[tableName][oldId] = newId;
+            if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+            {
+                if (!_idMappings.ContainsKey(tableName))
+                    _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                _idMappings[tableName][oldId] = newId;
+            }
         }
-    }
-    else
-    {
-        // Autre erreur bloquante : log seulement (ou ce que tu fais déjà)
-        Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {errorMessage}");
-        errorCount++;
+        else
+        {
+            Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {errorMessage}");
+            errorCount++;
+        }
     }
 }
-
-
-
-oldIdsBatch.Clear();
-rowsInBatch = 0;
