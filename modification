@@ -1,38 +1,72 @@
-IF @exists = 1
-BEGIN
-    DECLARE @dupId nvarchar(100) = NULL;
-
-    IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL AND LEN(ISNULL(@whereClause,N'')) > 0
-    BEGIN
-        DECLARE @selDupSql nvarchar(max) =
-            N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
-            N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
-
-        EXEC sp_executesql
-             @selDupSql,
-             N'@nid nvarchar(100) OUTPUT',
-             @nid = @dupId OUTPUT;
-    END
-
-    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-    VALUES(@rowIdx, @dupId, N'Doublon');  -- ⚠️ NewID peut être NULL si pas d’identity
-    CONTINUE;
-END
+var oldIdsBatch = new List<string>();     // indexé par RowIndex-1 renvoyé par la PS
+var rowsInBatch = 0;
 
 
-
-if (!string.IsNullOrEmpty(errorMessage) && errorMessage.Equals("Doublon", StringComparison.OrdinalIgnoreCase))
+string oldIdForThisRow = null;
+if (hasIdentity && rowDict.ContainsKey(identityColumn))
 {
-    duplicateCount++;
+    oldIdForThisRow = Convert.ToString(rowDict[identityColumn]);
+    rowDict.Remove(identityColumn); // on n’insère pas l’identité
+}
+oldIdsBatch.Add(oldIdForThisRow);
+rowsInBatch++;
 
-    // ➜ NOUVEAU : si la proc nous a renvoyé l'ID existant, on mappe quand même
-    if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+
+
+
+int returned = sql.ReturnedRows(1, 1);
+for (int r = 1; r <= returned; r++)
+{
+    // RowIndex renvoyé par la PS (1..N)
+    var rowIndexStr = sql.GetValueUsingColName(r, "RowIndex", 1, 1);
+    int rowIndex = 0;
+    int.TryParse(rowIndexStr, out rowIndex);
+    int idx = Math.Max(0, rowIndex - 1); // sécurité
+
+    string newId = sql.GetValueUsingColName(r, "NewID", 1, 1);
+    string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
+    string oldId = (idx >= 0 && idx < oldIdsBatch.Count) ? oldIdsBatch[idx] : null;
+
+    bool isDoublon = !string.IsNullOrEmpty(errorMessage) &&
+                     string.Equals(errorMessage, "Doublon", StringComparison.OrdinalIgnoreCase);
+
+    if (isDoublon)
     {
-        if (!_idMappings.ContainsKey(tableName))
-            _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        duplicateCount++;
 
-        _idMappings[tableName][oldId] = newId;
+        // ⬅️ NOUVEAU : même en doublon, si la PS nous renvoie l'ID existant, on crée le mapping
+        if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+        {
+            if (!_idMappings.ContainsKey(tableName))
+                _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            _idMappings[tableName][oldId] = newId;
+        }
+        continue;
     }
 
-    continue;
+    // Succès : pas d'erreur => compter et mapper si Identity
+    if (string.IsNullOrEmpty(errorMessage))
+    {
+        insertedCount++;
+
+        if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+        {
+            if (!_idMappings.ContainsKey(tableName))
+                _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            _idMappings[tableName][oldId] = newId;
+        }
+    }
+    else
+    {
+        // Autre erreur bloquante : log seulement (ou ce que tu fais déjà)
+        Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {errorMessage}");
+        errorCount++;
+    }
 }
+
+
+
+oldIdsBatch.Clear();
+rowsInBatch = 0;
