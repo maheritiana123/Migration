@@ -1,197 +1,135 @@
-private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 500)
+private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 500, HashSet<string> nullFkColumns = null)
 {
     Console.WriteLine("_______________________");
     Console.WriteLine($"[IMPORT] {tableName}");
 
-    // Chemin CSV attendu
     string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath))
-    {
-        Console.WriteLine($"⚠ CSV introuvable : {tableName}");
-        return;
-    }
+    if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
 
     var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
-    if (lines.Length < 2)
-    {
-        Console.WriteLine($"⚠ CSV vide : {tableName}");
-        return;
-    }
+    if (lines.Length < 2) { Console.WriteLine($"CSV vide : {tableName}"); return; }
 
-    // En-tête et schéma
     var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
     var fkInfos = GetForeignKeyInfo(tableName);
     var identityColumn = GetIdentityColumn(tableName);
     bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
 
-    // Ordre/typage des colonnes réellement insérées (on exclut l'IDENTITY)
-    var insertCols = columnNames
-        .Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase))
-        .ToList();
-    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
 
-    // Types SQL par colonne insérée (BuildValuesBatch s'en sert)
-    var columnTypes = insertCols.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
-
-    int insertedCount = 0;
-    int duplicateCount = 0;
-    int errorCount = 0;
-    int structureSkipped = 0;
-
-    Console.WriteLine($"{lines.Length - 1} lignes à importer (batch={batchSize})...");
-
-    // Préparation des lignes (on résout les FK ici, on enlève l'IDENTITY)
     var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
-    var oldIdPerRow = new List<string>(lines.Length - 1);
+    var oldIdPerRow = new List<string>();
+    int structureSkipped = 0;
 
     for (int i = 1; i < lines.Length; i++)
     {
-        var values = lines[i].Split(';').ToList();
-        if (values.Count != columnNames.Count)
-        {
-            structureSkipped++;
-            continue;
-        }
+        var vals = lines[i].Split(';');
+        if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
 
-        var row = columnNames.Zip(values, (col, val) => new { col, val })
-                             .ToDictionary(x => x.col, x => (object)x.val, StringComparer.OrdinalIgnoreCase);
+        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
 
-        // Mémoriser l'ancien ID et supprimer la colonne IDENTITY de l'insert
         string oldId = null;
         if (hasIdentity && row.ContainsKey(identityColumn))
         {
-            oldId = Convert.ToString(row[identityColumn]);
-            row.Remove(identityColumn);
+            oldId = (row[identityColumn] ?? "").ToString();
+            row.Remove(identityColumn); // ne jamais insérer l'IDENTITY
         }
         oldIdPerRow.Add(oldId);
 
-        // Résolution des FK
         foreach (var fk in fkInfos)
         {
-            if (!row.ContainsKey(fk.ColumnName))
-                continue;
+            if (!row.ContainsKey(fk.ColumnName)) continue;
 
+            // 1) FK marquée "différée" -> on force NULL à l'insert
+            if (nullFkColumns != null && nullFkColumns.Contains(fk.ColumnName))
+            {
+                row[fk.ColumnName] = null;
+                continue;
+            }
+
+            // 2) forceNullFK global (rare)
             if (forceNullFK)
             {
                 row[fk.ColumnName] = null;
                 continue;
             }
 
-            var oldFk = Convert.ToString(row[fk.ColumnName]);
-            if (string.IsNullOrWhiteSpace(oldFk))
-            {
-                row[fk.ColumnName] = null;
-                continue;
-            }
+            // 3) mapping normal
+            var oldFk = (row[fk.ColumnName] ?? "").ToString();
+            if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
 
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map)
-                && map != null
-                && map.TryGetValue(oldFk, out var newFkObj)
-                && newFkObj != null)
-            {
-                row[fk.ColumnName] = Convert.ToString(newFkObj);
-            }
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+                row[fk.ColumnName] = newFk;
+            else if (IsForeignKeyNullable(fk))
+                row[fk.ColumnName] = null;
             else
-            {
-                // Si la FK est nullable -> NULL, sinon erreur bloquante
-                if (IsForeignKeyNullable(fk))
-                    row[fk.ColumnName] = null;
-                else
-                    throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
-            }
+                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
         }
 
-        // Restreindre aux colonnes insérées (sécurité)
-        var rowForInsert = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-        foreach (var c in insertCols)
-            rowForInsert[c] = row.ContainsKey(c) ? row[c] : null;
-
-        prepared.Add(rowForInsert);
+        prepared.Add(row);
     }
 
-    if (prepared.Count == 0)
-    {
-        Console.WriteLine($"⚠ Table {tableName} : 0 ligne exploitable.");
-        return;
-    }
+    if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }
 
-    // Import par lots
+    var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
+    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+
+    int inserted = 0, duplicates = 0, errors = 0;
+    Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+
     for (int start = 0; start < prepared.Count; start += batchSize)
     {
         int count = Math.Min(batchSize, prepared.Count - start);
         var batchRows = prepared.GetRange(start, count);
         var oldIdsBatch = oldIdPerRow.GetRange(start, count);
 
-        // Construit @ValuesBatch avec tes séparateurs (RS/CS) et la conversion typée
-        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes);
+        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes); // RS/CS
 
         var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        string request = @"
-EXEC dbo.batch_safe_insert_with_type_conversion
-    @TableName   = $t$,
-    @Columns     = $cols$,
-    @ValuesBatch = $vb$,
-    @HasIdentity = $hid$,
-    @IdentityCol = $idcol$;";
-        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        string req = @"
+            EXEC dbo.batch_safe_insert_with_type_conversion
+                @TableName   = $t$,
+                @Columns     = $cols$,
+                @ValuesBatch = $vb$,
+                @HasIdentity = $hid$,
+                @IdentityCol = $idcol$;";
+        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
         sql.SetSecureParam("t", tableName, true, 0);
         sql.SetSecureParam("cols", columnsSql, true, 0);
         sql.SetSecureParam("vb", valuesBatch, true, 0);
         sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
         sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
         sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-
         sql.Execute(60000);
 
-        int returned = sql.ReturnedRows(1, 1);
-        for (int r = 1; r <= returned; r++)
+        int rows = sql.ReturnedRows(1, 1);
+        for (int i = 1; i <= rows; i++)
         {
-            // RowIndex = position 1..N dans ce batch
-            int rowIndex = 0;
-            int.TryParse(sql.GetValueUsingColName(r, "RowIndex", 1, 1), out rowIndex);
-            int idx = (rowIndex <= 0 || rowIndex > oldIdsBatch.Count) ? -1 : rowIndex - 1;
-
-            string newId = sql.GetValueUsingColName(r, "NewID", 1, 1);
-            string errorMessage = sql.GetValueUsingColName(r, "ErrorMessage", 1, 1);
-            string oldId = (idx >= 0) ? oldIdsBatch[idx] : null;
-
-            bool isDoublon = !string.IsNullOrEmpty(errorMessage)
-                          && errorMessage.Equals("Doublon", StringComparison.OrdinalIgnoreCase);
-
-            if (isDoublon)
+            int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+            string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
+            string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+            if (!string.IsNullOrEmpty(err))
             {
-                duplicateCount++;
-
-                // ✅ Correction : en doublon, si la PS renvoie l'ID existant, on mappe quand même
-                if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
-                {
-                    if (!_idMappings.ContainsKey(tableName))
-                        _idMappings[tableName] = new Dictionary<object, object>();
-
-                    _idMappings[tableName][oldId] = newId;
-                }
+                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) duplicates++;
+                else { errors++; Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}"); }
                 continue;
             }
 
-            if (string.IsNullOrEmpty(errorMessage))
-            {
-                insertedCount++;
+            inserted++;
 
-                if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+            if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+            {
+                var oldId = oldIdsBatch[rowIndex - 1];
+                if (!string.IsNullOrEmpty(oldId))
                 {
                     if (!_idMappings.ContainsKey(tableName))
                         _idMappings[tableName] = new Dictionary<object, object>();
-
-                    _idMappings[tableName][oldId] = newId;
+                    if (!_idMappings[tableName].ContainsKey(oldId))
+                        _idMappings[tableName][oldId] = newId;
                 }
-            }
-            else
-            {
-                Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {errorMessage}");
-                errorCount++;
             }
         }
     }
 
-    Console.WriteLine($"✅ Table {tableName} : {insertedCount} insérées, {duplicateCount} doublons ignorés, {errorCount} erreurs, {structureSkipped} lignes sautées (structure).");
+    Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
 }
