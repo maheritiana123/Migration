@@ -1,107 +1,66 @@
-private static readonly DateTime SqlDateTimeMin = new DateTime(1753, 1, 1);
-private static readonly string[] DateParseFormats = new[]
-{
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-ddTHH:mm:ss",
-    "yyyy-MM-dd",
-    "dd/MM/yyyy HH:mm:ss",
-    "dd/MM/yyyy",
-    "MM/dd/yyyy HH:mm:ss",
-    "MM/dd/yyyy"
-};
+-- repère : juste APRÈS
+--   INSERT INTO @colList (ColName, Ord) ... dbo.SplitByCommaOrdered(@Columns)
 
-private string FormatValueForSqlToken(object value, string sqlType)
-{
-    if (value == null) return "NULL";
-    var s = value.ToString()?.Trim();
-    if (string.IsNullOrEmpty(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase)) return "NULL";
-
-    var t = (sqlType ?? "").Trim().ToLowerInvariant();
-
-    // --- Numériques
-    if (t == "int" || t == "bigint" || t == "smallint" || t == "tinyint")
-        return long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var li) ? li.ToString(CultureInfo.InvariantCulture) : "NULL";
-
-    if (t == "bit")
-        return (s == "1" || s.Equals("true", StringComparison.OrdinalIgnoreCase)) ? "1" : "0";
-
-    if (t.StartsWith("decimal") || t.StartsWith("numeric") || t == "money" || t == "smallmoney" || t == "float" || t == "real")
-    {
-        // Remplacer virgule FR éventuelle par point
-        var sn = s.Replace(',', '.');
-        return decimal.TryParse(sn, NumberStyles.Any, CultureInfo.InvariantCulture, out var d)
-            ? d.ToString(CultureInfo.InvariantCulture)
-            : "NULL";
-    }
-
-    // --- Date/heure
-    if (t == "date" || t.StartsWith("datetime"))
-    {
-        if (TryNormalizeDateTime(s, out var iso))  // iso = "yyyy-MM-ddTHH:mm:ss"
-        {
-            // Si colonne = datetime (pas datetime2) => borne mini 1753-01-01
-            if (t == "datetime" || t == "smalldatetime")
-            {
-                // Parse rapide pour comparer à la borne
-                if (DateTime.TryParseExact(iso, "yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)
-                    && dt < SqlDateTimeMin)
-                    return "NULL";
-            }
-            // Utiliser CONVERT(style 126 ISO) côté SQL pour éviter toute ambiguïté locale
-            return $"CONVERT(datetime2(0), '{iso}', 126)";
-        }
-        return "NULL";
-    }
-
-    // --- GUID
-    if (t == "uniqueidentifier")
-        return Guid.TryParse(s, out var g) ? $"'{g}'" : "NULL";
-
-    // --- Défaut : NVARCHAR (échappement simple quote)
-    return $"N'{s.Replace("'", "''")}'";
-}
+-- 2a) Colonnes NOT NULL qui ont un DEFAULT → on peut substituer NULL par DEFAULT
+DECLARE @defaultable TABLE(Ord int PRIMARY KEY);
+INSERT INTO @defaultable(Ord)
+SELECT c.Ord
+FROM @colList c
+JOIN INFORMATION_SCHEMA.COLUMNS ic
+  ON ic.TABLE_NAME = @TableName
+ AND ic.COLUMN_NAME = c.ColName
+LEFT JOIN sys.default_constraints dc
+  ON dc.parent_object_id = OBJECT_ID(QUOTENAME(@TableName))
+ AND dc.parent_column_id = COLUMNPROPERTY(OBJECT_ID(@TableName), c.ColName, 'ColumnId')
+WHERE ic.IS_NULLABLE = 'NO'
+  AND dc.object_id IS NOT NULL;  -- colonne possède un DEFAULT
 
 
 
-private bool TryNormalizeDateTime(string input, out string iso8601)
-{
-    iso8601 = null;
-    if (string.IsNullOrWhiteSpace(input)) return false;
-
-    // Nettoyage basique
-    var s = input.Trim();
-
-    // Essais multi-formats (FR, US, ISO)
-    if (DateTime.TryParseExact(s, DateParseFormats, CultureInfo.InvariantCulture,
-                               DateTimeStyles.AllowWhiteSpaces, out var dt)
-        || DateTime.TryParse(s, new CultureInfo("fr-FR"), DateTimeStyles.AllowWhiteSpaces, out dt)
-        || DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out dt))
-    {
-        iso8601 = dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
-        return true;
-    }
-
-    // Cas timestamps numériques (optionnel) : secondes depuis epoch
-    if (long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var epoch) && epoch > 0 && epoch < 4102444800) // < 2100
-    {
-        var dt2 = DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime;
-        iso8601 = dt2.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture);
-        return true;
-    }
-
-    return false;
-}
+DECLARE @values NVARCHAR(MAX) = N'';
+SELECT @values = STRING_AGG(
+         CASE 
+           WHEN UPPER(LTRIM(RTRIM(v.Val))) = 'NULL' 
+                AND EXISTS (SELECT 1 FROM @defaultable d WHERE d.Ord = v.Ord)
+             THEN 'DEFAULT'
+           ELSE v.Val
+         END
+       , ',') WITHIN GROUP (ORDER BY v.Ord)
+FROM @valList v;
 
 
-// Exemple rapide dans la boucle de préparation :
-foreach (var col in insertCols)
-{
-    var typ = columnTypes[col];
-    if ((typ ?? "").StartsWith("datetime") || typ == "date")
-    {
-        var raw = preparedRow[col]?.ToString();
-        var ok = TryNormalizeDateTime(raw, out var iso);
-        if (!ok)
-            Console.WriteLine($"[DEBUG-DATE] {tableName} col={col} raw='{raw}' -> NULL");
-    }
-}
+
+EXEC sp_executesql
+    @sql,
+    N'@nid nvarchar(100) OUTPUT',
+    @nid = @newId OUTPUT;
+
+IF @newId IS NULL OR @newId = N''
+BEGIN
+    -- Fallback: relire via PK/UNIQUE si on a un WHERE
+    IF LEN(ISNULL(@whereClause, N'')) > 0 AND @IdentityCol IS NOT NULL
+    BEGIN
+        DECLARE @selIdSql nvarchar(max) = 
+            N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
+            N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
+
+        DECLARE @nid2 nvarchar(100) = NULL;
+        EXEC sp_executesql @selIdSql, N'@nid nvarchar(100) OUTPUT', @nid = @nid2 OUTPUT;
+
+        IF @nid2 IS NOT NULL AND @nid2 <> N''
+        BEGIN
+            SET @newId = @nid2;
+        END
+    END
+END
+
+IF @newId IS NULL OR @newId = N''
+BEGIN
+    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+    VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
+END
+ELSE
+BEGIN
+    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+    VALUES(@rowIdx, @newId, NULL);
+END
