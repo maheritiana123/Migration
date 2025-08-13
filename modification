@@ -1,244 +1,38 @@
-IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
-GO
-
-CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName      NVARCHAR(128),
-    @Columns        NVARCHAR(MAX),      -- ex: [Col1],[Col2]
-    @ValuesBatch    NVARCHAR(MAX),      -- lignes: NCHAR(30), colonnes: NCHAR(29)
-    @HasIdentity    BIT          = 0,
-    @IdentityCol    NVARCHAR(128)= NULL -- si NULL et @HasIdentity=1 : auto-détection
-AS
+IF @exists = 1
 BEGIN
-    SET NOCOUNT ON;
-    SET LOCK_TIMEOUT 5000;
-    SET DEADLOCK_PRIORITY LOW;
+    DECLARE @dupId nvarchar(100) = NULL;
 
-    -- Séparateurs (doivent matcher le côté C#)
-    DECLARE @RS nchar(1) = NCHAR(30);  -- record separator (ligne)
-    DECLARE @CS nchar(1) = NCHAR(29);  -- column separator
-
-    -- Détection de la colonne IDENTITY si demandée
-    IF @HasIdentity = 1 AND ( @IdentityCol IS NULL OR LEN(@IdentityCol)=0 )
+    IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL AND LEN(ISNULL(@whereClause,N'')) > 0
     BEGIN
-        SELECT TOP (1) @IdentityCol = c.COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS c
-        WHERE c.TABLE_NAME = @TableName
-          AND COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1;
+        DECLARE @selDupSql nvarchar(max) =
+            N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
+            N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
+
+        EXEC sp_executesql
+             @selDupSql,
+             N'@nid nvarchar(100) OUTPUT',
+             @nid = @dupId OUTPUT;
     END
 
-    -- Colonnes PK/UNIQUE (hors éventuelle identity), agrégées pour SQL 2016
-    DECLARE @pkCols NVARCHAR(MAX);
-    ;WITH PKU AS (
-        SELECT kcu.COLUMN_NAME
-        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-          ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-         AND tc.TABLE_NAME      = kcu.TABLE_NAME
-        WHERE tc.TABLE_NAME = @TableName
-          AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
-          AND ( @IdentityCol IS NULL OR kcu.COLUMN_NAME <> @IdentityCol )
-    )
-    SELECT @pkCols = STUFF((
-        SELECT ',' + QUOTENAME(PKU.COLUMN_NAME)
-        FROM PKU
-        FOR XML PATH(''), TYPE).value('.','nvarchar(max)'),1,1,''
-    );
-
-    -- Résultats (une ligne par ligne du batch)
-    DECLARE @out TABLE (
-        RowIndex     INT,
-        NewID        NVARCHAR(100),
-        ErrorMessage NVARCHAR(MAX)
-    );
-
-    -- Batch vide ?
-    IF @ValuesBatch IS NULL OR LEN(@ValuesBatch)=0
-    BEGIN
-        INSERT INTO @out VALUES (0, NULL, N'Batch vide (aucune donnée)');
-        SELECT RowIndex, NewID, ErrorMessage FROM @out ORDER BY RowIndex;
-        RETURN;
-    END
-
-    -- Préparer liste des colonnes avec l’ordre
-    DECLARE @cols TABLE(ColName nvarchar(128), Ord int);
-    INSERT INTO @cols(ColName, Ord)
-    SELECT LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']',''))), Ord
-    FROM dbo.SplitByCommaOrdered(@Columns);
-
-    -- Préparer set de colonnes PK/UK pour test rapide
-    DECLARE @pk TABLE(ColName nvarchar(128) PRIMARY KEY);
-    IF @pkCols IS NOT NULL AND LEN(@pkCols)>0
-    BEGIN
-        INSERT INTO @pk(ColName)
-        SELECT LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']','')))
-        FROM dbo.SplitByCommaOrdered(@pkCols);
-    END
-
-    -- Boucle sur les lignes du batch (découpage manuel)
-    DECLARE @len    INT  = LEN(@ValuesBatch);
-    DECLARE @cur    INT  = 1;              -- position dans @ValuesBatch
-    DECLARE @next   INT;                   -- position du prochain @RS
-    DECLARE @line   NVARCHAR(MAX);         -- ligne courante (texte brut)
-    DECLARE @rowIdx INT  = 0;              -- 1..N
-
-    WHILE @cur <= @len
-    BEGIN
-        -- Isoler la ligne courante
-        SET @next = CHARINDEX(@RS, @ValuesBatch, @cur);
-        IF @next = 0
-            SET @line = SUBSTRING(@ValuesBatch, @cur, @len - @cur + 1);
-        ELSE
-            SET @line = SUBSTRING(@ValuesBatch, @cur, @next - @cur);
-
-        IF @next = 0 SET @cur = @len + 1 ELSE SET @cur = @next + 1;
-
-        -- Index de ligne ++
-        SET @rowIdx = @rowIdx + 1;
-
-        -- Trim & ligne vide ?
-        SET @line = LTRIM(RTRIM(@line));
-        IF @line IS NULL OR LEN(@line)=0
-        BEGIN
-            INSERT INTO @out VALUES(@rowIdx, NULL, N'Ligne vide ignorée');
-            CONTINUE;
-        END
-
-        -- 1) Contrôle nb colonnes/valeurs
-        DECLARE @valCount INT = (LEN(@line) - LEN(REPLACE(@line, @CS, N''))) + 1;
-        DECLARE @colCount INT = (LEN(@Columns) - LEN(REPLACE(@Columns, N',', N''))) + 1;
-
-        IF @valCount <> @colCount
-        BEGIN
-            INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-            VALUES(@rowIdx, NULL,
-                   N'ERR: Nombre de valeurs <> colonnes. Attendu='
-                   + CAST(@colCount AS nvarchar(10))
-                   + N' | Trouvé=' + CAST(@valCount AS nvarchar(10))
-                   + N' | Row="' + @line + N'"');
-            CONTINUE;
-        END
-
-        -- 2) Détection doublon (PK/UK)
-        DECLARE @whereClause nvarchar(max) = N'';
-        IF EXISTS(SELECT 1 FROM @pk)
-        BEGIN
-            DECLARE @ord int = 1, @p int = 1, @n int, @token nvarchar(max);
-            DECLARE @work nvarchar(max) = @line;
-
-            WHILE 1=1
-            BEGIN
-                SET @n = CHARINDEX(@CS, @work, @p);
-                IF @n = 0 SET @token = SUBSTRING(@work, @p, LEN(@work)-@p+1);
-                ELSE      SET @token = SUBSTRING(@work, @p, @n-@p);
-
-                DECLARE @col nvarchar(128) =
-                    (SELECT ColName FROM @cols WHERE Ord=@ord);
-
-                IF @col IS NOT NULL AND EXISTS(SELECT 1 FROM @pk WHERE ColName=@col)
-                BEGIN
-                    SET @whereClause = @whereClause
-                        + CASE WHEN LEN(@whereClause)>0 THEN N' AND ' ELSE N'' END
-                        + QUOTENAME(@col) + N' = '
-                        + CASE WHEN UPPER(LTRIM(RTRIM(@token))) = N'NULL'
-                               THEN N'NULL' ELSE @token END;
-                END
-
-                SET @ord = @ord + 1;
-                IF @n = 0 BREAK;
-                SET @p = @n + 1;
-            END
-
-            IF LEN(@whereClause) > 0
-            BEGIN
-                DECLARE @exists bit = 0;
-                DECLARE @checkSql nvarchar(max) =
-                    N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
-                    + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE '
-                    + @whereClause + N') THEN 1 ELSE 0 END';
-                EXEC sp_executesql @checkSql, N'@out bit OUTPUT', @out=@exists OUTPUT;
-
-                IF @exists = 1
-                BEGIN
-                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-                    VALUES(@rowIdx, NULL, N'Doublon');
-                    CONTINUE;
-                END
-            END
-        END
-
-        -- 3) Liste de valeurs pour l'INSERT (remplacer @CS par des virgules)
-        DECLARE @values nvarchar(max) = REPLACE(@line, @CS, N',');
-
-        -- 4) INSERT : version SCOPE_IDENTITY() (safe vs triggers),
-        --    mais uniquement si @HasIdentity = 1 ET @IdentityCol non NULL.
-        DECLARE @sql nvarchar(max);
-        SET @sql = N'SET NOCOUNT ON; '
-                 + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
-                 + N'SELECT ' + @values + N'; ';
-
-        IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-        BEGIN
-            SET @sql = @sql + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
-        END
-
-        BEGIN TRY
-            IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-            BEGIN
-                DECLARE @newId nvarchar(100) = NULL;  -- réinit à chaque ligne
-                EXEC sp_executesql
-                    @sql,
-                    N'@nid nvarchar(100) OUTPUT',
-                    @nid = @newId OUTPUT;
-
-                -- Fallback si SCOPE_IDENTITY() vide : relire par PK/UNIQUE
-                IF (@newId IS NULL OR @newId = N'')
-                BEGIN
-                    IF LEN(ISNULL(@whereClause, N'')) > 0
-                    BEGIN
-                        DECLARE @selIdSql nvarchar(max) =
-                            N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
-                            N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
-
-                        DECLARE @nid2 nvarchar(100) = NULL;
-                        EXEC sp_executesql
-                             @selIdSql,
-                             N'@nid nvarchar(100) OUTPUT',
-                             @nid = @nid2 OUTPUT;
-
-                        IF (@nid2 IS NOT NULL AND @nid2 <> N'')
-                            SET @newId = @nid2;
-                    END
-                END
-
-                IF @newId IS NULL OR @newId = N''
-                BEGIN
-                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-                    VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
-                END
-                ELSE
-                BEGIN
-                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-                    VALUES(@rowIdx, @newId, NULL);
-                END
-            END
-            ELSE
-            BEGIN
-                -- Table sans identity : simple insert
-                EXEC sp_executesql @sql;
-                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-                VALUES(@rowIdx, NULL, NULL);
-            END
-        END TRY
-        BEGIN CATCH
-            INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-            VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
-        END CATCH
-    END -- WHILE lignes
-
-    -- Retour des résultats
-    SELECT RowIndex, NewID, ErrorMessage
-    FROM @out
-    ORDER BY RowIndex;
+    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+    VALUES(@rowIdx, @dupId, N'Doublon');  -- ⚠️ NewID peut être NULL si pas d’identity
+    CONTINUE;
 END
-GO
+
+
+
+if (!string.IsNullOrEmpty(errorMessage) && errorMessage.Equals("Doublon", StringComparison.OrdinalIgnoreCase))
+{
+    duplicateCount++;
+
+    // ➜ NOUVEAU : si la proc nous a renvoyé l'ID existant, on mappe quand même
+    if (hasIdentity && !string.IsNullOrEmpty(newId) && !string.IsNullOrEmpty(oldId))
+    {
+        if (!_idMappings.ContainsKey(tableName))
+            _idMappings[tableName] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        _idMappings[tableName][oldId] = newId;
+    }
+
+    continue;
+}
