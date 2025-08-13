@@ -27,7 +27,7 @@ BEGIN
           AND COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1;
     END
 
-    -- Colonnes PK/UNIQUE (hors éventuelle identity), agrégées pour SQL 2016
+    -- Colonnes PK/UNIQUE (hors éventuelle identity), agrégées (compat SQL 2016)
     DECLARE @pkCols NVARCHAR(MAX);
     ;WITH PKU AS (
         SELECT kcu.COLUMN_NAME
@@ -60,13 +60,13 @@ BEGIN
         RETURN;
     END
 
-    -- Préparer liste des colonnes avec l’ordre
+    -- Préparer liste des colonnes avec l’ordre -> @cols(ColName,Ord)
     DECLARE @cols TABLE(ColName nvarchar(128), Ord int);
     INSERT INTO @cols(ColName, Ord)
     SELECT LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']',''))), Ord
     FROM dbo.SplitByCommaOrdered(@Columns);
 
-    -- Préparer set de colonnes PK/UK pour test rapide
+    -- Préparer set de colonnes PK/UK pour test rapide -> @pk(ColName)
     DECLARE @pk TABLE(ColName nvarchar(128) PRIMARY KEY);
     IF @pkCols IS NOT NULL AND LEN(@pkCols)>0
     BEGIN
@@ -119,86 +119,161 @@ BEGIN
             CONTINUE;
         END
 
-        -- 2) Détection doublon (PK/UK)
+        ----------------------------------------------------------------
+        -- 2) Tokeniser la ligne -> @vals(Val,Ord) pour cette ligne
+        ----------------------------------------------------------------
+        DECLARE @vals TABLE(Val nvarchar(max), Ord int);
+        DECLARE @ord int = 1, @p int = 1, @n int, @token nvarchar(max);
+        DECLARE @work nvarchar(max) = @line;
+
+        WHILE 1=1
+        BEGIN
+            SET @n = CHARINDEX(@CS, @work, @p);
+            IF @n = 0 SET @token = SUBSTRING(@work, @p, LEN(@work)-@p+1);
+            ELSE      SET @token = SUBSTRING(@work, @p, @n-@p);
+
+            INSERT INTO @vals(Val, Ord) VALUES(@token, @ord);
+
+            SET @ord = @ord + 1;
+            IF @n = 0 BREAK;
+            SET @p = @n + 1;
+        END
+
+        ----------------------------------------------------------------
+        -- 3) Détection doublon (PK/UK) -> construire @whereClause
+        ----------------------------------------------------------------
         DECLARE @whereClause nvarchar(max) = N'';
         IF EXISTS(SELECT 1 FROM @pk)
         BEGIN
-            DECLARE @ord int = 1, @p int = 1, @n int, @token nvarchar(max);
-            DECLARE @work nvarchar(max) = @line;
+            SELECT @whereClause = COALESCE(@whereClause + N' AND ', N'')
+                   + QUOTENAME(c.ColName) + N' = '
+                   + CASE WHEN UPPER(LTRIM(RTRIM(v.Val))) = N'NULL' THEN N'NULL' ELSE v.Val END
+            FROM @cols c
+            JOIN @vals v ON v.Ord = c.Ord
+            WHERE EXISTS(SELECT 1 FROM @pk WHERE ColName=c.ColName);
+        END
 
-            WHILE 1=1
+        IF LEN(@whereClause) > 0
+        BEGIN
+            DECLARE @exists bit = 0;
+            DECLARE @checkSql nvarchar(max) =
+                N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
+                + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE '
+                + @whereClause + N') THEN 1 ELSE 0 END';
+            EXEC sp_executesql @checkSql, N'@out bit OUTPUT', @out=@exists OUTPUT;
+
+            IF @exists = 1
             BEGIN
-                SET @n = CHARINDEX(@CS, @work, @p);
-                IF @n = 0 SET @token = SUBSTRING(@work, @p, LEN(@work)-@p+1);
-                ELSE      SET @token = SUBSTRING(@work, @p, @n-@p);
-
-                DECLARE @col nvarchar(128) =
-                    (SELECT ColName FROM @cols WHERE Ord=@ord);
-
-                IF @col IS NOT NULL AND EXISTS(SELECT 1 FROM @pk WHERE ColName=@col)
-                BEGIN
-                    SET @whereClause = @whereClause
-                        + CASE WHEN LEN(@whereClause)>0 THEN N' AND ' ELSE N'' END
-                        + QUOTENAME(@col) + N' = '
-                        + CASE WHEN UPPER(LTRIM(RTRIM(@token))) = N'NULL'
-                               THEN N'NULL' ELSE @token END;
-                END
-
-                SET @ord = @ord + 1;
-                IF @n = 0 BREAK;
-                SET @p = @n + 1;
-            END
-
-            IF LEN(@whereClause) > 0
-            BEGIN
-                DECLARE @exists bit = 0;
-                DECLARE @checkSql nvarchar(max) =
-                    N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
-                    + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE '
-                    + @whereClause + N') THEN 1 ELSE 0 END';
-                EXEC sp_executesql @checkSql, N'@out bit OUTPUT', @out=@exists OUTPUT;
-
-                IF @exists = 1
-                BEGIN
-                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-                    VALUES(@rowIdx, NULL, N'Doublon');
-                    CONTINUE;
-                END
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES(@rowIdx, NULL, N'Doublon');
+                CONTINUE;
             END
         END
 
-        -- 3) Liste de valeurs pour l'INSERT (remplacer @CS par des virgules)
-        DECLARE @values nvarchar(max) = REPLACE(@line, @CS, N',');
+        ----------------------------------------------------------------
+        -- 4) NULL -> DEFAULT pour colonnes NOT NULL avec DEFAULT
+        ----------------------------------------------------------------
+        DECLARE @defaultable TABLE(Ord INT PRIMARY KEY);
+        INSERT INTO @defaultable(Ord)
+        SELECT c.Ord
+        FROM @cols AS c
+        JOIN INFORMATION_SCHEMA.COLUMNS ic
+          ON ic.TABLE_NAME  = @TableName
+         AND ic.COLUMN_NAME = c.ColName
+        LEFT JOIN sys.default_constraints dc
+          ON dc.parent_object_id = OBJECT_ID(QUOTENAME(@TableName))
+         AND dc.parent_column_id = COLUMNPROPERTY(OBJECT_ID(@TableName), c.ColName, 'ColumnId')
+        WHERE ic.IS_NULLABLE = 'NO'
+          AND dc.object_id IS NOT NULL;
 
-        -- 4) INSERT : version SCOPE_IDENTITY() (safe vs triggers)
+        UPDATE v
+           SET v.Val = N'DEFAULT'
+        FROM @vals AS v
+        JOIN @defaultable AS d
+          ON d.Ord = v.Ord
+        WHERE UPPER(LTRIM(RTRIM(v.Val))) = N'NULL';
+
+        ----------------------------------------------------------------
+        -- 5) Construire la chaîne @values (compat SQL 2016)
+        ----------------------------------------------------------------
+        DECLARE @values nvarchar(max) =
+            STUFF((
+                SELECT N',' + v.Val
+                FROM @vals v
+                ORDER BY v.Ord
+                FOR XML PATH(''), TYPE
+            ).value('.', 'nvarchar(max)'), 1, 1, N'');
+
+        ----------------------------------------------------------------
+        -- 6) INSERT : avec ou sans IDENTITY
+        ----------------------------------------------------------------
         DECLARE @sql nvarchar(max);
-		SET @sql = N'SET NOCOUNT ON; '
-				 + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
-				 + N'SELECT ' + @values + N'; '
-				 + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
 
-		BEGIN TRY
-			DECLARE @newId nvarchar(100) = NULL;  -- réinitialisé à chaque ligne
-			EXEC sp_executesql
-				@sql,
-				N'@nid nvarchar(100) OUTPUT',
-				@nid = @newId OUTPUT;
+        IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
+        BEGIN
+            -- Cas Identity : SCOPE_IDENTITY + fallback via PK/UK si vide
+            SET @sql = N'SET NOCOUNT ON; '
+                     + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
+                     + N'SELECT ' + @values + N'; '
+                     + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
 
-			IF @newId IS NULL OR @newId = N''
-			BEGIN
-				INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-				VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
-			END
-			ELSE
-			BEGIN
-				INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-				VALUES(@rowIdx, @newId, NULL);
-			END
-		END TRY
-		BEGIN CATCH
-			INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-			VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
-		END CATCH
+            BEGIN TRY
+                DECLARE @newId nvarchar(100) = NULL;
+                EXEC sp_executesql
+                    @sql,
+                    N'@nid nvarchar(100) OUTPUT',
+                    @nid = @newId OUTPUT;
+
+                IF (@newId IS NULL OR @newId = N'')
+                   AND LEN(ISNULL(@whereClause, N'')) > 0
+                BEGIN
+                    DECLARE @selIdSql nvarchar(max) =
+                        N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
+                        N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
+
+                    DECLARE @nid2 nvarchar(100) = NULL;
+                    EXEC sp_executesql
+                         @selIdSql,
+                         N'@nid nvarchar(100) OUTPUT',
+                         @nid = @nid2 OUTPUT;
+
+                    IF (@nid2 IS NOT NULL AND @nid2 <> N'')
+                        SET @newId = @nid2;
+                END
+
+                IF @newId IS NULL OR @newId = N''
+                BEGIN
+                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                    VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
+                END
+                ELSE
+                BEGIN
+                    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                    VALUES(@rowIdx, @newId, NULL);
+                END
+            END TRY
+            BEGIN CATCH
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
+            END CATCH
+        END
+        ELSE
+        BEGIN
+            -- Pas d'identity : simple insert
+            SET @sql = N'SET NOCOUNT ON; '
+                     + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
+                     + N'SELECT ' + @values + N';';
+
+            BEGIN TRY
+                EXEC sp_executesql @sql;
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES(@rowIdx, NULL, NULL);
+            END TRY
+            BEGIN CATCH
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
+            END CATCH
+        END
     END -- WHILE lignes
 
     -- Retour des résultats
