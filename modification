@@ -1,214 +1,93 @@
-public void PerformMigration()
+foreach (var fk in fkInfos)
 {
-    Console.WriteLine("=== MIGRATION START ===");
+    if (!row.ContainsKey(fk.ColumnName)) continue;
 
-    // 1) Tables (déjà filtrées par GetAllTables)
-    var allTables = GetAllTables(); // List<string>
-
-    // 2) Partition (tu as déjà les règles de détection côté projet)
-    LoadRelationTables(allTables, out var normalTables, out var extendedRelations, out var pureRelations);
-
-    // 3) Dépendances & cycles (SCC)
-    var fkMap = GetForeignKeysByTable(allTables); // Dictionary<string, List<ForeignKeyInfo>>
-    var plan = BuildPlan(normalTables, extendedRelations, fkMap);
-
-    // 4) Transaction globale (tu avais déjà)
-    BeginTransaction();
-    try
+    // 1) FK marquée "différée" -> on force NULL à l'insert
+    if (nullFkColumns != null && nullFkColumns.Contains(fk.ColumnName))
     {
-        // 4.1) Parents (ordre topologique + cycles gérés par FK différées)
-        foreach (var step in plan.NormalOrder)
+        row[fk.ColumnName] = null;
+        continue;
+    }
+
+    // 2) forceNullFK global (rare)
+    if (forceNullFK)
+    {
+        row[fk.ColumnName] = null;
+        continue;
+    }
+
+    // 3) mapping normal
+    var oldFk = (row[fk.ColumnName] ?? "").ToString();
+    if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
+
+    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+        row[fk.ColumnName] = newFk;
+    else if (IsForeignKeyNullable(fk))
+        row[fk.ColumnName] = null;
+    else
+        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} → {fk.ReferencedTableName} (table {tableName})");
+}
+
+
+private void FixupDeferredForeignKeys(string tableName, HashSet<string> columns)
+{
+    if (columns == null || columns.Count == 0) return;
+
+    Console.WriteLine($"[FIXUP] {tableName} : mise à jour FK différées ({string.Join(",", columns)})");
+
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath)) { Console.WriteLine($"[FIXUP] CSV introuvable {tableName}"); return; }
+
+    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+    if (lines.Length < 2) return;
+
+    var cols = lines[0].Split(';').Select(s => s.Trim()).ToList();
+    var idCol = GetIdentityColumn(tableName);
+    if (string.IsNullOrEmpty(idCol))
+    {
+        Console.WriteLine($"[FIXUP] {tableName} sans IDENTITY : skip (utiliser clé business si besoin).");
+        return;
+    }
+
+    // pour chaque ligne CSV : retrouver le newId et construire SET col = mappedId
+    for (int i = 1; i < lines.Length; i++)
+    {
+        var vals = lines[i].Split(';');
+        if (vals.Length != cols.Count) continue;
+
+        var row = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (int c = 0; c < cols.Count; c++) row[cols[c]] = vals[c];
+
+        var oldId = row.ContainsKey(idCol) ? row[idCol] : null;
+        if (string.IsNullOrEmpty(oldId)) continue;
+
+        if (!_idMappings.TryGetValue(tableName, out var tableMap) || !tableMap.TryGetValue(oldId, out var newId))
+            continue; // ligne non insérée (doublon/erreur)
+
+        // Build SET ...
+        var setParts = new List<string>();
+        foreach (var col in columns)
         {
-            var nullCols = plan.DeferredFkByTable.TryGetValue(step, out var set) ? set : null;
-            ImportTableCommon(step, forceNullFK:false, batchSize:500, nullFkColumns:nullCols);
-        }
-        // Fix-up des FK différées (celles mises à NULL dans les cycles)
-        foreach (var kv in plan.DeferredFkByTable)
-            FixupDeferredForeignKeys(kv.Key, kv.Value);
-
-        // 4.2) Relations étendues (mêmes règles que parents, mais après eux)
-        foreach (var rel in plan.ExtendedOrder)
-        {
-            var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
-            ImportTableCommon(rel, forceNullFK:false, batchSize:500, nullFkColumns:nullCols);
-            if (nullCols != null && nullCols.Count > 0)
-                FixupDeferredForeignKeys(rel, nullCols);
-        }
-
-        // 4.3) Relations pures (FK–FK, pas d’IDENTITY). On boucle jusqu’à stabilisation.
-        ImportPureRelationsUntilStable(pureRelations);
-
-        CommitTransaction();
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine("[FATAL] " + ex.Message);
-        RollbackTransaction();
-        throw;
-    }
-
-    Console.WriteLine("=== MIGRATION DONE ===");
-}
-
-
-private sealed class ImportPlan
-{
-    public List<string> NormalOrder { get; } = new();           // ordre topo
-    public List<string> ExtendedOrder { get; } = new();          // ordre topo sur étendues
-    public Dictionary<string, HashSet<string>> DeferredFkByTable { get; } = new(); // table -> FK à mettre à NULL puis fix-up
-}
-
-// Clé: table; Valeur: liste de ses FK sortantes
-private Dictionary<string, List<ForeignKeyInfo>> GetForeignKeysByTable(IEnumerable<string> tables)
-{
-    var res = new Dictionary<string, List<ForeignKeyInfo>>(StringComparer.OrdinalIgnoreCase);
-    foreach (var t in tables)
-        res[t] = GetForeignKeyInfo(t); // tu as déjà
-    return res;
-}
-
-private ImportPlan BuildPlan(List<string> normalTables,
-                             List<string> extendedTables,
-                             Dictionary<string, List<ForeignKeyInfo>> fkMap)
-{
-    var plan = new ImportPlan();
-
-    // Tri topo parents
-    var (orderParents, sccParents) = TopoSortWithCycles(normalTables, fkMap);
-    plan.NormalOrder.AddRange(orderParents);
-    MarkDeferredFksForCycles(sccParents, fkMap, plan);
-
-    // Tri topo étendues
-    var (orderExt, sccExt) = TopoSortWithCycles(extendedTables, fkMap);
-    plan.ExtendedOrder.AddRange(orderExt);
-    MarkDeferredFksForCycles(sccExt, fkMap, plan);
-
-    return plan;
-}
-
-// Kahn + SCC: renvoie ordre topo partiel + SCC (cycles)
-private (List<string> order, List<HashSet<string>> sccs) TopoSortWithCycles(
-    List<string> nodes,
-    Dictionary<string, List<ForeignKeyInfo>> fkMap)
-{
-    // Graphe: edge A->B si A a une FK vers B (A dépend de B)
-    var deps = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-    var rev  = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var n in nodes)
-    {
-        deps[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        rev[n]  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    }
-
-    foreach (var n in nodes)
-    {
-        if (!fkMap.TryGetValue(n, out var fks)) continue;
-        foreach (var fk in fks)
-        {
-            if (!nodes.Contains(fk.ReferencedTableName, StringComparer.OrdinalIgnoreCase)) continue;
-            deps[n].Add(fk.ReferencedTableName);
-            rev[fk.ReferencedTableName].Add(n);
-        }
-    }
-
-    var order = new List<string>();
-    var q = new Queue<string>(deps.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key));
-    var inDeg = deps.ToDictionary(kv => kv.Key, kv => kv.Value.Count, StringComparer.OrdinalIgnoreCase);
-
-    while (q.Count > 0)
-    {
-        var u = q.Dequeue();
-        order.Add(u);
-        foreach (var v in rev[u])
-        {
-            inDeg[v]--;
-            if (inDeg[v] == 0) q.Enqueue(v);
-        }
-    }
-
-    // SCC (Kosaraju simple)
-    var remaining = inDeg.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var sccs = ComputeSccs(remaining, deps, rev);
-
-    // Ajoute les nœuds cycliques en fin d’ordre pour être parcourus quand même
-    foreach (var scc in sccs)
-        order.AddRange(scc);
-
-    return (order.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sccs);
-}
-
-private List<HashSet<string>> ComputeSccs(HashSet<string> nodes,
-    Dictionary<string, HashSet<string>> deps,
-    Dictionary<string, HashSet<string>> rev)
-{
-    var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var stack = new Stack<string>();
-    void Dfs1(string u)
-    {
-        visited.Add(u);
-        foreach (var v in deps[u])
-            if (nodes.Contains(v) && !visited.Contains(v)) Dfs1(v);
-        stack.Push(u);
-    }
-    foreach (var n in nodes) if (!visited.Contains(n)) Dfs1(n);
-
-    var visited2 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    var comps = new List<HashSet<string>>();
-    void Dfs2(string u, HashSet<string> comp)
-    {
-        visited2.Add(u);
-        comp.Add(u);
-        foreach (var v in rev[u])
-            if (nodes.Contains(v) && !visited2.Contains(v)) Dfs2(v, comp);
-    }
-    while (stack.Count > 0)
-    {
-        var u = stack.Pop();
-        if (visited2.Contains(u)) continue;
-        var comp = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        Dfs2(u, comp);
-        if (comp.Count >= 2 || HasSelfRefNonTrivial(u)) // auto-cycle si FK vers soi-même
-            comps.Add(comp);
-    }
-    return comps;
-
-    bool HasSelfRefNonTrivial(string t)
-        => deps.TryGetValue(t, out var d) && d.Contains(t);
-}
-
-// Marque, pour chaque table d’un cycle, les colonnes FK vers des tables du même cycle
-// -> on les mettra à NULL à l’insert, puis on fera un fix-up UPDATE.
-private void MarkDeferredFksForCycles(List<HashSet<string>> sccs,
-                                      Dictionary<string, List<ForeignKeyInfo>> fkMap,
-                                      ImportPlan plan)
-{
-    foreach (var scc in sccs)
-    {
-        foreach (var table in scc)
-        {
-            if (!fkMap.TryGetValue(table, out var fks)) continue;
-            foreach (var fk in fks)
+            if (!row.TryGetValue(col, out var oldFkVal) || string.IsNullOrWhiteSpace(oldFkVal))
             {
-                if (!scc.Contains(fk.ReferencedTableName)) continue; // pas intra-cycle
-                // Si FK nullable -> on peut différer
-                if (IsForeignKeyNullable(fk))
-                {
-                    if (!plan.DeferredFkByTable.TryGetValue(table, out var set))
-                    {
-                        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                        plan.DeferredFkByTable[table] = set;
-                    }
-                    set.Add(fk.ColumnName);
-                }
-                else
-                {
-                    Console.WriteLine($"[INFO] Cycle non-nullable détecté: {table}.{fk.ColumnName} → {fk.ReferencedTableName}. " +
-                                      $"Solution conseillée: DISABLE/ENABLE ciblé de la contrainte le temps de l'import, puis CHECK.");
-                }
+                setParts.Add($"[{col}]=NULL");
+                continue;
             }
+            // retrouver la table référencée
+            var fk = GetForeignKeyInfo(tableName).FirstOrDefault(f => f.ColumnName.Equals(col, StringComparison.OrdinalIgnoreCase));
+            if (fk == null) { setParts.Add($"[{col}]=NULL"); continue; }
+
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFkVal, out var mapped))
+                setParts.Add($"[{col}]={mapped}");
+            else
+                setParts.Add($"[{col}]=NULL"); // faute de mieux (sinon lever une erreur)
         }
+        if (setParts.Count == 0) continue;
+
+        string sqlTxt = $"UPDATE [{tableName}] SET {string.Join(",", setParts)} WHERE [{idCol}]={newId};";
+        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql.AddDirectRequest(sqlTxt, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(30000);
     }
 }
-
-
