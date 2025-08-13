@@ -1,22 +1,40 @@
-DECLARE @tmp TABLE (NewID nvarchar(100));
-INSERT INTO @tmp EXEC sp_executesql @sql;
+-- 4) Construire & exécuter l’INSERT (version SCOPE_IDENTITY safe)
+DECLARE @sql nvarchar(max);
 
-DECLARE @cnt int = (SELECT COUNT(*) FROM @tmp);
-DECLARE @newId nvarchar(100) = (SELECT TOP (1) NewID FROM @tmp);
-
-IF @cnt > 1
+IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
 BEGIN
-    -- On renvoie le 1er ID et on note qu’il y a eu plusieurs rows dans OUTPUT
-    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-    VALUES (@i, @newId, N'Note: OUTPUT a retourné ' + CAST(@cnt AS nvarchar(10)) + N' IDs (seulement le 1er conservé)');
+    -- Une seule ligne, on renvoie l’ID créé par CET insert (scope courant)
+    SET @sql = N'SET NOCOUNT ON; ' +
+               N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') ' +
+               N'SELECT ' + @values + N'; ' +
+               N'SELECT CAST(SCOPE_IDENTITY() AS nvarchar(100)) AS NewID;';
+
+    BEGIN TRY
+        DECLARE @tmp TABLE (NewID nvarchar(100));
+        INSERT INTO @tmp EXEC sp_executesql @sql;
+
+        -- Normalement 1 seule ligne ; si >1 on garde la 1re pour rester robuste
+        DECLARE @newId nvarchar(100) = (SELECT TOP (1) NewID FROM @tmp);
+        INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+        VALUES (@i, @newId, NULL);
+    END TRY
+    BEGIN CATCH
+        INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+        VALUES(@i, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
+    END CATCH
 END
 ELSE
 BEGIN
-    INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-    VALUES (@i, @newId, NULL);
+    -- Cas sans identity : insert simple
+    SET @sql = N'SET NOCOUNT ON; ' +
+               N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') ' +
+               N'SELECT ' + @values + N';';
+    BEGIN TRY
+        EXEC sp_executesql @sql;
+        INSERT INTO @out(RowIndex, NewID, ErrorMessage) VALUES(@i, NULL, NULL);
+    END TRY
+    BEGIN CATCH
+        INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+        VALUES(@i, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
+    END CATCH
 END
-
-
-SELECT
-  RS_Count = LEN(@ValuesBatch) - LEN(REPLACE(@ValuesBatch, NCHAR(30), N'')),
-  CS_Count = LEN(@ValuesBatch) - LEN(REPLACE(@ValuesBatch, NCHAR(29), N''));
