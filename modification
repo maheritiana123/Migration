@@ -1,106 +1,44 @@
-// utilitaire
-private List<string> OrderTablesByDependencies(IEnumerable<string> tables)
+// colonnes à exclure de l'INSERT (computed/rowversion)
+private HashSet<string> GetNotInsertableColumns(string table)
 {
-    // Build graph: child -> parents
-    var parents = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-    var indeg   = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    var cols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    foreach (var t in tables)
+    // Computed
     {
-        var fks = GetForeignKeyInfo(t);
-        var parentSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var fk in fks)
-        {
-            // ne compte pas les FK différées
-            if (_deferredFkColumns.TryGetValue(t, out var set) && set.Contains(fk.ColumnName))
-                continue;
-            parentSet.Add(fk.ReferencedTableName);
-        }
-
-        parents[t] = parentSet;
-        indeg[t] = parentSet.Count;
-    }
-
-    // Kahn
-    var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
-    var order = new List<string>();
-    while (q.Count > 0)
-    {
-        var n = q.Dequeue();
-        order.Add(n);
-        foreach (var m in tables)
-        {
-            if (m == n) continue;
-            if (parents.TryGetValue(m, out var p) && p.Contains(n))
-            {
-                indeg[m]--;
-                if (indeg[m] == 0) q.Enqueue(m);
-            }
-        }
-    }
-
-    // s’il reste un cycle, on laisse ces tables à la fin (elles seront importées avec FK différées déjà prévues)
-    if (order.Count < tables.Count())
-        order.AddRange(tables.Where(t => !order.Contains(t)));
-
-    return order;
-}
-
-
-var orderedExtended = OrderTablesByDependencies(_extendedRelations);
-foreach (var t in orderedExtended)
-{
-    ImportTableCommon(t, forceNullFK: false, batchSize: 500, nullFkColumns: _deferredFkColumns.TryGetValue(t, out var s) ? s : null);
-}
-
-
-// en champ de classe
-private readonly Dictionary<string, HashSet<string>> _existingIdCache =
-    new(StringComparer.OrdinalIgnoreCase);
-
-private bool TryPassThroughExistingId(string table, string value)
-{
-    if (string.IsNullOrWhiteSpace(value)) return false;
-
-    if (!_existingIdCache.TryGetValue(table, out var set))
-    {
-        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var idCol = GetIdentityColumn(table); // si null, prends la colonne FK cible si tu la connais
-        if (string.IsNullOrEmpty(idCol)) return false; // pas d’identity connu → on ne tente pas
-
         var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        var req = $"SELECT CAST([{idCol}] AS nvarchar(200)) AS K FROM [{table}] WITH (NOLOCK)";
-        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.AddDirectRequest(@"
+            SELECT c.name AS ColName
+            FROM sys.computed_columns cc
+            JOIN sys.columns c ON c.object_id = cc.object_id AND c.column_id = cc.column_id
+            JOIN sys.objects o ON o.object_id = c.object_id
+            WHERE o.name = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("t", table, true, 0);
         sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(60000);
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-            set.Add(sql.GetValueUsingColName(i, "K", 1, 1) ?? "");
-        _existingIdCache[table] = set;
+        sql.Execute(30000);
+        for (int i=1;i<=sql.ReturnedRows(1,1);i++)
+            cols.Add(sql.GetValueUsingColName(i, "ColName", 1, 1));
     }
 
-    return set.Contains(value);
-}
-
-
-// ... dans la boucle FK, juste avant le throw:
-if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
-{
-    row[fk.ColumnName] = newFk;
-}
-else if (IsForeignKeyNullable(fk))
-{
-    row[fk.ColumnName] = null;
-}
-else
-{
-    // >>> PASS-THROUGH : si la valeur existe déjà chez le parent, on la garde telle quelle
-    if (TryPassThroughExistingId(fk.ReferencedTableName, oldFk))
+    // rowversion/timestamp
     {
-        row[fk.ColumnName] = oldFk; // on conserve la valeur existante
+        var sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
+        sql2.AddDirectRequest(@"
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = $t$
+              AND DATA_TYPE IN ('timestamp','rowversion');", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql2.SetSecureParam("t", table, true, 0);
+        sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql2.Execute(30000);
+        for (int i=1;i<=sql2.ReturnedRows(1,1);i++)
+            cols.Add(sql2.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
     }
-    else
-    {
-        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
-    }
+
+    return cols;
 }
+
+var notInsertable = GetNotInsertableColumns(tableName);
+var insertCols = columnNames
+    .Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase))
+                && !notInsertable.Contains(c))
+    .ToList();
