@@ -1,44 +1,25 @@
-// colonnes à exclure de l'INSERT (computed/rowversion)
-private HashSet<string> GetNotInsertableColumns(string table)
+// Exemple de règles locales : table -> (col -> valeur de substitution)
+private static readonly Dictionary<string, Dictionary<string, object>> _notNullFallbacks =
+    new(StringComparer.OrdinalIgnoreCase)
 {
-    var cols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-    // Computed
+    ["VarEnv"] = new(StringComparer.OrdinalIgnoreCase)
     {
-        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest(@"
-            SELECT c.name AS ColName
-            FROM sys.computed_columns cc
-            JOIN sys.columns c ON c.object_id = cc.object_id AND c.column_id = cc.column_id
-            JOIN sys.objects o ON o.object_id = c.object_id
-            WHERE o.name = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSecureParam("t", table, true, 0);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-        for (int i=1;i<=sql.ReturnedRows(1,1);i++)
-            cols.Add(sql.GetValueUsingColName(i, "ColName", 1, 1));
-    }
-
-    // rowversion/timestamp
+        ["VENom"] = ""  // remplace NULL par chaîne vide
+    },
+    ["SMSSITECODE"] = new(StringComparer.OrdinalIgnoreCase)
     {
-        var sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql2.AddDirectRequest(@"
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = $t$
-              AND DATA_TYPE IN ('timestamp','rowversion');", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql2.SetSecureParam("t", table, true, 0);
-        sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql2.Execute(30000);
-        for (int i=1;i<=sql2.ReturnedRows(1,1);i++)
-            cols.Add(sql2.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
+        ["Sms_Site_Name"] = "UNKNOWN"
     }
+};
 
-    return cols;
+// ...
+// après avoir rempli 'row' et résolu les FK :
+if (_notNullFallbacks.TryGetValue(tableName, out var perCol))
+{
+    foreach (var kvp in perCol)
+    {
+        var col = kvp.Key;
+        if (row.ContainsKey(col) && (row[col] == null || string.IsNullOrWhiteSpace(row[col]?.ToString())))
+            row[col] = kvp.Value;
+    }
 }
-
-var notInsertable = GetNotInsertableColumns(tableName);
-var insertCols = columnNames
-    .Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase))
-                && !notInsertable.Contains(c))
-    .ToList();
