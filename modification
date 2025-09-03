@@ -1,102 +1,90 @@
-// 4.2) Relations étendues (mêmes règles que parents, mais après eux)
-var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
+/* =========[ 1) Charger le CSV brut (1 seule colonne) ]========= */
+IF OBJECT_ID('tempdb..#raw') IS NOT NULL DROP TABLE #raw;
+CREATE TABLE #raw (rn INT IDENTITY(1,1), line NVARCHAR(MAX));
 
-// ❌ AVANT
-// foreach (var rel in plan.ExtendedOrder)
+-- ⚠️ Chemin à adapter (serveur SQL doit voir ce chemin)
+BULK INSERT #raw
+FROM 'C:\temp\networkprinters.csv'
+WITH (
+    CODEPAGE = '65001',           -- UTF-8 (adapte si besoin)
+    FIELDTERMINATOR = '\n',       -- on avale la ligne entière
+    ROWTERMINATOR   = '\n',       -- fin de ligne
+    FIRSTROW = 1                  -- garder l'entête : on va s'en servir
+);
 
-// ✅ APRÈS
-foreach (var rel in orderedExtended)
-{
-    var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
-    ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
-    if (nullCols != null && nullCols.Count > 0)
-        FixupDeferredForeignKeys(rel, nullCols);
-}
+/* =========[ 2) Récupérer l'entête et l'index de la colonne net_position ]========= */
+DECLARE @header NVARCHAR(MAX) =
+    (SELECT TOP(1) line FROM #raw ORDER BY rn);
 
+-- éclater l'entête sur ';' AVEC ORDRE (via XML) pour trouver l'index de net_position
+DECLARE @netPosIdx INT;
 
-
-
-
-/// <summary>
-/// Trie topologiquement un sous-ensemble de tables selon leurs FKs,
-/// en ignorant les FKs marquées "différées" (elles ne bloquent pas l'ordre).
-/// En cas de cycle résiduel, les tables cycliques sont mises en fin avec un warning.
-/// </summary>
-private List<string> OrderTablesByDependencies(
-    IEnumerable<string> tables,
-    Dictionary<string, HashSet<string>> deferredFkByTable // table -> set(colonnes FK différées)
+;WITH HeaderParts AS (
+    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS idx,
+           T.C.value('.','nvarchar(4000)') AS col
+    FROM (SELECT CAST('<r><c>' + REPLACE(@header,';','</c><c>') + '</c></r>' AS XML) AS X) H
+    CROSS APPLY H.X.nodes('/r/c') AS T(C)
 )
-{
-    var subset = new HashSet<string>(tables ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
-    var result = new List<string>(subset.Count);
-    if (subset.Count == 0) return result;
+SELECT @netPosIdx = idx
+FROM HeaderParts
+WHERE LTRIM(RTRIM(col)) = 'net_position';
 
-    // Récupère les FKs pour ce sous-ensemble uniquement
-    // (si ta GetForeignKeysByTable a une surcharge qui prend un IEnumerable<string>, utilise-la;
-    // sinon celle qui prend tout renverra plus, on filtrera de toutes façons).
-    var fkMapAll = GetForeignKeysByTable(subset); // clé = table enfant, valeur = liste de FKs (ForeignKeyInfo)
+IF @netPosIdx IS NULL
+BEGIN
+    RAISERROR('Colonne net_position introuvable dans l''entête CSV.', 16, 1);
+    RETURN;
+END
 
-    // Graphe parent -> enfants, et in-degree sur le sous-ensemble
-    var children = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-    var indeg    = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+/* =========[ 3) Extraire net_position pour chaque ligne de données ]========= */
+IF OBJECT_ID('tempdb..#np_csv') IS NOT NULL DROP TABLE #np_csv;
+CREATE TABLE #np_csv (net_position NVARCHAR(4000) NULL);
 
-    foreach (var t in subset)
-    {
-        children[t] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        indeg[t] = 0;
-    }
+;WITH RowsOnly AS (
+    SELECT rn, line FROM #raw WHERE rn >= 2 AND NULLIF(LTRIM(RTRIM(line)),N'') IS NOT NULL
+),
+Parts AS (
+    -- on split chaque ligne en cellules numérotées
+    SELECT R.rn,
+           ROW_NUMBER() OVER (PARTITION BY R.rn ORDER BY (SELECT 1)) AS idx,
+           P.C.value('.','nvarchar(max)') AS val
+    FROM RowsOnly R
+    CROSS APPLY (SELECT CAST('<r><c>' + REPLACE(R.line,';','</c><c>') + '</c></r>' AS XML) AS X) X
+    CROSS APPLY X.X.nodes('/r/c') AS P(C)
+)
+INSERT INTO #np_csv(net_position)
+SELECT NULLIF(LTRIM(RTRIM(val)),N'')
+FROM Parts
+WHERE idx = @netPosIdx;
 
-    bool IsDeferred(string child, string fkCol)
-        => deferredFkByTable != null
-           && deferredFkByTable.TryGetValue(child, out var cols)
-           && cols != null
-           && cols.Contains(fkCol);
+/* =========[ 4) Rapports utiles ]========= */
 
-    // Construire les arêtes parent->enfant pour les FKs NON différées et *dans* le sous-ensemble
-    foreach (var child in subset)
-    {
-        if (!fkMapAll.TryGetValue(child, out var fks) || fks == null) continue;
+PRINT '--- Doublons déjà existants en base (epk) ---';
+SELECT c.net_position, COUNT(*) AS OccurencesCSV
+FROM #np_csv AS c
+JOIN dbo.epk AS e
+  ON e.net_position = c.net_position
+GROUP BY c.net_position
+ORDER BY c.net_position;
 
-        foreach (var fk in fks)
-        {
-            // On n’ajoute l’arête que si la table parent fait partie du sous-ensemble,
-            // et si la colonne FK n’est pas différée pour l’enfant.
-            var parent = fk.ReferencedTableName;
-            if (string.IsNullOrEmpty(parent)) continue;
-            if (!subset.Contains(parent)) continue;
-            if (IsDeferred(child, fk.ColumnName)) continue; // cette contrainte ne bloque pas l’ordre
+PRINT '--- Doublons à l''intérieur du CSV ---';
+SELECT net_position, COUNT(*) AS Nb
+FROM #np_csv
+GROUP BY net_position
+HAVING COUNT(*) > 1
+ORDER BY Nb DESC, net_position;
 
-            if (!parent.Equals(child, StringComparison.OrdinalIgnoreCase))
-            {
-                if (children[parent].Add(child))
-                    indeg[child] = indeg[child] + 1;
-            }
-        }
-    }
+PRINT '--- Valeurs du CSV qui passeraient sans conflit dans epk ---';
+SELECT c.net_position
+FROM #np_csv AS c
+LEFT JOIN dbo.epk AS e
+  ON e.net_position = c.net_position
+WHERE e.net_position IS NULL
+ORDER BY c.net_position;
 
-    // Kahn
-    var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
-    while (q.Count > 0)
-    {
-        var u = q.Dequeue();
-        result.Add(u);
-        foreach (var v in children[u])
-        {
-            indeg[v] = indeg[v] - 1;
-            if (indeg[v] == 0) q.Enqueue(v);
-        }
-    }
-
-    // Cycle ? (restants avec in-degree > 0)
-    if (result.Count != subset.Count)
-    {
-        var remaining = indeg.Where(kv => kv.Value > 0).Select(kv => kv.Key)
-                             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-                             .ToList();
-        Console.WriteLine("[WARN] Cycle détecté parmi les relations étendues : " + string.Join(", ", remaining)
-                          + ". Elles seront importées en dernier (FK différées + fix-up).");
-        result.AddRange(remaining);
-    }
-
-    return result;
-}
+PRINT '--- Synthèse ---';
+SELECT
+    (SELECT COUNT(*) FROM #np_csv)                                         AS TotalCSV,
+    (SELECT COUNT(*) FROM #np_csv WHERE net_position IS NULL)              AS CSV_Nulls,
+    (SELECT COUNT(*) FROM #np_csv GROUP BY net_position HAVING COUNT(*)>1) AS CSV_DuplKeys,
+    (SELECT COUNT(*) FROM #np_csv AS c JOIN dbo.epk AS e
+        ON e.net_position=c.net_position)                                  AS ConflitsAvecEPK;
