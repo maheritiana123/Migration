@@ -1,7 +1,45 @@
-private Dictionary<string, List<ForeignKeyInfo>> BuildFkCache(IEnumerable<string> tables)
+// --- relations étendues ---
+if (_extendedRelations != null && _extendedRelations.Count > 0)
 {
-    var cache = new Dictionary<string, List<ForeignKeyInfo>>(StringComparer.OrdinalIgnoreCase);
-    foreach (var t in tables)
-        cache[t] = GetForeignKeyInfo(t) ?? new List<ForeignKeyInfo>();
-    return cache;
+    Console.WriteLine("---- Import tables relationnelles étendues ----");
+
+    var fkCache = BuildFkCache(_extendedRelations);
+    var ordered = SortTablesByDependencies(_extendedRelations, fkCache);
+
+    foreach (var table in ordered)
+    {
+        try
+        {
+            // Si tu as une logique de FK différées spécifique, garde-la,
+            // sinon appelle simplement :
+            ImportTableCommon(table, forceNullFK: false, batchSize: 500);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERREUR] {table} : {ex.Message}");
+            throw; // ou continue selon ta politique
+        }
+    }
+}
+
+// --- relations pures (si tu en as une liste dédiée) ---
+if (_pureRelations != null && _pureRelations.Count > 0)
+{
+    Console.WriteLine("---- Import tables relationnelles pures ----");
+
+    var fkCache = BuildFkCache(_pureRelations);
+    var ordered = SortTablesByDependencies(_pureRelations, fkCache);
+
+    foreach (var table in ordered)
+    {
+        try
+        {
+            ImportTableCommon(table, forceNullFK: false, batchSize: 500);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERREUR] {table} : {ex.Message}");
+            throw;
+        }
+    }
 }
