@@ -1,44 +1,48 @@
--- 1) Générer et exécuter les DROP CONSTRAINT pour toutes les FK
+-- 1) Drop toutes les FK
 DECLARE @sql NVARCHAR(MAX) = N'';
 
-SELECT @sql = STRING_AGG(
-    'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
-    ' DROP CONSTRAINT ' + QUOTENAME(fk.name) + ';',
-    CHAR(10)
-)
-FROM sys.foreign_keys fk
-JOIN sys.tables t ON fk.parent_object_id = t.object_id
-JOIN sys.schemas s ON t.schema_id = s.schema_id;
+SELECT @sql = (
+    SELECT 
+        'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
+        ' DROP CONSTRAINT ' + QUOTENAME(fk.name) + ';' + CHAR(10)
+    FROM sys.foreign_keys fk
+    JOIN sys.tables t ON fk.parent_object_id = t.object_id
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    FOR XML PATH(''), TYPE
+).value('.', 'NVARCHAR(MAX)');
 
+PRINT @sql; -- debug
 EXEC sp_executesql @sql;
 
--- 2) TRUNCATE toutes les tables
-SET @sql = N'';
-SELECT @sql = STRING_AGG(
-    'TRUNCATE TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ';',
-    CHAR(10)
-)
-FROM sys.tables t
-JOIN sys.schemas s ON s.schema_id = t.schema_id
-WHERE t.is_ms_shipped = 0;
+-- 2) Truncate toutes les tables
+SET @sql = (
+    SELECT 
+        'TRUNCATE TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ';' + CHAR(10)
+    FROM sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    WHERE t.is_ms_shipped = 0
+    FOR XML PATH(''), TYPE
+).value('.', 'NVARCHAR(MAX)');
 
+PRINT @sql; -- debug
 EXEC sp_executesql @sql;
 
--- 3) Générer et exécuter les ADD CONSTRAINT pour recréer les FK
-SET @sql = N'';
-SELECT @sql = STRING_AGG(
-    'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
-    ' ADD CONSTRAINT ' + QUOTENAME(fk.name) +
-    ' FOREIGN KEY (' + COL_NAME(fc.parent_object_id, fc.parent_column_id) + ')' +
-    ' REFERENCES ' + QUOTENAME(s2.name) + '.' + QUOTENAME(t2.name) +
-    '(' + COL_NAME(fc.referenced_object_id, fc.referenced_column_id) + ');',
-    CHAR(10)
-)
-FROM sys.foreign_keys fk
-JOIN sys.foreign_key_columns fc ON fk.object_id = fc.constraint_object_id
-JOIN sys.tables t ON fk.parent_object_id = t.object_id
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-JOIN sys.tables t2 ON fk.referenced_object_id = t2.object_id
-JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id;
+-- 3) Recréer toutes les FK
+SET @sql = (
+    SELECT 
+        'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
+        ' ADD CONSTRAINT ' + QUOTENAME(fk.name) +
+        ' FOREIGN KEY (' + COL_NAME(fc.parent_object_id, fc.parent_column_id) + ')' +
+        ' REFERENCES ' + QUOTENAME(s2.name) + '.' + QUOTENAME(t2.name) +
+        '(' + COL_NAME(fc.referenced_object_id, fc.referenced_column_id) + ');' + CHAR(10)
+    FROM sys.foreign_keys fk
+    JOIN sys.foreign_key_columns fc ON fk.object_id = fc.constraint_object_id
+    JOIN sys.tables t ON fk.parent_object_id = t.object_id
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    JOIN sys.tables t2 ON fk.referenced_object_id = t2.object_id
+    JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+    FOR XML PATH(''), TYPE
+).value('.', 'NVARCHAR(MAX)');
 
+PRINT @sql; -- debug
 EXEC sp_executesql @sql;
