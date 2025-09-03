@@ -1,38 +1,19 @@
-// --- après la boucle de résolution des FK ---
 var meta = GetColumnsMetaCached(tableName);
-
-// Remplir les NULL non autorisés (ou mettre le DEFAULT littéral)
 foreach (var col in columnNames)
 {
-    // ne jamais insérer l'IDENTITY
     if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
     if (!row.ContainsKey(col)) continue;
     if (!meta.TryGetValue(col, out var m)) continue;
-    if (m.IsComputed) continue; // colonnes non-insérables
+    if (m.IsComputed) continue;
 
     var s = row[col]?.ToString();
     var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
 
     if (isNullish && !m.IsNullable)
     {
-        // 1) DEFAULT littéral ?
         if (TryParseSimpleDefault(m.ColumnDefault, out var defVal))
-        {
-            row[col] = defVal; // BuildValuesBatch gèrera le quoting selon le type
-        }
+            row[col] = defVal;
         else
-        {
-            // 2) Fallback par type (évite le blocage)
             row[col] = GetTypeFallback(m.DataType);
-        }
     }
 }
-
-// Si tu veux exclure computed/rowversion à l'INSERT :
-var notInsertable = new HashSet<string>(meta.Values.Where(x => x.IsComputed).Select(x => x.Name),
-                                        StringComparer.OrdinalIgnoreCase);
-
-var insertCols = columnNames
-    .Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase))
-                && !notInsertable.Contains(c))
-    .ToList();
