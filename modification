@@ -1,119 +1,79 @@
-/// Import dédié aux tables de relation "pures":
-/// - utilise la même SP que ImportTableCommon (détection de doublons par PK/UK)
-/// - ne gère pas de FK différées (pas utile ici)
-/// - ne met pas à jour _idMappings (en général pas d'IDENTITY utile comme clé de référence)
-private void ImportPureTableWithProc(string tableName, int batchSize = 500)
+private void AppendRejectedRow(
+    string tableName,
+    IList<string> insertCols,
+    Dictionary<string, object> row,   // row d’origine (après FK mapping et retrait de l’identity)
+    string reason)
 {
-    Console.WriteLine("_______________________");
-    Console.WriteLine($"[IMPORT PURE] {tableName}");
+    Directory.CreateDirectory(Path.Combine(_importPath, "Rejected"));
+    var rejPath = Path.Combine(
+        _importPath,
+        "Rejected",
+        $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}_rejected.csv"
+    );
 
-    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-    if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
+    var header = string.Join(";", insertCols.Concat(new[] { "_Reason" }));
+    var line   = string.Join(";", insertCols.Select(c =>
+                    (row.TryGetValue(c, out var v) && v != null) ? v.ToString() : "NULL")
+                 .Concat(new[] { reason?.Replace(";", " ").Replace("\r", " ").Replace("\n", " ") ?? "" }));
 
-    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
-    if (lines.Length < 2) { Console.WriteLine($"CSV vide : {tableName}"); return; }
-
-    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
-    var identityColumn = GetIdentityColumn(tableName);                   // peut exister (on ne l'insère jamais)
-    var fkInfos = GetForeignKeyInfo(tableName);
-    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
-
-    // Types SQL par colonne pour un quoting correct dans BuildValuesBatch
-    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
-
-    // Préparation des lignes (mapping FK + retrait éventuel de l'IDENTITY)
-    var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
-    int structureSkipped = 0;
-
-    for (int i = 1; i < lines.Length; i++)
+    var writeHeader = !File.Exists(rejPath);
+    using (var sw = new StreamWriter(rejPath, append: true, Encoding.UTF8))
     {
-        var vals = lines[i].Split(';');
-        if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
-
-        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
-
-        // On n’insère jamais la colonne IDENTITY si elle existe
-        if (hasIdentity && row.ContainsKey(identityColumn))
-            row.Remove(identityColumn);
-
-        // Mapping FK (comme dans ImportTableCommon, mais sans différé ici)
-        foreach (var fk in fkInfos)
-        {
-            if (!row.ContainsKey(fk.ColumnName)) continue;
-
-            var oldFk = (row[fk.ColumnName] ?? "").ToString();
-            if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
-
-            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
-                row[fk.ColumnName] = newFk;
-            else if (IsForeignKeyNullable(fk))
-                row[fk.ColumnName] = null;           // on laisse à NULL si nullable
-            else
-                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
-        }
-
-        prepared.Add(row);
+        if (writeHeader) sw.WriteLine(header);
+        sw.WriteLine(line);
     }
-
-    if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }
-
-    // Colonnes réellement insérées (sans l'IDENTITY)
-    var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
-    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
-
-    int inserted = 0, duplicates = 0, errors = 0;
-    Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
-
-    for (int start = 0; start < prepared.Count; start += batchSize)
-    {
-        int count = Math.Min(batchSize, prepared.Count - start);
-        var batchRows = prepared.GetRange(start, count);
-
-        // Fabrique le @ValuesBatch avec nos séparateurs NCHAR(30)/NCHAR(29)
-        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes);
-
-        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        string req = @"
-            EXEC dbo.batch_safe_insert_with_type_conversion
-                @TableName   = $t$,
-                @Columns     = $cols$,
-                @ValuesBatch = $vb$,
-                @HasIdentity = $hid$,
-                @IdentityCol = $idcol$;";
-
-        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSecureParam("t", tableName, true, 0);
-        sql.SetSecureParam("cols", columnsSql, true, 0);
-        sql.SetSecureParam("vb", valuesBatch, true, 0);
-        sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
-        sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(60000);
-
-        int rows = sql.ReturnedRows(1, 1);
-        for (int i = 1; i <= rows; i++)
-        {
-            string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
-            if (!string.IsNullOrEmpty(err))
-            {
-                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) { duplicates++; continue; }
-                errors++;
-                int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
-                Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
-                continue;
-            }
-
-            inserted++;
-        }
-    }
-
-    Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
 }
 
 
-// 4.3) Relations pures (FK–FK, pas d’IDENTITY). On traite en appelant la SP pour gérer les doublons.
-foreach (var rel in pureRelations)
+
+// on a déjà: var batchRows = prepared.GetRange(start, count);
+// et oldIdsBatch aligné; insertCols, etc.
+
+int rows = sql.ReturnedRows(1, 1);
+for (int i = 1; i <= rows; i++)
 {
-    ImportPureTableWithProc(rel, batchSize: 500);
+    int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+    string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
+    string err   = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+
+    // récupère la ligne d’origine de ce batch
+    Dictionary<string, object> rowForReject = null;
+    if (rowIndex >= 1 && rowIndex <= batchRows.Count)
+        rowForReject = batchRows[rowIndex - 1];
+
+    if (!string.IsNullOrEmpty(err))
+    {
+        if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            duplicates++;
+            // ✅ journaliser la ligne rejetée (pas de perte)
+            if (rowForReject != null)
+                AppendRejectedRow(tableName, insertCols, rowForReject, "Doublon");
+
+            // mapping même en doublon si NewID renvoyé (déjà dans ton code)
+            if (hasIdentity && !string.IsNullOrEmpty(newId)
+                && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+            {
+                var oldId = oldIdsBatch[rowIndex - 1];
+                if (!string.IsNullOrEmpty(oldId))
+                {
+                    if (!_idMappings.ContainsKey(tableName))
+                        _idMappings[tableName] = new Dictionary<object, object>();
+                    _idMappings[tableName][oldId] = newId;
+                }
+            }
+        }
+        else
+        {
+            errors++;
+            Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
+            if (rowForReject != null)
+                AppendRejectedRow(tableName, insertCols, rowForReject, err);
+        }
+        continue;
+    }
+
+    // succès
+    inserted++;
+    // … (mapping identity déjà présent)
 }
