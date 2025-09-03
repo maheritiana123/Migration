@@ -1,90 +1,119 @@
-/* =========[ 1) Charger le CSV brut (1 seule colonne) ]========= */
-IF OBJECT_ID('tempdb..#raw') IS NOT NULL DROP TABLE #raw;
-CREATE TABLE #raw (rn INT IDENTITY(1,1), line NVARCHAR(MAX));
+/// Import dédié aux tables de relation "pures":
+/// - utilise la même SP que ImportTableCommon (détection de doublons par PK/UK)
+/// - ne gère pas de FK différées (pas utile ici)
+/// - ne met pas à jour _idMappings (en général pas d'IDENTITY utile comme clé de référence)
+private void ImportPureTableWithProc(string tableName, int batchSize = 500)
+{
+    Console.WriteLine("_______________________");
+    Console.WriteLine($"[IMPORT PURE] {tableName}");
 
--- ⚠️ Chemin à adapter (serveur SQL doit voir ce chemin)
-BULK INSERT #raw
-FROM 'C:\temp\networkprinters.csv'
-WITH (
-    CODEPAGE = '65001',           -- UTF-8 (adapte si besoin)
-    FIELDTERMINATOR = '\n',       -- on avale la ligne entière
-    ROWTERMINATOR   = '\n',       -- fin de ligne
-    FIRSTROW = 1                  -- garder l'entête : on va s'en servir
-);
+    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
+    if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
 
-/* =========[ 2) Récupérer l'entête et l'index de la colonne net_position ]========= */
-DECLARE @header NVARCHAR(MAX) =
-    (SELECT TOP(1) line FROM #raw ORDER BY rn);
+    var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+    if (lines.Length < 2) { Console.WriteLine($"CSV vide : {tableName}"); return; }
 
--- éclater l'entête sur ';' AVEC ORDRE (via XML) pour trouver l'index de net_position
-DECLARE @netPosIdx INT;
+    var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+    var identityColumn = GetIdentityColumn(tableName);                   // peut exister (on ne l'insère jamais)
+    var fkInfos = GetForeignKeyInfo(tableName);
+    bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
 
-;WITH HeaderParts AS (
-    SELECT ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS idx,
-           T.C.value('.','nvarchar(4000)') AS col
-    FROM (SELECT CAST('<r><c>' + REPLACE(@header,';','</c><c>') + '</c></r>' AS XML) AS X) H
-    CROSS APPLY H.X.nodes('/r/c') AS T(C)
-)
-SELECT @netPosIdx = idx
-FROM HeaderParts
-WHERE LTRIM(RTRIM(col)) = 'net_position';
+    // Types SQL par colonne pour un quoting correct dans BuildValuesBatch
+    var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
 
-IF @netPosIdx IS NULL
-BEGIN
-    RAISERROR('Colonne net_position introuvable dans l''entête CSV.', 16, 1);
-    RETURN;
-END
+    // Préparation des lignes (mapping FK + retrait éventuel de l'IDENTITY)
+    var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
+    int structureSkipped = 0;
 
-/* =========[ 3) Extraire net_position pour chaque ligne de données ]========= */
-IF OBJECT_ID('tempdb..#np_csv') IS NOT NULL DROP TABLE #np_csv;
-CREATE TABLE #np_csv (net_position NVARCHAR(4000) NULL);
+    for (int i = 1; i < lines.Length; i++)
+    {
+        var vals = lines[i].Split(';');
+        if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
 
-;WITH RowsOnly AS (
-    SELECT rn, line FROM #raw WHERE rn >= 2 AND NULLIF(LTRIM(RTRIM(line)),N'') IS NOT NULL
-),
-Parts AS (
-    -- on split chaque ligne en cellules numérotées
-    SELECT R.rn,
-           ROW_NUMBER() OVER (PARTITION BY R.rn ORDER BY (SELECT 1)) AS idx,
-           P.C.value('.','nvarchar(max)') AS val
-    FROM RowsOnly R
-    CROSS APPLY (SELECT CAST('<r><c>' + REPLACE(R.line,';','</c><c>') + '</c></r>' AS XML) AS X) X
-    CROSS APPLY X.X.nodes('/r/c') AS P(C)
-)
-INSERT INTO #np_csv(net_position)
-SELECT NULLIF(LTRIM(RTRIM(val)),N'')
-FROM Parts
-WHERE idx = @netPosIdx;
+        var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
 
-/* =========[ 4) Rapports utiles ]========= */
+        // On n’insère jamais la colonne IDENTITY si elle existe
+        if (hasIdentity && row.ContainsKey(identityColumn))
+            row.Remove(identityColumn);
 
-PRINT '--- Doublons déjà existants en base (epk) ---';
-SELECT c.net_position, COUNT(*) AS OccurencesCSV
-FROM #np_csv AS c
-JOIN dbo.epk AS e
-  ON e.net_position = c.net_position
-GROUP BY c.net_position
-ORDER BY c.net_position;
+        // Mapping FK (comme dans ImportTableCommon, mais sans différé ici)
+        foreach (var fk in fkInfos)
+        {
+            if (!row.ContainsKey(fk.ColumnName)) continue;
 
-PRINT '--- Doublons à l''intérieur du CSV ---';
-SELECT net_position, COUNT(*) AS Nb
-FROM #np_csv
-GROUP BY net_position
-HAVING COUNT(*) > 1
-ORDER BY Nb DESC, net_position;
+            var oldFk = (row[fk.ColumnName] ?? "").ToString();
+            if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
 
-PRINT '--- Valeurs du CSV qui passeraient sans conflit dans epk ---';
-SELECT c.net_position
-FROM #np_csv AS c
-LEFT JOIN dbo.epk AS e
-  ON e.net_position = c.net_position
-WHERE e.net_position IS NULL
-ORDER BY c.net_position;
+            if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+                row[fk.ColumnName] = newFk;
+            else if (IsForeignKeyNullable(fk))
+                row[fk.ColumnName] = null;           // on laisse à NULL si nullable
+            else
+                throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
+        }
 
-PRINT '--- Synthèse ---';
-SELECT
-    (SELECT COUNT(*) FROM #np_csv)                                         AS TotalCSV,
-    (SELECT COUNT(*) FROM #np_csv WHERE net_position IS NULL)              AS CSV_Nulls,
-    (SELECT COUNT(*) FROM #np_csv GROUP BY net_position HAVING COUNT(*)>1) AS CSV_DuplKeys,
-    (SELECT COUNT(*) FROM #np_csv AS c JOIN dbo.epk AS e
-        ON e.net_position=c.net_position)                                  AS ConflitsAvecEPK;
+        prepared.Add(row);
+    }
+
+    if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }
+
+    // Colonnes réellement insérées (sans l'IDENTITY)
+    var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
+    string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+
+    int inserted = 0, duplicates = 0, errors = 0;
+    Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+
+    for (int start = 0; start < prepared.Count; start += batchSize)
+    {
+        int count = Math.Min(batchSize, prepared.Count - start);
+        var batchRows = prepared.GetRange(start, count);
+
+        // Fabrique le @ValuesBatch avec nos séparateurs NCHAR(30)/NCHAR(29)
+        string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes);
+
+        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        string req = @"
+            EXEC dbo.batch_safe_insert_with_type_conversion
+                @TableName   = $t$,
+                @Columns     = $cols$,
+                @ValuesBatch = $vb$,
+                @HasIdentity = $hid$,
+                @IdentityCol = $idcol$;";
+
+        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("t", tableName, true, 0);
+        sql.SetSecureParam("cols", columnsSql, true, 0);
+        sql.SetSecureParam("vb", valuesBatch, true, 0);
+        sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
+        sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
+        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+        sql.Execute(60000);
+
+        int rows = sql.ReturnedRows(1, 1);
+        for (int i = 1; i <= rows; i++)
+        {
+            string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+            if (!string.IsNullOrEmpty(err))
+            {
+                if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0) { duplicates++; continue; }
+                errors++;
+                int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+                Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
+                continue;
+            }
+
+            inserted++;
+        }
+    }
+
+    Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
+}
+
+
+// 4.3) Relations pures (FK–FK, pas d’IDENTITY). On traite en appelant la SP pour gérer les doublons.
+foreach (var rel in pureRelations)
+{
+    ImportPureTableWithProc(rel, batchSize: 500);
+}
