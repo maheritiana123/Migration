@@ -1,59 +1,6 @@
-// ---- NORMALISATION des NULL non autorisés ----
-// meta = GetColumnsMetaCached(tableName) doit être un dico OrdinalIgnoreCase
-var meta = GetColumnsMetaCached(tableName);
+// AVANT
+string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes);
 
-foreach (var col in columnNames)
-{
-    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
-    if (!row.ContainsKey(col)) continue;
-
-    meta.TryGetValue(col, out var m);
-    if (m?.IsComputed == true) continue;                 // colonnes calculées: on n’insère rien
-
-    var s = (row[col] ?? "").ToString();
-    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
-
-    // nullabilité "fiable" : méta + (filet) sys.columns (DynamicSql)
-    bool isNullable = (m?.IsNullable ?? true);
-    if (isNullable)                                      // si la méta dit nullable, on confirme côté SQL
-        isNullable = IsColumnNullableSql(tableName, col);
-
-    if (isNullish)
-    {
-        if (!isNullable)
-        {
-            // 1) DEFAULT de la colonne (simple)
-            if (m != null && TryParseSimpleDefault(m.ColumnDefault, out var defVal))
-            {
-                row[col] = defVal;                       // BuildValuesBatch gèrera le quoting / pass-through
-                // Console.WriteLine($"[DEFAULT] {tableName}.{col} <- {defVal}");
-            }
-            else
-            {
-                // 2) Fallback typé (jamais null)
-                var fb = GetTypeFallback(m?.DataType);
-                row[col] = fb;
-                // Console.WriteLine($"[FALLBACK] {tableName}.{col} <- {fb} (type={m?.DataType})");
-            }
-        }
-        else
-        {
-            row[col] = null;                             // vraie valeur NULL autorisée
-        }
-    }
-}
-
-// Dernier filet: s’assurer qu’aucun NOT NULL ne reste à null
-foreach (var col in columnNames)
-{
-    if (hasIdentity && col.Equals(identityColumn,9 StringComparison.OrdinalIgnoreCase)) continue;
-    if (!row.ContainsKey(col)) continue;
-
-    if (!IsColumnNullableSql(tableName, col))
-    {
-        var v = row[col];
-        if (v == null || (v is string ss && ss.Equals("NULL", StringComparison.OrdinalIgnoreCase)))
-            row[col] = GetTypeFallback(meta.TryGetValue(col, out var m2) ? m2.DataType : null);
-    }
-}
-// ---- fin normalisation ----
+// APRÈS (on passe la méta en plus)
+var meta = GetColumnsMetaCached(tableName); // tu l’as déjà
+string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes, meta);
