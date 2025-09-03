@@ -1,48 +1,66 @@
--- 1) Drop toutes les FK
-DECLARE @sql NVARCHAR(MAX) = N'';
+// Trie les tables par dépendances de FKs (parents avant enfants).
+// Ne conserve que les arêtes (FK) dont la table référencée est DANS le sous-ensemble passé.
+private List<string> SortTablesByDependencies(
+    IEnumerable<string> tables,
+    Dictionary<string, List<ForeignKeyInfo>> fkCache // clé = table, valeur = FKs de cette table
+)
+{
+    var set = new HashSet<string>(tables, StringComparer.OrdinalIgnoreCase);
 
-SELECT @sql = (
-    SELECT 
-        'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
-        ' DROP CONSTRAINT ' + QUOTENAME(fk.name) + ';' + CHAR(10)
-    FROM sys.foreign_keys fk
-    JOIN sys.tables t ON fk.parent_object_id = t.object_id
-    JOIN sys.schemas s ON t.schema_id = s.schema_id
-    FOR XML PATH(''), TYPE
-).value('.', 'NVARCHAR(MAX)');
+    // Construire graphe : parent -> liste d'enfants
+    var children = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    var indeg    = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-PRINT @sql; -- debug
-EXEC sp_executesql @sql;
+    foreach (var t in set)
+    {
+        children[t] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        indeg[t] = 0;
+    }
 
--- 2) Truncate toutes les tables
-SET @sql = (
-    SELECT 
-        'TRUNCATE TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ';' + CHAR(10)
-    FROM sys.tables t
-    JOIN sys.schemas s ON s.schema_id = t.schema_id
-    WHERE t.is_ms_shipped = 0
-    FOR XML PATH(''), TYPE
-).value('.', 'NVARCHAR(MAX)');
+    foreach (var t in set)
+    {
+        if (!fkCache.TryGetValue(t, out var fks) || fks == null) continue;
 
-PRINT @sql; -- debug
-EXEC sp_executesql @sql;
+        // t (enfant) dépend de fk.ReferencedTableName (parent)
+        foreach (var fk in fks)
+        {
+            var parent = fk.ReferencedTableName;
+            if (!string.IsNullOrEmpty(parent) && set.Contains(parent) && !parent.Equals(t, StringComparison.OrdinalIgnoreCase))
+            {
+                // arête parent -> enfant
+                if (children[parent].Add(t))
+                {
+                    indeg[t] = indeg[t] + 1;
+                }
+            }
+        }
+    }
 
--- 3) Recréer toutes les FK
-SET @sql = (
-    SELECT 
-        'ALTER TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) +
-        ' ADD CONSTRAINT ' + QUOTENAME(fk.name) +
-        ' FOREIGN KEY (' + COL_NAME(fc.parent_object_id, fc.parent_column_id) + ')' +
-        ' REFERENCES ' + QUOTENAME(s2.name) + '.' + QUOTENAME(t2.name) +
-        '(' + COL_NAME(fc.referenced_object_id, fc.referenced_column_id) + ');' + CHAR(10)
-    FROM sys.foreign_keys fk
-    JOIN sys.foreign_key_columns fc ON fk.object_id = fc.constraint_object_id
-    JOIN sys.tables t ON fk.parent_object_id = t.object_id
-    JOIN sys.schemas s ON t.schema_id = s.schema_id
-    JOIN sys.tables t2 ON fk.referenced_object_id = t2.object_id
-    JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
-    FOR XML PATH(''), TYPE
-).value('.', 'NVARCHAR(MAX)');
+    // Kahn
+    var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
+    var ordered = new List<string>();
 
-PRINT @sql; -- debug
-EXEC sp_executesql @sql;
+    while (q.Count > 0)
+    {
+        var u = q.Dequeue();
+        ordered.Add(u);
+
+        foreach (var v in children[u])
+        {
+            indeg[v] = indeg[v] - 1;
+            if (indeg[v] == 0) q.Enqueue(v);
+        }
+    }
+
+    // Si cycle : on met les restants (indeg>0) à la fin dans un ordre déterministe
+    if (ordered.Count != set.Count)
+    {
+        var remaining = indeg.Where(kv => kv.Value > 0).Select(kv => kv.Key)
+                             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
+        Console.WriteLine("[WARN] Cycle détecté parmi les tables relationnelles : " +
+                          string.Join(", ", remaining) + ". On importera ces tables en dernier.");
+        ordered.AddRange(remaining);
+    }
+
+    return ordered;
+}
