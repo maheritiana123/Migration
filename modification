@@ -1,34 +1,19 @@
--- 1) Désactiver les FKs
+-- 1) Désactiver les contraintes FK
 EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
--- 2) Vider toutes les tables (avec SET dans chaque batch de foreach)
-EXEC sp_MSforeachtable '
-    SET ANSI_NULLS ON;
-    SET QUOTED_IDENTIFIER ON;
-    SET ANSI_PADDING ON;
-    SET ANSI_WARNINGS ON;
-    SET CONCAT_NULL_YIELDS_NULL ON;
-    SET ARITHABORT ON;
-    DELETE FROM ?;
-';
-
--- 3) Réactiver les FKs
-EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
-
--- 4) Reseed uniquement les tables avec IDENTITY
+-- 2) Générer les TRUNCATE TABLE pour toutes les tables utilisateurs
 DECLARE @sql NVARCHAR(MAX) = N'';
 
 SELECT @sql = STRING_AGG(
-    'DBCC CHECKIDENT (' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ', RESEED, 0);',
-    CHAR(13)
+    'TRUNCATE TABLE ' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ';',
+    CHAR(10)
 )
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
-WHERE EXISTS (
-    SELECT 1
-    FROM sys.identity_columns ic
-    WHERE ic.object_id = t.object_id
-);
+WHERE t.is_ms_shipped = 0;  -- éviter les tables système
 
--- Exécuter le bloc DBCC
+-- Exécuter les TRUNCATE
 EXEC sp_executesql @sql;
+
+-- 3) Réactiver les contraintes FK
+EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
