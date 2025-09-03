@@ -1,66 +1,7 @@
-// Trie les tables par dépendances de FKs (parents avant enfants).
-// Ne conserve que les arêtes (FK) dont la table référencée est DANS le sous-ensemble passé.
-private List<string> SortTablesByDependencies(
-    IEnumerable<string> tables,
-    Dictionary<string, List<ForeignKeyInfo>> fkCache // clé = table, valeur = FKs de cette table
-)
+private Dictionary<string, List<ForeignKeyInfo>> BuildFkCache(IEnumerable<string> tables)
 {
-    var set = new HashSet<string>(tables, StringComparer.OrdinalIgnoreCase);
-
-    // Construire graphe : parent -> liste d'enfants
-    var children = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-    var indeg    = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-    foreach (var t in set)
-    {
-        children[t] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        indeg[t] = 0;
-    }
-
-    foreach (var t in set)
-    {
-        if (!fkCache.TryGetValue(t, out var fks) || fks == null) continue;
-
-        // t (enfant) dépend de fk.ReferencedTableName (parent)
-        foreach (var fk in fks)
-        {
-            var parent = fk.ReferencedTableName;
-            if (!string.IsNullOrEmpty(parent) && set.Contains(parent) && !parent.Equals(t, StringComparison.OrdinalIgnoreCase))
-            {
-                // arête parent -> enfant
-                if (children[parent].Add(t))
-                {
-                    indeg[t] = indeg[t] + 1;
-                }
-            }
-        }
-    }
-
-    // Kahn
-    var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
-    var ordered = new List<string>();
-
-    while (q.Count > 0)
-    {
-        var u = q.Dequeue();
-        ordered.Add(u);
-
-        foreach (var v in children[u])
-        {
-            indeg[v] = indeg[v] - 1;
-            if (indeg[v] == 0) q.Enqueue(v);
-        }
-    }
-
-    // Si cycle : on met les restants (indeg>0) à la fin dans un ordre déterministe
-    if (ordered.Count != set.Count)
-    {
-        var remaining = indeg.Where(kv => kv.Value > 0).Select(kv => kv.Key)
-                             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
-        Console.WriteLine("[WARN] Cycle détecté parmi les tables relationnelles : " +
-                          string.Join(", ", remaining) + ". On importera ces tables en dernier.");
-        ordered.AddRange(remaining);
-    }
-
-    return ordered;
+    var cache = new Dictionary<string, List<ForeignKeyInfo>>(StringComparer.OrdinalIgnoreCase);
+    foreach (var t in tables)
+        cache[t] = GetForeignKeyInfo(t) ?? new List<ForeignKeyInfo>();
+    return cache;
 }
