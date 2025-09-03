@@ -1,7 +1,8 @@
-// Cache local (clé: table) -> (col -> bool IsNullable)
+// Cache: par table -> (col -> isNullable)
 private readonly Dictionary<string, Dictionary<string, bool>> _nullabilityCache =
     new(StringComparer.OrdinalIgnoreCase);
 
+// Lit sys.columns via DynamicSql (schéma dbo)
 private bool IsColumnNullableSql(string table, string column)
 {
     if (!_nullabilityCache.TryGetValue(table, out var map))
@@ -9,19 +10,26 @@ private bool IsColumnNullableSql(string table, string column)
         map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         _nullabilityCache[table] = map;
 
-        // Charge toutes les colonnes de la table d’un coup (plus rapide)
-        using var cn = GetSqlConnection(); // ton util d’accès SQL
-        using var cmd = cn.CreateCommand();
-        cmd.CommandText = @"
+        var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+        string req = @"
 SELECT c.name AS ColName, c.is_nullable
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
 JOIN sys.columns c ON c.object_id = t.object_id
-WHERE s.name = 'dbo' AND t.name = @tbl;";
-        cmd.Parameters.AddWithValue("@tbl", table);
-        using var rd = cmd.ExecuteReader();
-        while (rd.Read())
-            map[rd.GetString(0)] = rd.GetBoolean(1);
+WHERE s.name = N'dbo' AND t.name = $tbl$
+ORDER BY c.column_id;";
+        sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+        sql.SetSecureParam("tbl", table, true, 0);
+        sql.Execute(30000);
+
+        int rows = sql.ReturnedRows(1, 1);
+        for (int i = 1; i <= rows; i++)
+        {
+            string col = sql.GetValueUsingColName(i, "ColName", 1, 1);
+            string nul = sql.GetValueUsingColName(i, "is_nullable", 1, 1);
+            if (!string.IsNullOrEmpty(col))
+                map[col] = nul == "1";
+        }
     }
-    return map.TryGetValue(column, out var nul) ? nul : true; // par défaut: prudent
+    return map.TryGetValue(column, out var isNul) ? isNul : true; // défaut prudent
 }
