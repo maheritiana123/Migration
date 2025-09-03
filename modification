@@ -1,52 +1,102 @@
-public void PerformMigration()
+// 4.2) Relations étendues (mêmes règles que parents, mais après eux)
+var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
+
+// ❌ AVANT
+// foreach (var rel in plan.ExtendedOrder)
+
+// ✅ APRÈS
+foreach (var rel in orderedExtended)
 {
-    Console.WriteLine("=== MIGRATION START ===");
+    var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
+    ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
+    if (nullCols != null && nullCols.Count > 0)
+        FixupDeferredForeignKeys(rel, nullCols);
+}
 
-    // 1) Tables (déjà filtrées par GetAllTables)
-    var allTables = GetAllTables(); 
 
-    // 2) Partition 
-    LoadRelationTables(allTables, out var normalTables, out var extendedRelations, out var pureRelations);
 
-    // 3) Dépendances & cycles (SCC)
-    var fkMap = GetForeignKeysByTable(allTables); 
-    var plan = BuildPlan(normalTables, extendedRelations, fkMap);
 
-    // 4) Transaction globale 
-    ExecuteTransactionCommand("BEGIN TRANSACTION");
-    try
+
+/// <summary>
+/// Trie topologiquement un sous-ensemble de tables selon leurs FKs,
+/// en ignorant les FKs marquées "différées" (elles ne bloquent pas l'ordre).
+/// En cas de cycle résiduel, les tables cycliques sont mises en fin avec un warning.
+/// </summary>
+private List<string> OrderTablesByDependencies(
+    IEnumerable<string> tables,
+    Dictionary<string, HashSet<string>> deferredFkByTable // table -> set(colonnes FK différées)
+)
+{
+    var subset = new HashSet<string>(tables ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+    var result = new List<string>(subset.Count);
+    if (subset.Count == 0) return result;
+
+    // Récupère les FKs pour ce sous-ensemble uniquement
+    // (si ta GetForeignKeysByTable a une surcharge qui prend un IEnumerable<string>, utilise-la;
+    // sinon celle qui prend tout renverra plus, on filtrera de toutes façons).
+    var fkMapAll = GetForeignKeysByTable(subset); // clé = table enfant, valeur = liste de FKs (ForeignKeyInfo)
+
+    // Graphe parent -> enfants, et in-degree sur le sous-ensemble
+    var children = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    var indeg    = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var t in subset)
     {
-        // 4.1) Parents (ordre topologique + cycles gérés par FK différées)
-        foreach (var step in plan.NormalOrder)
-        {
-            var nullCols = plan.DeferredFkByTable.TryGetValue(step, out var set) ? set : null;
-            ImportTableCommon(step, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
-        }
-        // Fix-up des FK différées (celles mises à NULL dans les cycles)
-        foreach (var kv in plan.DeferredFkByTable)
-            FixupDeferredForeignKeys(kv.Key, kv.Value);
-
-        // 4.2) Relations étendues (mêmes règles que parents, mais après eux)
-        var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
-        foreach (var rel in plan.ExtendedOrder)
-        {
-            var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
-            ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
-            if (nullCols != null && nullCols.Count > 0)
-                FixupDeferredForeignKeys(rel, nullCols);
-        }
-
-        // 4.3) Relations pures (FK–FK, pas d’IDENTITY). On boucle jusqu’à stabilisation.
-        ImportPureRelationsUntilStable(pureRelations);
-
-        ExecuteTransactionCommand("COMMIT TRANSACTION");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine("[FATAL] " + ex.Message);
-        ExecuteTransactionCommand("ROLLBACK TRANSACTION");
-        throw;
+        children[t] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        indeg[t] = 0;
     }
 
-    Console.WriteLine("=== MIGRATION DONE ===");
+    bool IsDeferred(string child, string fkCol)
+        => deferredFkByTable != null
+           && deferredFkByTable.TryGetValue(child, out var cols)
+           && cols != null
+           && cols.Contains(fkCol);
+
+    // Construire les arêtes parent->enfant pour les FKs NON différées et *dans* le sous-ensemble
+    foreach (var child in subset)
+    {
+        if (!fkMapAll.TryGetValue(child, out var fks) || fks == null) continue;
+
+        foreach (var fk in fks)
+        {
+            // On n’ajoute l’arête que si la table parent fait partie du sous-ensemble,
+            // et si la colonne FK n’est pas différée pour l’enfant.
+            var parent = fk.ReferencedTableName;
+            if (string.IsNullOrEmpty(parent)) continue;
+            if (!subset.Contains(parent)) continue;
+            if (IsDeferred(child, fk.ColumnName)) continue; // cette contrainte ne bloque pas l’ordre
+
+            if (!parent.Equals(child, StringComparison.OrdinalIgnoreCase))
+            {
+                if (children[parent].Add(child))
+                    indeg[child] = indeg[child] + 1;
+            }
+        }
+    }
+
+    // Kahn
+    var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
+    while (q.Count > 0)
+    {
+        var u = q.Dequeue();
+        result.Add(u);
+        foreach (var v in children[u])
+        {
+            indeg[v] = indeg[v] - 1;
+            if (indeg[v] == 0) q.Enqueue(v);
+        }
+    }
+
+    // Cycle ? (restants avec in-degree > 0)
+    if (result.Count != subset.Count)
+    {
+        var remaining = indeg.Where(kv => kv.Value > 0).Select(kv => kv.Key)
+                             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                             .ToList();
+        Console.WriteLine("[WARN] Cycle détecté parmi les relations étendues : " + string.Join(", ", remaining)
+                          + ". Elles seront importées en dernier (FK différées + fix-up).");
+        result.AddRange(remaining);
+    }
+
+    return result;
 }
