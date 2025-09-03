@@ -1,61 +1,27 @@
-// Interprète les DEFAULT simples du style: ('foo'), (0), ((1)), ('1900-01-01'), GETDATE() -> ignoré (on ne sait pas l’évaluer côté client)
-private bool TryParseSimpleDefault(string columnDefault, out object value)
+// Cache local (clé: table) -> (col -> bool IsNullable)
+private readonly Dictionary<string, Dictionary<string, bool>> _nullabilityCache =
+    new(StringComparer.OrdinalIgnoreCase);
+
+private bool IsColumnNullableSql(string table, string column)
 {
-    value = null;
-    if (string.IsNullOrWhiteSpace(columnDefault)) return false;
-
-    var s = columnDefault.Trim();
-    // on vire les parenthèses extérieures
-    while (s.Length >= 2 && s.StartsWith("(") && s.EndsWith(")"))
-        s = s.Substring(1, s.Length - 2).Trim();
-
-    // fonctions -> on ne touche pas (laisser SQL les appliquer si possible)
-    var upper = s.ToUpperInvariant();
-    if (upper.Contains("GETDATE") || upper.Contains("NEWID") || upper.Contains("SYSUTCDATETIME")) 
-        return false;
-
-    // littéral string ?
-    if (s.Length >= 2 && s[0] == '\'' && s[s.Length - 1] == '\'')
+    if (!_nullabilityCache.TryGetValue(table, out var map))
     {
-        value = s.Substring(1, s.Length - 2).Replace("''", "'");
-        return true;
+        map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        _nullabilityCache[table] = map;
+
+        // Charge toutes les colonnes de la table d’un coup (plus rapide)
+        using var cn = GetSqlConnection(); // ton util d’accès SQL
+        using var cmd = cn.CreateCommand();
+        cmd.CommandText = @"
+SELECT c.name AS ColName, c.is_nullable
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.columns c ON c.object_id = t.object_id
+WHERE s.name = 'dbo' AND t.name = @tbl;";
+        cmd.Parameters.AddWithValue("@tbl", table);
+        using var rd = cmd.ExecuteReader();
+        while (rd.Read())
+            map[rd.GetString(0)] = rd.GetBoolean(1);
     }
-
-    // nombre entier ?
-    if (int.TryParse(s, out var i)) { value = i; return true; }
-    if (long.TryParse(s, out var l)) { value = l; return true; }
-    if (decimal.TryParse(s, out var d)) { value = d; return true; }
-
-    // bit ?
-    if (s == "0" || s == "1") { value = (s == "1"); return true; }
-
-    // date littérale ?
-    if (DateTime.TryParse(s, out var dt)) { value = dt; return true; }
-
-    return false;
-}
-
-// Valeur de secours si NOT NULL sans DEFAULT
-private object GetTypeFallback(string sqlType)
-{
-    sqlType = (sqlType ?? "").ToLowerInvariant();
-
-    if (sqlType.Contains("char") || sqlType.Contains("text") || sqlType.Contains("ntext"))
-        return "";                   // texte : chaîne vide
-
-    if (sqlType.Contains("bit"))
-        return 0;                    // bit : 0
-
-    if (sqlType.Contains("int") || sqlType.Contains("numeric") || sqlType.Contains("decimal")
-        || sqlType.Contains("float") || sqlType.Contains("real") || sqlType.Contains("money"))
-        return 0;                    // numériques : 0
-
-    if (sqlType.Contains("date") || sqlType.Contains("time"))
-        return new DateTime(1900, 1, 1); // dates : 1900-01-01
-
-    if (sqlType.Contains("uniqueidentifier"))
-        return Guid.Empty;           // GUID nul
-
-    // par défaut
-    return "";
+    return map.TryGetValue(column, out var nul) ? nul : true; // par défaut: prudent
 }
