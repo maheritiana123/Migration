@@ -1,45 +1,52 @@
-// --- relations étendues ---
-if (_extendedRelations != null && _extendedRelations.Count > 0)
+public void PerformMigration()
 {
-    Console.WriteLine("---- Import tables relationnelles étendues ----");
+    Console.WriteLine("=== MIGRATION START ===");
 
-    var fkCache = BuildFkCache(_extendedRelations);
-    var ordered = SortTablesByDependencies(_extendedRelations, fkCache);
+    // 1) Tables (déjà filtrées par GetAllTables)
+    var allTables = GetAllTables(); 
 
-    foreach (var table in ordered)
+    // 2) Partition 
+    LoadRelationTables(allTables, out var normalTables, out var extendedRelations, out var pureRelations);
+
+    // 3) Dépendances & cycles (SCC)
+    var fkMap = GetForeignKeysByTable(allTables); 
+    var plan = BuildPlan(normalTables, extendedRelations, fkMap);
+
+    // 4) Transaction globale 
+    ExecuteTransactionCommand("BEGIN TRANSACTION");
+    try
     {
-        try
+        // 4.1) Parents (ordre topologique + cycles gérés par FK différées)
+        foreach (var step in plan.NormalOrder)
         {
-            // Si tu as une logique de FK différées spécifique, garde-la,
-            // sinon appelle simplement :
-            ImportTableCommon(table, forceNullFK: false, batchSize: 500);
+            var nullCols = plan.DeferredFkByTable.TryGetValue(step, out var set) ? set : null;
+            ImportTableCommon(step, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
         }
-        catch (Exception ex)
+        // Fix-up des FK différées (celles mises à NULL dans les cycles)
+        foreach (var kv in plan.DeferredFkByTable)
+            FixupDeferredForeignKeys(kv.Key, kv.Value);
+
+        // 4.2) Relations étendues (mêmes règles que parents, mais après eux)
+        var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
+        foreach (var rel in plan.ExtendedOrder)
         {
-            Console.WriteLine($"[ERREUR] {table} : {ex.Message}");
-            throw; // ou continue selon ta politique
+            var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
+            ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
+            if (nullCols != null && nullCols.Count > 0)
+                FixupDeferredForeignKeys(rel, nullCols);
         }
+
+        // 4.3) Relations pures (FK–FK, pas d’IDENTITY). On boucle jusqu’à stabilisation.
+        ImportPureRelationsUntilStable(pureRelations);
+
+        ExecuteTransactionCommand("COMMIT TRANSACTION");
     }
-}
-
-// --- relations pures (si tu en as une liste dédiée) ---
-if (_pureRelations != null && _pureRelations.Count > 0)
-{
-    Console.WriteLine("---- Import tables relationnelles pures ----");
-
-    var fkCache = BuildFkCache(_pureRelations);
-    var ordered = SortTablesByDependencies(_pureRelations, fkCache);
-
-    foreach (var table in ordered)
+    catch (Exception ex)
     {
-        try
-        {
-            ImportTableCommon(table, forceNullFK: false, batchSize: 500);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERREUR] {table} : {ex.Message}");
-            throw;
-        }
+        Console.WriteLine("[FATAL] " + ex.Message);
+        ExecuteTransactionCommand("ROLLBACK TRANSACTION");
+        throw;
     }
+
+    Console.WriteLine("=== MIGRATION DONE ===");
 }
