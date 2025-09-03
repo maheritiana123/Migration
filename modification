@@ -1,152 +1,38 @@
-// Cache méta pour éviter de requêter en boucle
-private readonly Dictionary<string, Dictionary<string, ColMeta>> _colMetaCache =
-    new(StringComparer.OrdinalIgnoreCase);
+// --- après la boucle de résolution des FK ---
+var meta = GetColumnsMetaCached(tableName);
 
-private sealed class ColMeta
+// Remplir les NULL non autorisés (ou mettre le DEFAULT littéral)
+foreach (var col in columnNames)
 {
-    public string Name;
-    public string DataType;
-    public bool IsNullable;
-    public bool IsComputed;
-    public string ColumnDefault; // ex: (N'foo'), ('bar'), ((0)), (0), (1)
-    public int MaxLen;
-}
+    // ne jamais insérer l'IDENTITY
+    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
+    if (!row.ContainsKey(col)) continue;
+    if (!meta.TryGetValue(col, out var m)) continue;
+    if (m.IsComputed) continue; // colonnes non-insérables
 
-private Dictionary<string, ColMeta> GetColumnsMetaCached(string table)
-{
-    if (_colMetaCache.TryGetValue(table, out var meta)) return meta;
-    var m = GetColumnsMeta(table);
-    _colMetaCache[table] = m;
-    return m;
-}
+    var s = row[col]?.ToString();
+    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
 
-// Lecture dynamique du schéma
-private Dictionary<string, ColMeta> GetColumnsMeta(string table)
-{
-    var meta = new Dictionary<string, ColMeta>(StringComparer.OrdinalIgnoreCase);
-
-    // Base: nullable / default / type / length
-    var sql = new DynamicSql { Dsn = "PXE1_PXE" };
-    sql.AddDirectRequest(@"
-        SELECT 
-            c.COLUMN_NAME,
-            c.DATA_TYPE,
-            CASE WHEN c.IS_NULLABLE='YES' THEN 1 ELSE 0 END AS IsNullable,
-            c.COLUMN_DEFAULT,
-            c.CHARACTER_MAXIMUM_LENGTH AS MaxLen
-        FROM INFORMATION_SCHEMA.COLUMNS c
-        WHERE c.TABLE_NAME = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql.SetSecureParam("t", table, true, 0);
-    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql.Execute(30000);
-    for (int i=1;i<=sql.ReturnedRows(1,1);i++)
+    if (isNullish && !m.IsNullable)
     {
-        var m = new ColMeta {
-            Name         = sql.GetValueUsingColName(i, "COLUMN_NAME", 1,1),
-            DataType     = sql.GetValueUsingColName(i, "DATA_TYPE", 1,1),
-            IsNullable   = "1" == sql.GetValueUsingColName(i, "IsNullable", 1,1),
-            ColumnDefault= sql.GetValueUsingColName(i, "COLUMN_DEFAULT", 1,1),
-        };
-        int.TryParse(sql.GetValueUsingColName(i, "MaxLen", 1,1), out m.MaxLen);
-        meta[m.Name] = m;
-    }
-
-    // Computed columns
-    var sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
-    sql2.AddDirectRequest(@"
-        SELECT c.name AS ColName
-        FROM sys.computed_columns cc
-        JOIN sys.columns c ON c.object_id = cc.object_id AND c.column_id = cc.column_id
-        JOIN sys.objects o ON o.object_id = c.object_id
-        WHERE o.name = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql2.SetSecureParam("t", table, true, 0);
-    sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql2.Execute(30000);
-    for (int i=1;i<=sql2.ReturnedRows(1,1);i++)
-    {
-        var col = sql2.GetValueUsingColName(i, "ColName", 1,1);
-        if (meta.TryGetValue(col, out var m)) m.IsComputed = true;
-    }
-
-    // rowversion/timestamp -> traiter comme "non insérable"
-    var sql3 = new DynamicSql { Dsn = "PXE1_PXE" };
-    sql3.AddDirectRequest(@"
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = $t$ AND DATA_TYPE IN ('timestamp','rowversion');", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-    sql3.SetSecureParam("t", table, true, 0);
-    sql3.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-    sql3.Execute(30000);
-    for (int i=1;i<=sql3.ReturnedRows(1,1);i++)
-    {
-        var col = sql3.GetValueUsingColName(i, "COLUMN_NAME", 1,1);
-        if (meta.TryGetValue(col, out var m)) m.IsComputed = true;
-    }
-
-    return meta;
-}
-
-// DEFAULT simple ? -> on renvoie une valeur "brute" (non quotée), ex: foo, 0, 1
-private static bool TryParseSimpleDefault(string columnDefault, out string valueOut)
-{
-    valueOut = null;
-    if (string.IsNullOrWhiteSpace(columnDefault)) return false;
-
-    var s = columnDefault.Trim();
-    // retire des paires de parenthèses
-    if (s.StartsWith("(") && s.EndsWith(")")) s = s.Substring(1, s.Length-2).Trim();
-    if (s.StartsWith("(") && s.EndsWith(")")) s = s.Substring(1, s.Length-2).Trim();
-
-    // N'...' ou '...'
-    if (s.StartsWith("N'") && s.EndsWith("'")) { valueOut = s.Substring(2, s.Length-3); return true; }
-    if (s.StartsWith("'")  && s.EndsWith("'")) { valueOut = s.Substring(1, s.Length-2); return true; }
-
-    // nombres simples
-    if (decimal.TryParse(s, out _)) { valueOut = s; return true; }
-
-    // fonctions (getdate(), newid(), etc.) -> NON gérées ici
-    return false;
-}
-
-// Fallback "safe" par type (string "", 0, date minimale, guid...)
-private static string GetTypeFallback(string sqlType)
-{
-    sqlType = (sqlType ?? "").ToLowerInvariant();
-    switch (sqlType)
-    {
-        case "nvarchar":
-        case "nchar":
-        case "varchar":
-        case "char":
-        case "ntext":
-        case "text":
-            return ""; // chaîne vide
-
-        case "bit":
-            return "0";
-
-        case "tinyint":
-        case "smallint":
-        case "int":
-        case "bigint":
-        case "decimal":
-        case "numeric":
-        case "money":
-        case "smallmoney":
-        case "float":
-        case "real":
-            return "0";
-
-        case "datetime":
-        case "datetime2":
-        case "smalldatetime":
-        case "date":
-            return "1900-01-01 00:00:00";
-
-        case "uniqueidentifier":
-            return Guid.NewGuid().ToString();
-
-        default:
-            return ""; // défaut neutre
+        // 1) DEFAULT littéral ?
+        if (TryParseSimpleDefault(m.ColumnDefault, out var defVal))
+        {
+            row[col] = defVal; // BuildValuesBatch gèrera le quoting selon le type
+        }
+        else
+        {
+            // 2) Fallback par type (évite le blocage)
+            row[col] = GetTypeFallback(m.DataType);
+        }
     }
 }
+
+// Si tu veux exclure computed/rowversion à l'INSERT :
+var notInsertable = new HashSet<string>(meta.Values.Where(x => x.IsComputed).Select(x => x.Name),
+                                        StringComparer.OrdinalIgnoreCase);
+
+var insertCols = columnNames
+    .Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase))
+                && !notInsertable.Contains(c))
+    .ToList();
