@@ -1,39 +1,34 @@
-// ---------- Nouveau : contrôle des NOT NULL ----------
-bool rowHasFatalNotNull = false;
+// ---- NORMALISATION DES COLONNES NOT NULL (à mettre juste avant prepared.Add(row)) ----
+var meta = GetColumnsMetaCached(tableName);
 
-foreach (var col in insertCols) // colonnes à insérer (hors identity)
+// on parcourt les colonnes réellement insérées (donc hors identity)
+foreach (var col in columnNames)
 {
+    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
     if (!row.ContainsKey(col)) continue;
+    if (!meta.TryGetValue(col, out var m)) continue;   // méta absente -> on n’insiste pas
+    if (m.IsComputed) continue;                        // colonnes calculées : ne jamais fournir
 
-    var rawObj = row[col];
-    var rawStr = (rawObj ?? "").ToString();
-    bool isVide = string.IsNullOrWhiteSpace(rawStr) || 
-                  string.Equals(rawStr, "NULL", StringComparison.OrdinalIgnoreCase);
+    var s = (row[col] ?? "").ToString();
+    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
 
-    if (!IsColumnNullable(tableName, col) && isVide)
+    if (isNullish && !m.IsNullable)
     {
-        var type = columnTypes[col]?.ToLowerInvariant() ?? "";
-        bool estTexte = type.Contains("char") || type.Contains("text");
-
-        if (estTexte)
+        // 1) si la colonne a un DEFAULT simple (constante), on l’utilise
+        if (TryParseSimpleDefault(m.ColumnDefault, out var defVal))
         {
-            // Pour les colonnes texte NOT NULL, on force une chaîne vide
-            row[col] = "";
+            row[col] = defVal; // BuildValuesBatch gèrera le quoting selon le type (string/object)
         }
         else
         {
-            // Pour les colonnes numériques/dates NOT NULL -> ignorer la ligne
-            rowHasFatalNotNull = true;
-            Console.WriteLine($"[ERREUR INSERT] {tableName} : colonne NOT NULL '{col}' vide à la ligne {i + 1}. Ligne ignorée.");
-            break;
+            // 2) sinon, fallback “raisonnable” selon le type pour éviter l’échec d’INSERT
+            row[col] = GetTypeFallback(m.DataType);
         }
     }
-    else if (isVide)
+    else if (isNullish)
     {
-        // Colonne nullable ou vide autorisée -> mettre NULL
+        // colonne nullable -> NULL explicite
         row[col] = null;
     }
 }
-
-if (rowHasFatalNotNull) { structureSkipped++; continue; }
-// ---------- Fin du nouveau bloc ----------
+// ---- fin normalisation ----
