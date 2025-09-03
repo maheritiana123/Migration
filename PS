@@ -46,7 +46,7 @@ foreach (var col in columnNames)
 // Dernier filet: s’assurer qu’aucun NOT NULL ne reste à null
 foreach (var col in columnNames)
 {
-    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
+    if (hasIdentity && col.Equals(identityColumn,9 StringComparison.OrdinalIgnoreCase)) continue;
     if (!row.ContainsKey(col)) continue;
 
     if (!IsColumnNullableSql(tableName, col))
