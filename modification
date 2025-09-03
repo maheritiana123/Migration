@@ -1,25 +1,11 @@
-// Exemple de règles locales : table -> (col -> valeur de substitution)
-private static readonly Dictionary<string, Dictionary<string, object>> _notNullFallbacks =
-    new(StringComparer.OrdinalIgnoreCase)
-{
-    ["VarEnv"] = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["VENom"] = ""  // remplace NULL par chaîne vide
-    },
-    ["SMSSITECODE"] = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["Sms_Site_Name"] = "UNKNOWN"
-    }
-};
+-- Désactiver les contraintes FK
+EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
-// ...
-// après avoir rempli 'row' et résolu les FK :
-if (_notNullFallbacks.TryGetValue(tableName, out var perCol))
-{
-    foreach (var kvp in perCol)
-    {
-        var col = kvp.Key;
-        if (row.ContainsKey(col) && (row[col] == null || string.IsNullOrWhiteSpace(row[col]?.ToString())))
-            row[col] = kvp.Value;
-    }
-}
+-- Supprimer les données de toutes les tables
+EXEC sp_MSforeachtable 'DELETE FROM ?';
+
+-- Réactiver les contraintes FK
+EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
+
+-- Optionnel : remettre les IDENTITY à 1
+EXEC sp_MSforeachtable 'DBCC CHECKIDENT (''?'', RESEED, 0)';
