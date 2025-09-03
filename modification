@@ -1,21 +1,36 @@
--- Désactiver les contraintes FK
+-- Requis pour tables avec vues indexées / colonnes calculées indexées
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_PADDING ON;
+SET ANSI_WARNINGS ON;
+SET CONCAT_NULL_YIELDS_NULL ON;
+SET ARITHABORT ON;
+
+-- 1) Désactiver les FKs
 EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
--- Supprimer les données
-EXEC sp_MSforeachtable 'DELETE FROM ?';
+-- 2) Vider toutes les tables (avec SET dans chaque batch de foreach)
+EXEC sp_MSforeachtable '
+    SET ANSI_NULLS ON;
+    SET QUOTED_IDENTIFIER ON;
+    SET ANSI_PADDING ON;
+    SET ANSI_WARNINGS ON;
+    SET CONCAT_NULL_YIELDS_NULL ON;
+    SET ARITHABORT ON;
+    DELETE FROM ?;
+';
 
--- Réactiver les contraintes FK
+-- 3) Réactiver les FKs (avec validation des données)
 EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
 
--- Reseed uniquement sur les tables qui ont une colonne IDENTITY
-DECLARE @sql NVARCHAR(MAX) = N'';
-
-SELECT @sql += 'DBCC CHECKIDENT (''' + t.name + ''', RESEED, 0);' + CHAR(13)
+-- 4) Reseed uniquement les tables avec IDENTITY (nom qualifié schéma)
+DECLARE @sql nvarchar(max) = N'''';
+SELECT @sql = STRING_AGG(
+    ''DBCC CHECKIDENT ('' + QUOTENAME(s.name) + ''.'' + QUOTENAME(t.name) + '', RESEED, 0);'',
+    CHAR(13)
+)
 FROM sys.tables t
-WHERE EXISTS (
-    SELECT 1
-    FROM sys.identity_columns c
-    WHERE c.[object_id] = t.[object_id]
-);
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE EXISTS (SELECT 1 FROM sys.identity_columns ic WHERE ic.object_id = t.object_id);
 
 EXEC sp_executesql @sql;
