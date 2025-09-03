@@ -1,35 +1,67 @@
-// ---- NORMALISATION NOT NULL (double filet via DynamicSql) ----
-var meta = GetColumnsMetaCached(tableName); // doit renvoyer un dict OrdinalIgnoreCase
-
-foreach (var col in columnNames)
+private static bool TryParseSimpleDefault(string defaultDef, out object value)
 {
-    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
-    if (!row.ContainsKey(col)) continue;
+    value = null;
+    if (string.IsNullOrWhiteSpace(defaultDef)) return false;
 
-    meta.TryGetValue(col, out var m);                    // m peut être null
-    if (m?.IsComputed == true) continue;                 // colonnes calculées: on n'insère pas
+    // enlève les parenthèses autour de ((…))
+    var s = defaultDef.Trim();
+    while (s.Length > 1 && s.StartsWith("(") && s.EndsWith(")"))
+        s = s.Substring(1, s.Length - 2).Trim();
 
-    var s = (row[col] ?? "").ToString();
-    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
+    if (string.Equals(s, "NULL", StringComparison.OrdinalIgnoreCase))
+        return false;
 
-    // Décide la nullabilité : méta -> vérif SQL (DynamicSql) en filet de sécurité
-    bool isNullable = m?.IsNullable ?? true;
-    if (isNullable)                                      // si la méta dit nullable, on confirme côté SQL
-        isNullable = IsColumnNullableSql(tableName, col);
-
-    if (isNullish)
+    // DEFAULT N'abc' / 'abc'
+    if (s.StartsWith("N'", StringComparison.Ordinal) || s.StartsWith("'", StringComparison.Ordinal))
     {
-        if (!isNullable)
+        var start = s.StartsWith("N'") ? 2 : 1;
+        if (s.EndsWith("'") && s.Length >= start + 1)
         {
-            if (m != null && TryParseSimpleDefault(m.ColumnDefault, out var defVal))
-                row[col] = defVal;                       // DEFAULT littéral
-            else
-                row[col] = GetTypeFallback(m?.DataType); // fallback typé (évite l'échec)
-        }
-        else
-        {
-            row[col] = null;                             // vraie valeur NULL autorisée
+            var inner = s.Substring(start, s.Length - start - 1).Replace("''", "'");
+            value = inner;                  // chaîne .NET -> sera quotée par BuildValuesBatch
+            return true;
         }
     }
+
+    // entier / décimal simple
+    if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)) { value = i; return true; }
+    if (decimal.TryParse(s, NumberStyles.Number, CultureInfo.InvariantCulture, out var d)) { value = d; return true; }
+
+    // expressions connues: CONVERT(...), CAST(...), GETDATE()...
+    if (s.StartsWith("CONVERT(", StringComparison.OrdinalIgnoreCase) ||
+        s.StartsWith("CAST(", StringComparison.OrdinalIgnoreCase) ||
+        s.Equals("GETDATE()", StringComparison.OrdinalIgnoreCase))
+    { value = s; return true; }
+
+    return false;
 }
-// ---- fin normalisation ----
+
+private static object GetTypeFallback(string sqlDataType)
+{
+    var dt = (sqlDataType ?? "").ToLowerInvariant();
+
+    // chaînes
+    if (dt.Contains("char") || dt.Contains("text") || dt.Contains("xml"))
+        return "";                         // chaîne vide => N'' (pas NULL)
+
+    // booléen
+    if (dt == "bit") return 0;
+
+    // entiers
+    if (dt is "int" or "bigint" or "smallint" or "tinyint") return 0;
+
+    // numériques
+    if (dt.Contains("decimal") || dt.Contains("numeric") || dt.Contains("money") || dt.Contains("float") || dt.Contains("real"))
+        return 0;
+
+    // dates
+    if (dt.Contains("date") || dt.Contains("time"))
+        return "CONVERT(datetime2(0),'1900-01-01T00:00:00',126)"; // **expression SQL brute**
+
+    // binaire => vide
+    if (dt.Contains("varbinary") || dt.Contains("binary") || dt.Contains("image"))
+        return "0x";                         // vide
+
+    // par défaut, chaîne vide (sûr et non NULL)
+    return "";
+}
