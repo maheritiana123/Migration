@@ -1,42 +1,10 @@
-private void AppendRejectedRow(
-    string tableName,
-    IList<string> insertCols,
-    Dictionary<string, object> row,   // row d’origine (après FK mapping et retrait de l’identity)
-    string reason)
-{
-    Directory.CreateDirectory(Path.Combine(_importPath, "Rejected"));
-    var rejPath = Path.Combine(
-        _importPath,
-        "Rejected",
-        $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}_rejected.csv"
-    );
-
-    var header = string.Join(";", insertCols.Concat(new[] { "_Reason" }));
-    var line   = string.Join(";", insertCols.Select(c =>
-                    (row.TryGetValue(c, out var v) && v != null) ? v.ToString() : "NULL")
-                 .Concat(new[] { reason?.Replace(";", " ").Replace("\r", " ").Replace("\n", " ") ?? "" }));
-
-    var writeHeader = !File.Exists(rejPath);
-    using (var sw = new StreamWriter(rejPath, append: true, Encoding.UTF8))
-    {
-        if (writeHeader) sw.WriteLine(header);
-        sw.WriteLine(line);
-    }
-}
-
-
-
-// on a déjà: var batchRows = prepared.GetRange(start, count);
-// et oldIdsBatch aligné; insertCols, etc.
-
 int rows = sql.ReturnedRows(1, 1);
 for (int i = 1; i <= rows; i++)
 {
     int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
-    string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
-    string err   = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+    string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
 
-    // récupère la ligne d’origine de ce batch
+    // récupère la ligne d’origine (alignée sur RowIndex 1..N du batch)
     Dictionary<string, object> rowForReject = null;
     if (rowIndex >= 1 && rowIndex <= batchRows.Count)
         rowForReject = batchRows[rowIndex - 1];
@@ -46,22 +14,8 @@ for (int i = 1; i <= rows; i++)
         if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
         {
             duplicates++;
-            // ✅ journaliser la ligne rejetée (pas de perte)
             if (rowForReject != null)
                 AppendRejectedRow(tableName, insertCols, rowForReject, "Doublon");
-
-            // mapping même en doublon si NewID renvoyé (déjà dans ton code)
-            if (hasIdentity && !string.IsNullOrEmpty(newId)
-                && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
-            {
-                var oldId = oldIdsBatch[rowIndex - 1];
-                if (!string.IsNullOrEmpty(oldId))
-                {
-                    if (!_idMappings.ContainsKey(tableName))
-                        _idMappings[tableName] = new Dictionary<object, object>();
-                    _idMappings[tableName][oldId] = newId;
-                }
-            }
         }
         else
         {
@@ -73,7 +27,5 @@ for (int i = 1; i <= rows; i++)
         continue;
     }
 
-    // succès
     inserted++;
-    // … (mapping identity déjà présent)
 }
