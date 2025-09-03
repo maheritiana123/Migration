@@ -1,11 +1,3 @@
--- Requis pour tables avec vues indexées / colonnes calculées indexées
-SET ANSI_NULLS ON;
-SET QUOTED_IDENTIFIER ON;
-SET ANSI_PADDING ON;
-SET ANSI_WARNINGS ON;
-SET CONCAT_NULL_YIELDS_NULL ON;
-SET ARITHABORT ON;
-
 -- 1) Désactiver les FKs
 EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
@@ -20,17 +12,23 @@ EXEC sp_MSforeachtable '
     DELETE FROM ?;
 ';
 
--- 3) Réactiver les FKs (avec validation des données)
+-- 3) Réactiver les FKs
 EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
 
--- 4) Reseed uniquement les tables avec IDENTITY (nom qualifié schéma)
-DECLARE @sql nvarchar(max) = N'''';
+-- 4) Reseed uniquement les tables avec IDENTITY
+DECLARE @sql NVARCHAR(MAX) = N'';
+
 SELECT @sql = STRING_AGG(
-    ''DBCC CHECKIDENT ('' + QUOTENAME(s.name) + ''.'' + QUOTENAME(t.name) + '', RESEED, 0);'',
+    'DBCC CHECKIDENT (' + QUOTENAME(s.name) + '.' + QUOTENAME(t.name) + ', RESEED, 0);',
     CHAR(13)
 )
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
-WHERE EXISTS (SELECT 1 FROM sys.identity_columns ic WHERE ic.object_id = t.object_id);
+WHERE EXISTS (
+    SELECT 1
+    FROM sys.identity_columns ic
+    WHERE ic.object_id = t.object_id
+);
 
+-- Exécuter le bloc DBCC
 EXEC sp_executesql @sql;
