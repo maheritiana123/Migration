@@ -1,139 +1,73 @@
-// --- Remplace ta version par celle-ci ---
-private string BuildValuesBatch(
-    List<Dictionary<string, object>> rows,
-    List<string> insertCols,
-    Dictionary<string, string> columnTypes,                    // déjà présent chez toi
-    Dictionary<string, ColumnMeta> metaByCol                   // + NOUVEAU param
-)
-{
-    var RS = ((char)30).ToString(); // record sep
-    var CS = ((char)29).ToString(); // column sep
+# === Paramètres ===
+$Drive = 'C:\'
+$ThresholdGB = 10
+$SubThresholdGB = 5   # seuil pour le détail des sous-dossiers des 3 plus gros
 
-    var sb = new StringBuilder(rows.Count * 64);
+# --- Petite fonction utilitaire : taille d'un dossier (en octets) ---
+function Get-FolderSizeBytes {
+    param([string]$Path)
+    try {
+        $sum = (Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                Measure-Object -Property Length -Sum).Sum
+        if ($null -eq $sum) { 0 } else { [int64]$sum }
+    } catch { 0 }
+}
 
-    for (int r = 0; r < rows.Count; r++)
-    {
-        if (r > 0) sb.Append(RS);
+Write-Host "Analyse de l'espace disque sur $Drive (seuil: $ThresholdGB Go)..." -ForegroundColor Cyan
 
-        var row = rows[r];
+# --- 1) Plus gros dossiers au 1er niveau de C:\ ---
+$top = Get-ChildItem -LiteralPath $Drive -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $sizeBytes = Get-FolderSizeBytes -Path $_.FullName
+    [pscustomobject]@{
+        Path      = $_.FullName
+        SizeGB    = [math]::Round($sizeBytes / 1GB, 2)
+        SizeBytes = $sizeBytes
+    }
+} | Where-Object { $_.SizeGB -ge $ThresholdGB } | Sort-Object SizeBytes -Descending
 
-        for (int c = 0; c < insertCols.Count; c++)
-        {
-            if (c > 0) sb.Append(CS);
+if ($top.Count -eq 0) {
+    Write-Host "Aucun dossier > $ThresholdGB Go trouvé au 1er niveau de $Drive." -ForegroundColor Yellow
+} else {
+    Write-Host "`n== Dossiers > $ThresholdGB Go à la racine de $Drive ==" -ForegroundColor Green
+    $top | Select-Object Path, SizeGB | Format-Table -AutoSize
+}
 
-            var col = insertCols[c];
-            object raw = row.TryGetValue(col, out var v) ? v : null;
-
-            // Types SQL connus (ex: "nvarchar", "int", "datetime2", etc.)
-            columnTypes.TryGetValue(col, out var dt);
-            dt = dt?.ToLowerInvariant() ?? "";
-
-            // Métadonnées (nullable, computed, default…)
-            metaByCol.TryGetValue(col, out var meta);
-            bool isNullable = meta?.IsNullable ?? true;
-
-            // 1) Normalisation stricte : si vide/"NULL"/null -> fallback si NOT NULL
-            string token = FormatValueToken(raw, dt, isNullable);
-
-            sb.Append(token);
+# --- 2) Détail des sous-dossiers pour les 3 plus gros ---
+$drill = $top | Select-Object -First 3
+foreach ($t in $drill) {
+    Write-Host "`n-- Détails pour: $($t.Path) --" -ForegroundColor Magenta
+    $subs = Get-ChildItem -LiteralPath $t.Path -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $s = Get-FolderSizeBytes -Path $_.FullName
+        [pscustomobject]@{
+            Path   = $_.FullName
+            SizeGB = [math]::Round($s / 1GB, 2)
         }
+    } | Where-Object { $_.SizeGB -ge $SubThresholdGB } | Sort-Object SizeGB -Descending
+    if ($subs.Count -gt 0) {
+        $subs | Select-Object Path, SizeGB | Format-Table -AutoSize
+    } else {
+        Write-Host "Aucun sous-dossier ≥ $SubThresholdGB Go." -ForegroundColor DarkYellow
     }
-
-    return sb.ToString();
 }
 
-// --- Helpers à ajouter ---
+# --- 3) Tailles de quelques emplacements Windows connus (si présents) ---
+$known = @(
+    'C:\Windows\WinSxS',
+    'C:\Windows\SoftwareDistribution\Download',
+    'C:\Windows\Installer',
+    'C:\Windows.old',
+    'C:\Users',
+    'C:\ProgramData',
+    'C:\Program Files',
+    'C:\Program Files (x86)'
+) | Where-Object { Test-Path $_ }
 
-// Transforme la valeur .NET en token SQL prêt pour l’INSERT,
-// en évitant d’émettre NULL pour une colonne NOT NULL
-private string FormatValueToken(object raw, string dt, bool isNullable)
-{
-    // Null ou "NULL" explicite ou chaîne vide ?
-    bool isNullish =
-        raw == null ||
-        (raw is string s0 && (string.IsNullOrWhiteSpace(s0) || s0.Equals("NULL", StringComparison.OrdinalIgnoreCase)));
-
-    if (isNullish)
-    {
-        if (isNullable)
-            return "NULL";                  // OK de mettre NULL
-        else
-            return GetTypeFallback(dt);     // pas nullable -> fallback raisonnable
-    }
-
-    // Chaîne
-    if (raw is string s)
-    {
-        // si la chaîne est vide mais colonne NOT NULL -> ''
-        if (s.Length == 0 && !isNullable)
-            return "N''";
-
-        // déjà au format SQL ? (commence par N' et se termine par ')
-        if (s.Length >= 2 && s[0] == 'N' && s[1] == '\'' && s.EndsWith("'"))
-            return s;
-
-        // Datetime ISO ? -> CONVERT(datetime2(0),'...',126)
-        if (dt.StartsWith("date", StringComparison.OrdinalIgnoreCase) ||
-            dt.StartsWith("datetime", StringComparison.OrdinalIgnoreCase) ||
-            dt.StartsWith("smalldatetime", StringComparison.OrdinalIgnoreCase))
-        {
-            // laisse la proc gérer le convert, mais formate proprement
-            // si la valeur ressemble déjà à 'YYYY-...Z' on garde comme littéral
-            var lit = EscapeSqlLiteralN(s);
-            if (lit == "N''" && !isNullable)
-                return "N''";
-            // On enveloppe par CONVERT pour rester robuste
-            return $"CONVERT(datetime2(0), {lit.Substring(1)}, 126)"; // lit = N'...'
-        }
-
-        // Types texte -> N'...'
-        return EscapeSqlLiteralN(s);
-    }
-
-    // Booléen
-    if (raw is bool b)
-        return b ? "1" : "0";
-
-    // Numériques
-    if (raw is byte || raw is sbyte || raw is short || raw is ushort ||
-        raw is int || raw is uint || raw is long || raw is ulong ||
-        raw is float || raw is double || raw is decimal)
-        return Convert.ToString(raw, System.Globalization.CultureInfo.InvariantCulture);
-
-    // DateTime/.Offset
-    if (raw is DateTime dtm)
-        return $"CONVERT(datetime2(0), N'{dtm:yyyy-MM-ddTHH:mm:ss}', 126)";
-    if (raw is DateTimeOffset dto)
-        return $"CONVERT(datetime2(0), N'{dto:yyyy-MM-ddTHH:mm:ss}', 126)";
-
-    // Fallback générique : ToString comme texte
-    return EscapeSqlLiteralN(Convert.ToString(raw, System.Globalization.CultureInfo.InvariantCulture) ?? "");
+if ($known.Count -gt 0) {
+    Write-Host "`n== Emplacements connus ==" -ForegroundColor Cyan
+    $known | ForEach-Object {
+        $bytes = Get-FolderSizeBytes -Path $_
+        [pscustomobject]@{ Path = $_; SizeGB = [math]::Round($bytes / 1GB, 2) }
+    } | Sort-Object SizeGB -Descending | Format-Table -AutoSize
 }
 
-// Fallback “raisonnable” pour NOT NULL selon le type SQL
-private string GetTypeFallback(string dt)
-{
-    dt = (dt ?? "").ToLowerInvariant();
-
-    if (dt == "int" || dt == "bigint" || dt == "smallint" || dt == "tinyint")
-        return "0";
-
-    if (dt == "bit")
-        return "0";
-
-    if (dt.StartsWith("decimal") || dt.StartsWith("numeric") || dt.StartsWith("money") || dt.StartsWith("float") || dt.StartsWith("real"))
-        return "0";
-
-    if (dt.StartsWith("date")) // date, datetime, datetime2, smalldatetime
-        return "CONVERT(datetime2(0), N'1900-01-01T00:00:00', 126)";
-
-    // nvarchar, nchar, varchar, char, text, ntext, etc.
-    return "N''";
-}
-
-// Quote + N prefix + échappement des quotes
-private string EscapeSqlLiteralN(string s)
-{
-    if (s == null) return "NULL";
-    return "N'" + s.Replace("'", "''") + "'";
-}
+Write-Host "`nAnalyse terminée." -ForegroundColor Cyan
