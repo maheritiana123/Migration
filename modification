@@ -1,1 +1,8 @@
-Get-ChildItem C:\ -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*.sys" } | Select Name,@{n="SizeGB";e={[math]::Round($_.Length/1GB,2)}}
+$ThresholdGB = 10
+Get-ChildItem C:\ -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $size = (Get-ChildItem $_.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    [PSCustomObject]@{
+        Path   = $_.FullName
+        SizeGB = [math]::Round($size / 1GB, 2)
+    }
+} | Where-Object { $_.SizeGB -ge $ThresholdGB } | Sort-Object SizeGB -Descending
