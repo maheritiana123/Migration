@@ -1,8 +1,1 @@
-function Get-FolderSizeBytes {
-    param([string]$Path)
-    try {
-        $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
-                Measure-Object -Property Length -Sum).Sum
-        if ($null -eq $sum) { 0 } else { [int64]$sum }
-    } catch { 0 }
-}
+Get-ChildItem "C:\Windows\WinSxS" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum | ForEach-Object { "{0:N2} GB" -f ($_.Sum / 1GB) }
