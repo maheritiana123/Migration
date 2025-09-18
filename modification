@@ -1,73 +1,8 @@
-# === Paramètres ===
-$Drive = 'C:\'
-$ThresholdGB = 10
-$SubThresholdGB = 5   # seuil pour le détail des sous-dossiers des 3 plus gros
-
-# --- Petite fonction utilitaire : taille d'un dossier (en octets) ---
 function Get-FolderSizeBytes {
     param([string]$Path)
     try {
-        $sum = (Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+        $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
                 Measure-Object -Property Length -Sum).Sum
         if ($null -eq $sum) { 0 } else { [int64]$sum }
     } catch { 0 }
 }
-
-Write-Host "Analyse de l'espace disque sur $Drive (seuil: $ThresholdGB Go)..." -ForegroundColor Cyan
-
-# --- 1) Plus gros dossiers au 1er niveau de C:\ ---
-$top = Get-ChildItem -LiteralPath $Drive -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
-    $sizeBytes = Get-FolderSizeBytes -Path $_.FullName
-    [pscustomobject]@{
-        Path      = $_.FullName
-        SizeGB    = [math]::Round($sizeBytes / 1GB, 2)
-        SizeBytes = $sizeBytes
-    }
-} | Where-Object { $_.SizeGB -ge $ThresholdGB } | Sort-Object SizeBytes -Descending
-
-if ($top.Count -eq 0) {
-    Write-Host "Aucun dossier > $ThresholdGB Go trouvé au 1er niveau de $Drive." -ForegroundColor Yellow
-} else {
-    Write-Host "`n== Dossiers > $ThresholdGB Go à la racine de $Drive ==" -ForegroundColor Green
-    $top | Select-Object Path, SizeGB | Format-Table -AutoSize
-}
-
-# --- 2) Détail des sous-dossiers pour les 3 plus gros ---
-$drill = $top | Select-Object -First 3
-foreach ($t in $drill) {
-    Write-Host "`n-- Détails pour: $($t.Path) --" -ForegroundColor Magenta
-    $subs = Get-ChildItem -LiteralPath $t.Path -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        $s = Get-FolderSizeBytes -Path $_.FullName
-        [pscustomobject]@{
-            Path   = $_.FullName
-            SizeGB = [math]::Round($s / 1GB, 2)
-        }
-    } | Where-Object { $_.SizeGB -ge $SubThresholdGB } | Sort-Object SizeGB -Descending
-    if ($subs.Count -gt 0) {
-        $subs | Select-Object Path, SizeGB | Format-Table -AutoSize
-    } else {
-        Write-Host "Aucun sous-dossier ≥ $SubThresholdGB Go." -ForegroundColor DarkYellow
-    }
-}
-
-# --- 3) Tailles de quelques emplacements Windows connus (si présents) ---
-$known = @(
-    'C:\Windows\WinSxS',
-    'C:\Windows\SoftwareDistribution\Download',
-    'C:\Windows\Installer',
-    'C:\Windows.old',
-    'C:\Users',
-    'C:\ProgramData',
-    'C:\Program Files',
-    'C:\Program Files (x86)'
-) | Where-Object { Test-Path $_ }
-
-if ($known.Count -gt 0) {
-    Write-Host "`n== Emplacements connus ==" -ForegroundColor Cyan
-    $known | ForEach-Object {
-        $bytes = Get-FolderSizeBytes -Path $_
-        [pscustomobject]@{ Path = $_; SizeGB = [math]::Round($bytes / 1GB, 2) }
-    } | Sort-Object SizeGB -Descending | Format-Table -AutoSize
-}
-
-Write-Host "`nAnalyse terminée." -ForegroundColor Cyan
