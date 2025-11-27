@@ -1,40 +1,42 @@
-# Check-SystemSize.ps1
-# Script pour mesurer les gros dossiers "système" qui peuvent gonfler
+Resaka mony be na acné sévère.
+ 
+(Tsy misy resaka publicité na kely ary fa tena fizaràna sao mba mahasoa ny hafa.)
+ 
+Betsaka ianareo no mahalala fa nanana ary mbola manana olana amin’ny resaka mony ny tenako. Ary matetika mandray fihaonambe iraisam-pirenenan’ny mony. Tsy mbola tena nasehoko anareo kosa nefa hoe toy ny ahoana ny tena fitrangany. Dia toy io amin’ny sary voalohany io izy rehefa tena hanao zavatra izay. Mbola nisy ary ny zava-doza noho io fa sao matahotra eo ianareo ka aleo tsy aseho.
+ 
+Amin’izao izy efa somary mipetraka kely indray aloha satria misy traitement hitako mandaitra amiko, hoteneniko anareo miandalana eo. Fa tena mba te hitantara mihitsy aho aloha, dia vakio hatramin’ny farany raha manana olana amin’ny resaka mony ianao fa mety mba hahasoa anao e !  
+ 
+Nanomboka 24 na 25 taona teo aho vao nisy mony teo amin’ny fiainako. Tsy mba nisy mihitsy nandritry ny fotoana fialana sakana na tamin’ny naha adolantsento. « Acné d’adulte » no ilazana azy hono izany. Misy koa ny milaza hoe « acné hormonale » hono satria ny ahy teo amin’ny faritry ny nangy sy ambany saoka iny foana no mandoza.
+ 
+Nandritr’izay dimy taona mahery izay, dia efa nandramako daholo ny zavatra rehetra, na ny naturel na ny tsy naturel, tena hoe t$y sisa tsy nandramako. Efa nijery dermatologue maro dia maro na tany Madagasikara na taty andafy. Efa nandramana daholo ny karazana traitement mahery vaika rehetra. Somary afaka kely amin’ny voalohany dia avy eo miverina mahery vaika be. Ny ahy sady lay tena kystes ngeza be sy marary be ireny. Ary tena betsaka araka ny hita eto amin’ny sary voalohany. Efa tonga tamin’ilay hoe « acné sévère ».  Tonga amin’ilay fitenenana hoe vay an-kandrina, ka sady marary no mahamenatra. Satria mahamenatra tokoa aloha lay izy, satria aleo dia tenenina hoe ratsy. Tamin’ny tavako aloha tena ratsy fa amin’ny tavan’ny hafa no tsy haiko. Sady heveron’olona fa tsy mitandri-tena, tsy mahavatena dia omemeny an’ity torohevitra volomborona rehetra ity nefa ianao efa tena kivy sy nanao izay azo atao rehetra. Mankarary saina be io resaka mony io fa mety tsy azon’ireo izay mbola tsy sendra azy. Misaora an’ny Tompo, tena misaora ny Tompo raha tsy manana olana amin’ny resaka acné fa tena tsy moramora. Mety misy hiteny hoe « mony ve dia atao mankarary saina, sady amin’izay lehilahy ». Tsy haiko aloha fa samy manana ny mahasalama ny sainy io.  
+ 
+Nandritra izay taona maro niverimberenan’ilay acné izay, dia ny zavatra ho ahosotra foana no notadiavina. (Efa nihinana antibiotiques nandritra ny fotoana maro koa aho kay ka, nomen’ny drematologue. Fa miverina foana e !) Rehefa mba namakafaka anefa dia hita fa misy antony maro avy antatiny ny mahatonga ilay acné. Ho ahy manokana dia ireto hotanisaiko manaraka ireto :  
+ 
+Ny antony voalohany indrindra dia ny siramamy. Tena zava-doza ny siramamy, na tsy ho an’ny resaka mony fotsiny ary. Tsy misy zavatra tsara entin’ny siramamy amin’ny fahasalamana. Ary vao mihinana mamy aho dia tsy maintsy mandrombona sy mamelana ny mony ary tena maventy. Teo amin’ny heritaona mahery teo aho izao no mihezaka tsy mihinana siramamy sy zavatra mamy be intsony.
+ 
+Ny antony faharoa dia ny sakafo. Ny menaka, ny kiendiendy, ny zavatra matavy, ny fast food, ny karazana biscuits, chips, boissons rehetra (izay feno siramamy). Ary indrindra ny toaka, izay sady antony fahatelo. Miezaka mifady an’ireo zavatra rehetra ireo aho. Izaho moa efa tsy mifoka rahateo na dia betsaka ary ianareo no resy lahatra fa mifoka rongony aho. Matetika hihomehezan’ny namana aho rehefa mba mivoaka satria rano no sotroiko fa tsy te hiditra problème amin’ny toaka sy ny cocktails feno siramamy aho.  
 
-$report = @()
-
-function Get-FolderSizeGB($path) {
-    if (Test-Path $path) {
-        $size = (Get-ChildItem $path -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
-        if ($size) {
-            return [math]::Round($size / 1GB, 2)
-        } else {
-            return 0
-        }
-    } else {
-        return "Introuvable"
-    }
-}
-
-$folders = @(
-    "C:\Windows\SoftwareDistribution",
-    "C:\ProgramData\Microsoft\Windows\DeliveryOptimization",
-    "C:\System Volume Information"
-)
-
-foreach ($f in $folders) {
-    $size = Get-FolderSizeGB $f
-    $report += [PSCustomObject]@{
-        Dossier = $f
-        Taille_GB = $size
-    }
-}
-
-# Affiche le rapport dans la console
-$report | Format-Table -AutoSize
-
-# Sauvegarde aussi sur le bureau
-$desktop = [Environment]::GetFolderPath("Desktop")
-$report | Out-File -FilePath "$desktop\SystemSizeReport.txt" -Encoding UTF8
-
-Write-Host "`nRapport enregistré sur le bureau : SystemSizeReport.txt" -ForegroundColor Green
+Ny antony iray farany dia ny masoandro. 
+ 
+Amin’ny ankapobeny izany dia ireo aloha no isan’ny antony voalohany azo andraisana fepetra. Andramo ihany koa ny manao cure détox kely mialohan’ny anaovanao an’ireo. Afaka vidinao eny amin’ny pharmacie.
+ 
+Ny manarak’izay dia hiditra amin’ny zavatra hosorana rehetra amin’izay isika.
+Ny zavatra ilaina voalohany dia ny manadio tarehy foana. Maraina sy hariva, amin’ny gel nettoyant, vidinao eny amin’ny pharmacie, misy karazany maro. Tena mila diovina ny tarehy ary tsy vitan’ny rano fotsiny lay manadio tarehy fa mila tosika fameno kely toy ny faritra rehetra amin’ny vatana ihany.
+Ny zavatra tsy maintsy atao faharoa dia ny resaka hydratation. Na mitera-menaka toy ny inona ary ny tarehanao dia tena mila hydratation, mila crème hydratante, maraina sy hariva.
+Ny zavatra fahatelo izay tena tsy mbola mahazatra antsika malagasy dia ny protection solaire, izany hoe ny crème solaire na écran solaire. SPF 50 fa ny ambanin’izay tena tsy misy dikany indrindra raha amin’ny tany mafana toa an’i Madagasikara.
+ 
+Ireo rehetra ireo dia misy eny amin’ny pharmacie daholo. Tsy hitonona marques aho hoe ity na ity fa samy manana ny zakan’ny entimanany. Fa amin’ny ankapobeny, tokony handaitra daholo sy tsy tokony hisy atahorana raha vidinao eny amin’ny pharmacie na parapharmacie ireo. Ireo rehetra ireo dia vidinao tsy mila ordonnance.
+ 
+Ity holazaiko manaraka ity kosa, dia tena mila ordonnance avy amin’ny dokotera, raha ho an’ny aty andafy manokana aloha fa ny any Madagasikara no tsy haiko. Kanefa amporisihiko ianao hanantona dokotera aloha. TRÉTINOINE Crème. Io angamba no tena hitako hoe nandaitra indrindra tamin’ny zavatra rehetra efa nataoko hatrizay, nanavotra ny tavako amin’izao. Dimy volana teo aho izao no nampiasa an’io fa tena hitako hoe mandaitra. Izy io dia fanafody anisan’ny rétinoïde mahery indrindra. Ny rétinoïdes dia singa entina miady amin’ny acné sy ny fahanteran’ny hoditra (raha tsotsorina).
+ 
+Tandremo tena tandremo fa tena mahery dia mahery io Trétinoine io ka mila mandeha tsikelikely ny fampiasanao azy. Ny torohevitro amin’ny fampiasana azy dia izao :
+- Voalohany indrindra aloha, fantaro fa amin’ny alina ihany izy io no azo ampiasana. Tena fady tena fay ny mitondra azy amin’ny andro mazava na amin’ny masoandro. Averiko indray : FADY ATAO AMIN’NY ANDRO ATOANDRO.
+- Manarak’izay dia tsy maintsy mampiasa protection solaire ianao raha manao traitement amin’ny trétinoine. Averiko indray : TSY MAINTSY MANAO ÉCRAN SOLAIRE amin’ny atoandro na maloka aza ny andro.
+- Manarak’izay, ataovy tsikelikely aloha ny fampiasana azy. Izany hoe isaky ny telo andro aloha mandritra ny iray volana eo ohatra. Dia aveo rehefa mihazatra ny hoditrao dia isaky ny roa andro, dia rehefa tena hoe zatra tanteraka dia azonao atao isan-kariva, fa mba asio fotoana kely ihany mba maka aina lay hoditra iray na roa andro ohatra. Amin’ny voalohany tsy maintsy miofaka be ny tarehy, aza ajanona nefa fa normal iny. Elanelano tsara foana fotsiny ny fanosorana azy. Rehefa mihazatra ianao dia tsy miofaka firy intsony.
+- Ny fomba fanosoranao azy : Manasa tarehy tsara amin’ilay gel nettoyant noresahako tetsy ambony, avy eo manosotra crème hydratante tsara, dia izay vao manosotra an’ilay trétinoine. Avela ho mainamaina tsara zay vao entina matory. Tsy mila betsaka akory ny ahosotra fa kely otrn angezan’ny petit pois dia mahampy ny tarehy rehetra. Tena tsy manova ninoninona na ataonao kely na ataonao mifotetaka be ary iny ary tsy hampahaingana ny fahasitranana fa vao mainka ary mety hanimba ny tarehinao. Ka kelikely avao !
+- Maraina vao mifoa ianao dia manasa tarehy, manao crème hydratante ary tsy manadino an’ilay écran solaire vao mivoaka ny trano.
+ 
+Averiko indray fa fanafody izy io ka mila mandalo dokotera aloha ianao maka ordonnance sy manontany tsara ny dokotera. Izaho tsy dokotera ary tsy tompon’andraikitra raha nihositrositra fahatany tany ianao ka nahita loza. Makanesa aloha any amin’ny dokotera, na dokotera tsotra na dermatologue dia resaho azy hoe te hanao an’ity traitement Trétitoine ity aho dia ahoana sy ahoana. Tandremo, Trétinoine crème ihany no noresahiko teto, ary crème ihany no nampiasaiko fa tsy nampiasa fanafody hoanina aho. Misy fanafody hoanina koa mantsy ny trétinoine fa tena aza miditra amin’iny fa tena problème be !  
+ 
+Dia izay, hitako hoe nandaitra tamiko izay rehetra izay, dia zaraiko satria fantatro hoe mafy ny mitondra acné. Tsy afaka mandeha ila ireo rehetra ireo. Raha hampiasa trétinoine ianao nefa sady tsy mitandrina amin’ ny sakafo hoaninao sy ny fahasalamanao dia mety tsy handaitra mihitsy. Raha misy olon-kafa manana expérience hafa hoe nandaitra taminy dia zarap ao amin’ny commentaires.
+Mirary soa indrindra, tsy maintsy resy io mony be io e, aiza ny tsy ho vizaka eo io ! Mahereza dia aza adino ny crème solaire !
