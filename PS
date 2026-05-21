@@ -1,6 +1,12 @@
-// AVANT
-string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes);
+// 4.2) Relations étendues
+var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
 
-// APRÈS (on passe la méta en plus)
-var meta = GetColumnsMetaCached(tableName); // tu l’as déjà
-string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes, meta);
+foreach (var rel in orderedExtended)
+{
+    var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
+
+    ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
+
+    if (nullCols != null && nullCols.Count > 0)
+        FixupDeferredForeignKeys(rel, nullCols);
+}
