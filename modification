@@ -1,24 +1,103 @@
-public class RequiredIfNotAttribute : ValidationAttribute
-{
-    private readonly string _propertyName;
-    private readonly object _forbiddenValue;
-
-    public RequiredIfNotAttribute(string propertyName, object forbiddenValue)
-    {
-        _propertyName = propertyName;
-        _forbiddenValue = forbiddenValue;
-    }
-
-    protected override ValidationResult IsValid(object value, ValidationContext context)
-    {
-        var property = context.ObjectType.GetProperty(_propertyName);
-        var propertyValue = property.GetValue(context.ObjectInstance);
-
-        if (!Equals(propertyValue, _forbiddenValue) && string.IsNullOrEmpty(value as string))
-        {
-            return new ValidationResult($"{context.MemberName} est requis.");
-        }
-
-        return ValidationResult.Success;
-    }
-}
+=== MIGRATION START ===
+[LOAD] Normal tables      : addomains, options, adfederations, servers, adsites, imssites, views, emails, logs, bitlocker_keys, migrationdata, Identities, eventlog_errors
+[LOAD] Extended relations : associated_devices, gedscanners, ilsprinters, localprinters, names, printers, printservers, networkprinters, adspaths, usbprinters, adspaths_imssites, views_servers, workstations_options, eventclasses, certificates, eventclasses_emails, securedprinters, eventlog, Perimeters, workstations, Resources
+[LOAD] Pure relations     : settings
+_______________________
+[IMPORT] addomains
+4 lignes à importer (batch=500)...
+Table addomains : 4 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] options
+693 lignes à importer (batch=500)...
+Table options : 600 insérées, 93 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] adfederations
+6 lignes à importer (batch=500)...
+Table adfederations : 6 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] servers
+79 lignes à importer (batch=500)...
+Table servers : 79 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] adsites
+6 lignes à importer (batch=500)...
+Table adsites : 6 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] imssites
+2 lignes à importer (batch=500)...
+Table imssites : 2 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] views
+CSV vide : views
+_______________________
+[IMPORT] emails
+CSV vide : emails
+_______________________
+[IMPORT] logs
+7 lignes à importer (batch=500)...
+Table logs : 7 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] bitlocker_keys
+2150 lignes à importer (batch=500)...
+Table bitlocker_keys : 2150 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] migrationdata
+CSV vide : migrationdata
+_______________________
+[IMPORT] Identities
+2 lignes à importer (batch=500)...
+Table Identities : 2 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] eventlog_errors
+5000 lignes à importer (batch=500)...
+Table eventlog_errors : 5000 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[FIXUP] workstations : mise à jour FK différées (wks_tobereplaced_workstation_id)
+_______________________
+[IMPORT] printers
+24 lignes à importer (batch=500)...
+Table printers : 24 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] printservers
+42 lignes à importer (batch=500)...
+Table printservers : 42 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] adspaths
+7 lignes à importer (batch=500)...
+Table adspaths : 7 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] views_servers
+CSV vide : views_servers
+_______________________
+[IMPORT] eventclasses
+34 lignes à importer (batch=500)...
+Table eventclasses : 31 insérées, 3 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] Perimeters
+CSV vide : Perimeters
+_______________________
+[IMPORT] Resources
+15 lignes à importer (batch=500)...
+Table Resources : 15 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] adspaths_imssites
+7 lignes à importer (batch=500)...
+Table adspaths_imssites : 7 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[IMPORT] eventclasses_emails
+CSV vide : eventclasses_emails
+_______________________
+[IMPORT] eventlog
+4871 lignes à importer (batch=500)...
+Table eventlog : 4871 insérées, 0 doublons ignorés, 0 erreurs, 387 lignes sautées (structure).
+_______________________
+[IMPORT] workstations
+81 lignes à importer (batch=500)...
+Table workstations : 81 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+_______________________
+[FIXUP] workstations : mise à jour FK différées (wks_tobereplaced_workstation_id)
+_______________________
+[IMPORT PURE] settings
+1 lignes à importer (batch=500)...
+Table settings : 1 insérées, 0 doublons ignorés, 0 erreurs, 0 lignes sautées (structure).
+=== MIGRATION DONE ===
