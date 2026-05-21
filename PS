@@ -1,69 +1,12 @@
-private ImportPlan BuildPlan(List<string> normalTables,
-                     List<string> extendedTables,
-                     Dictionary<string, List<ForeignKeyInfo>> fkMap)
+// Ajoute les nœuds cycliques en fin d’ordre pour être parcourus quand même
+foreach (var scc in sccs)
+    order.AddRange(scc);
+
+// Filet de sécurité : aucune table ne doit disparaître
+foreach (var n in nodes)
 {
-    var plan = new ImportPlan();
-
-    // Tri topo parents
-    var (orderParents, sccParents) = TopoSortWithCycles(normalTables, fkMap);
-    plan.NormalOrder.AddRange(orderParents);
-    MarkDeferredFksForCycles(sccParents, fkMap, plan);
-
-    // Tri topo étendues
-    var (orderExt, sccExt) = TopoSortWithCycles(extendedTables, fkMap);
-    plan.ExtendedOrder.AddRange(orderExt);
-    MarkDeferredFksForCycles(sccExt, fkMap, plan);
-
-    return plan;
+    if (!order.Contains(n, StringComparer.OrdinalIgnoreCase))
+        order.Add(n);
 }
-// Kahn + SCC: renvoie ordre topo partiel + SCC (cycles)
-private (List<string> order, List<HashSet<string>> sccs) TopoSortWithCycles(
-    List<string> nodes,
-    Dictionary<string, List<ForeignKeyInfo>> fkMap)
-{
-    // Graphe: edge A->B si A a une FK vers B (A dépend de B)
-    var deps = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-    var rev = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
 
-    foreach (var n in nodes)
-    {
-        deps[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        rev[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    }
-
-    foreach (var n in nodes)
-    {
-        if (!fkMap.TryGetValue(n, out var fks)) continue;
-        foreach (var fk in fks)
-        {
-            if (!nodes.Contains(fk.ReferencedTableName, StringComparer.OrdinalIgnoreCase)) continue;
-            deps[n].Add(fk.ReferencedTableName);
-            rev[fk.ReferencedTableName].Add(n);
-        }
-    }
-
-    var order = new List<string>();
-    var q = new Queue<string>(deps.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key));
-    var inDeg = deps.ToDictionary(kv => kv.Key, kv => kv.Value.Count, StringComparer.OrdinalIgnoreCase);
-
-    while (q.Count > 0)
-    {
-        var u = q.Dequeue();
-        order.Add(u);
-        foreach (var v in rev[u])
-        {
-            inDeg[v]--;
-            if (inDeg[v] == 0) q.Enqueue(v);
-        }
-    }
-
-    // SCC (Kosaraju simple)
-    var remaining = inDeg.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
-    var sccs = ComputeSccs(remaining, deps, rev);
-
-    // Ajoute les nœuds cycliques en fin d’ordre pour être parcourus quand même
-    foreach (var scc in sccs)
-        order.AddRange(scc);
-
-    return (order.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sccs);
-}
+return (order.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sccs);
