@@ -1,909 +1,1344 @@
-public class DatabaseMigrator
+using MIDW_CLIENTLib;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+
+namespace PXE_JOBS.PXE1O003
 {
-    private readonly string _importPath;
-    private readonly HashSet<string> _importedTables;
-    private readonly DynamicSql _transactionSql;
-    private Dictionary<string,HashSet<string>> _uniqueKeyTracker = new Dictionary<string, HashSet<string>>();
-    private readonly HashSet<string> _pureRelations = new HashSet<string>();
-    private readonly HashSet<string> _extendedRelations = new HashSet<string>();
-    private readonly Dictionary<string, Dictionary<object, object>> _idMappings = new Dictionary<string, Dictionary<object, object>>();
-    private readonly HashSet<string> _ignoredTables = new HashSet<string> { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings", "BASE36" };
-
-    public DatabaseMigrator(string importPath)
+    public class DatabaseMigrator
     {
-        _importPath = importPath;
-        _importedTables = new HashSet<string>();
-        _transactionSql = new DynamicSql { Dsn = "PXE1_PXE" };
-    }
-    public void PerformMigration(bool disableForeignKeys = true)
-    {
-        LoadRelationTables();
-
-        if (disableForeignKeys)
-            DisableAllForeignKeys();
-
-        ExecuteTransactionCommand("BEGIN TRANSACTION");
-
-        try
+        private readonly string _importPath;
+        private readonly string _siteSource;
+        private readonly Dictionary<string, Dictionary<object, object>> _idMappings = new Dictionary<string, Dictionary<object, object>>();
+        private readonly HashSet<string> _ignoredTables = new HashSet<string> { "AD_DOMAIN", "AD_FEDERATION", "AD_SITE_LOCATION", "ADSPATH", "ADSPATH_IMSSITE", "BASE36", "BANK", "BASEREJECT", "EVENT_CATEGORIES" , "EVENTS", "FEDERATION", "HISTORY", "HSTPOVAR", "IMSSITE", "PERIMETER", "POSTE", "PosteEtat" , "PosteVarEnv", "PREFIX", "SASSRV", "SMSSITECODE", "SRV", "SRV_IMP", "VERROUPOSTE" };
+        private readonly Dictionary<string, HashSet<string>> _existingIdCache = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, Dictionary<string, ColMeta>> _colMetaCache = new Dictionary<string, Dictionary<string, ColMeta>>(StringComparer.OrdinalIgnoreCase);
+        private const char RS = (char)0x1E; // row separator
+        private const char CS = (char)0x1D; // column separator
+        private int _lastInsertedCount = 0;
+        public DatabaseMigrator(string importPath, string site)
         {
-            var orchestrator = new MigrationOrchestrator(
-                _pureRelations,
-                _extendedRelations,
-                _idMappings,
-                GetForeignKeyInfo,
-                ImportTable,
-                ImportPureRelationTable,
-                ImportExtendedRelationTable,
-                GetAllTables
-            );
-
-            orchestrator.PerformGlobalImport();
-
-            ExecuteTransactionCommand("COMMIT TRANSACTION");
+            _importPath = importPath;
+            _siteSource = site;
         }
-        catch (Exception ex)
+        public void PerformMigration()
         {
-            ExecuteTransactionCommand("ROLLBACK TRANSACTION");
-            Console.WriteLine($"Erreur de migration: {ex.Message}");
-            throw;
-        }
-        finally
-        {
-            if (disableForeignKeys)
-            {
-                EnableAllForeignKeys();
-                ValidateDataIntegrity();
-            }
-        }            
-    }
-    private void ImportExtendedRelationTable(string tableName)
-    {
-        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-        if (!File.Exists(csvPath))
-        {
-            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-            return;
-        }
-        var fkInfo = GetForeignKeyInfo(tableName);
-        var nonFkColumns = GetTableColumns(tableName)
-                          .Except(fkInfo.Select(fk => fk.ColumnName))
-                          .ToList();
+            Console.WriteLine("=== MIGRATION START ===");
 
-        int inserted = 0;
-        int enErreur = 0;
-        foreach (var record in ReadCsvFile(csvPath, tableName))
-        {
+            // 1) Tables (déjà filtrées par GetAllTables)
+            var allTables = GetAllTables(); 
+
+            // 2) Partition 
+            LoadRelationTables(allTables, out var normalTables, out var extendedRelations, out var pureRelations);
+
+            // 3) Dépendances & cycles (SCC)
+            var fkMap = GetForeignKeysByTable(allTables); 
+            var plan = BuildPlan(normalTables, extendedRelations, fkMap);
+
             try
             {
-                // Validation des FK
-                var mappedRecord = ValidateAndMapForeignKeys(record, fkInfo);
-                if (mappedRecord == null) continue;
-
-                // Ajout des colonnes non-FK
-                foreach (var col in nonFkColumns)
+                // 4.1) Parents (ordre topologique + cycles gérés par FK différées)
+                foreach (var step in plan.NormalOrder)
                 {
-                    mappedRecord[col] = record[col];
+                    var nullCols = plan.DeferredFkByTable.TryGetValue(step, out var set) ? set : null;
+                    ImportTableCommon(step, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
+                }
+                // Fix-up des FK différées (celles mises à NULL dans les cycles)
+                foreach (var kv in plan.DeferredFkByTable)
+                    FixupDeferredForeignKeys(kv.Key, kv.Value);
+
+                // 4.2) Relations étendues (mêmes règles que parents, mais après eux)
+                var orderedExtended = OrderTablesByDependencies(plan.ExtendedOrder, plan.DeferredFkByTable);
+                foreach (var rel in orderedExtended)
+                {
+                    var nullCols = plan.DeferredFkByTable.TryGetValue(rel, out var set) ? set : null;
+                    ImportTableCommon(rel, forceNullFK: false, batchSize: 500, nullFkColumns: nullCols);
+                    if (nullCols != null && nullCols.Count > 0)
+                        FixupDeferredForeignKeys(rel, nullCols);
                 }
 
-                bool hasIdentity = HasIdentityColumn(tableName);
-                string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
-                InsertAndGetNewId(tableName, mappedRecord, hasIdentity, pkColumn);
-                inserted++;
-            }
-            catch (Exception)
-            {
-                enErreur++;
-            }               
-        }
-        Console.WriteLine($"{enErreur} ligne(s) en erreur trouvée(s)");
-        Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");
-    }
-    private void ImportPureRelationTable(string tableName)
-    {
-        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-        if (!File.Exists(csvPath))
-        {
-            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-            return;
-        }
-        var fkInfo = GetForeignKeyInfo(tableName);
-        var records = ReadCsvFile(csvPath,tableName);
-        int inserted = 0;
-        int enErreur = 0;
-        foreach (var record in records)
-        {
-            try
-            {
-                // Validation et mapping des FK
-                var mappedRecord = ValidateAndMapForeignKeys(record, fkInfo);
-                if (mappedRecord == null) continue;
-
-                // Insertion directe
-                bool hasIdentity = HasIdentityColumn(tableName);
-                string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
-                InsertAndGetNewId(tableName, mappedRecord, hasIdentity, pkColumn);
-                inserted++;
-            }
-            catch (Exception)
-            {
-                enErreur++;
-            }
-            
-        }
-        Console.WriteLine($"{enErreur} ligne(s) en erreur trouvée(s)");
-        Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");
-    }
-    private Dictionary<string, object> ValidateAndMapForeignKeys(Dictionary<string, object> record, List<ForeignKeyInfo> fkInfo)
-    {
-        var result = new Dictionary<string, object>();
-
-        foreach (var fk in fkInfo)
-        {
-            if (!record.ContainsKey(fk.ColumnName))
-            {
-                Console.WriteLine($"[ERREUR] Colonne FK manquante : {fk.ColumnName}");
-                return null;
-            }
-
-            var originalValue = record[fk.ColumnName];
-
-            // Si la valeur est NULL, on vérifie si la colonne l'accepte
-            if (originalValue == null || originalValue.ToString() == "")
-            {
-                bool nullable = IsForeignKeyNullable(fk);
-                if (nullable)
+                // 4.3) Relations pures (FK–FK, pas d’IDENTITY). On boucle jusqu’à stabilisation.
+                foreach (var rel in pureRelations)
                 {
-                    result[fk.ColumnName] = null; // autorisé => on garde la ligne
-                    continue;
+                    ImportPureTableWithProc(rel, batchSize: 500);
+                }
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[FATAL] " + ex.Message);
+                throw;
+            }
+
+            Console.WriteLine("=== MIGRATION DONE ===");
+        }
+                
+        /// <summary>
+        /// Sépare les tables en trois catégories :
+        /// 1. normalTables : toutes les tables “classiques”
+        /// 2. extendedRelations : tables relationnelles qui ont AU MOINS une FK + colonnes additionnelles
+        /// 3. pureRelations : tables relationnelles contenant UNIQUEMENT des FKs (ex : tables de jonction N-N)
+        /// </summary>
+        private void LoadRelationTables(
+            List<string> allTables,
+            out List<string> normalTables,
+            out List<string> extendedRelations,
+            out List<string> pureRelations)
+        {
+            normalTables = new List<string>();
+            extendedRelations = new List<string>();
+            pureRelations = new List<string>();
+
+            foreach (var table in allTables)
+            {
+                var fkInfos = GetForeignKeyInfo(table);
+                var cols = GetTableColumns(table); // List<string> noms de colonnes
+                var fkCols = new HashSet<string>(fkInfos.Select(f => f.ColumnName), StringComparer.OrdinalIgnoreCase);
+
+                if (fkCols.Count == 0)
+                {
+                    // Pas de FK => table normale
+                    normalTables.Add(table);
+                }
+                else if (fkCols.Count == cols.Count)
+                {
+                    // Tous les champs sont des FK => pure relation (jonction)
+                    pureRelations.Add(table);
                 }
                 else
                 {
-                    Console.WriteLine($"[ERREUR] Valeur NULL interdite pour {fk.ColumnName} dans {fk.ReferencedTableName}");
-                    return null; // on rejette si NON NULL
+                    // Table relationnelle avec colonnes supplémentaires => étendue
+                    extendedRelations.Add(table);
                 }
             }
 
-            // On vérifie que la table de mapping est bien là
-            if (!_idMappings.ContainsKey(fk.ReferencedTableName))
+            Console.WriteLine($"[LOAD] Normal tables      : {string.Join(", ", normalTables)}");
+            Console.WriteLine($"[LOAD] Extended relations : {string.Join(", ", extendedRelations)}");
+            Console.WriteLine($"[LOAD] Pure relations     : {string.Join(", ", pureRelations)}");
+        }        
+        private bool IsForeignKeyNullable(ForeignKeyInfo fk)
+        {
+
+            DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
+            string req = @"EXEC dbo.[batch_get_fk_column_nullable] @table = $t$,@col = $c$";
+            sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("t", fk.TableName, true, 0);
+            sql.SetSecureParam("c", fk.ColumnName, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute();
+
+            if (sql.ReturnedRows(1, 1) > 0)
             {
-                Console.WriteLine($"[ERREUR] Mapping manquant pour : {fk.ReferencedTableName}");
-                return null;
+                string nullable = sql.GetValueUsingColName(1, "is_nullable", 1, 1);
+                return nullable == "YES";
             }
 
-            if (!_idMappings[fk.ReferencedTableName].TryGetValue(originalValue, out var newId))
+            return false; // si on ne sait pas, on préfère bloquer
+        }        
+        
+        private List<string> GetTableColumns(string tableName)
+        {
+            var columns = new List<string>();
+
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
+            sql.AddDirectRequest(@"EXEC [dbo].[batch_get_table_columns] @TableName = $table$", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("table", tableName, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
+
+            var colCount = sql.ReturnedRows(1, 1);
+
+            for (int r = 1; r <= colCount; r++)
             {
-                Console.WriteLine($"[ERREUR] Valeur FK introuvable : {fk.ColumnName}={originalValue} dans {fk.ReferencedTableName}");
-                return null;
+                var colName = sql.GetValueUsingColName(r, "COLUMN_NAME", 1, 1);
+                if (!string.IsNullOrEmpty(colName))
+                    columns.Add(colName);
             }
-
-            result[fk.ColumnName] = newId;
+            return columns;
         }
 
-        return result;
-    }
-    private bool IsForeignKeyNullable(ForeignKeyInfo fk)
-    {
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest(@"
-        SELECT is_nullable
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = $table$
-        AND COLUMN_NAME = $col$",
-          MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-        sql.SetSecureParam("table", fk.TableName, true, 0);
-        sql.SetSecureParam("col", fk.ColumnName, true, 0);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute();
-
-        if (sql.ReturnedRows(1, 1) > 0)
+        private string GetColumnType(string tableName, string columnName)
         {
-            string nullable = sql.GetValueUsingColName(1, "is_nullable", 1, 1);
-            return nullable == "YES";
+            var columns = new HashSet<string>();
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
+            sql.AddDirectRequest(@"EXEC [dbo].[batch_get_table_columns_type] @TableName = $table$ , @ColumnName = $col$ ", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("table", tableName, true, 0);
+            sql.SetSecureParam("col", columnName, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
+            return  sql.GetValueUsingColName(1, "DATA_TYPE", 1, 1);
         }
 
-        return false; // si on ne sait pas, on préfère bloquer
-    }       
-    
-    private void ExecuteTransactionCommand(string command)
-    {
-        var sql = new DynamicSql
+        private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
         {
-            Dsn = "PXE1_PXE"
-        };            
-        sql.AddDirectRequest(command, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-    }
+            var fkList = new List<ForeignKeyInfo>();
 
-    private void VisitImproved(string table,
-                             Dictionary<string, List<string>> dependencies,
-                             HashSet<string> visited,
-                             HashSet<string> temporaryMarks,
-                             List<string> result)
-    {
-        if (temporaryMarks.Contains(table))
-        {
-            // Ne plus lever d'exception, le traitement se fait ailleurs
-            return;
-        }
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
+            sql.AddDirectRequest(@"EXEC [dbo].[batch_get_table_foreign_keys] @TableName = $table$ ", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("table", tableName, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
 
-        if (!visited.Contains(table))
-        {
-            temporaryMarks.Add(table);
-
-            if (dependencies.TryGetValue(table, out var deps))
+            var rowCount = sql.ReturnedRows(1, 1);
+            for (int i = 1; i <= rowCount; i++)
             {
-                foreach (var dep in deps)
+                fkList.Add(new ForeignKeyInfo
                 {
-                    VisitImproved(dep, dependencies, visited, temporaryMarks, result);
-                }
+                    TableName= tableName,
+                    ColumnName = sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1),
+                    ReferencedTableName = sql.GetValueUsingColName(i, "REFERENCED_TABLE", 1, 1),
+                    IsNullable = sql.GetValueUsingColName(i, "IS_NULLABLE", 1, 1) == "1"
+                });
             }
 
-            temporaryMarks.Remove(table);
-            visited.Add(table);
-            result.Add(table);
-        }
-    }
+            return fkList;
+        }            
 
-    private DynamicSql ExecuteProcedure(string procedure,string TableName = null,string ColumnName = null,string referencedTable = null,string ReferenceColumn = null)
-    {
-        string request = @"EXEC [dbo].[" + procedure + "] ";
-        DynamicSql sql = new DynamicSql();
-        sql.Dsn = "PXE1_PXE";            
-
-        if (!string.IsNullOrEmpty(TableName))
-            request += "@TableName = $table$ ";
-        if (!string.IsNullOrEmpty(ColumnName))
-            request += ", @ColumnName = $col$ ";
-        if (!string.IsNullOrEmpty(referencedTable))
-            request += ", @ReferencedTable = $refTable$ ";
-        if (!string.IsNullOrEmpty(ReferenceColumn))
-            request += ", @ReferenceColumn = $refCol$ ";
-
-        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-        if (!string.IsNullOrEmpty(TableName))
-            sql.SetSecureParam("table", TableName, true, 0);
-        if (!string.IsNullOrEmpty(ColumnName))
-            sql.SetSecureParam("col", ColumnName, true, 0);
-        if (!string.IsNullOrEmpty(referencedTable))
-            sql.SetSecureParam("refTable", referencedTable, true, 0);
-        if (!string.IsNullOrEmpty(ReferenceColumn))
-            sql.SetSecureParam("refCol", ReferenceColumn, true, 0);
-
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);                      
-        return sql;
-    }
-
-    private void VisitForTopologicalSort(string table,
-                               Dictionary<string, List<string>> dependencies,
-                               HashSet<string> visited,
-                               HashSet<string> tempMarks,
-                               List<string> result)
-    {
-        if (tempMarks.Contains(table))
+        private List<string> GetAllTables()
         {
-            // Circularité détectée, mais on continue pour compléter le tri
-            return;
-        }
+            var tables = new List<string>();
 
-        if (!visited.Contains(table))
-        {
-            tempMarks.Add(table);
-
-            if (dependencies.TryGetValue(table, out var deps))
+            try
             {
-                foreach (var dep in deps)
+                // Essaye d'abord la procédure fournie (plus rapide / custom)
+
+                DynamicSql sql = new DynamicSql();
+                sql.Dsn = "PXE1_PXE";
+                sql.AddDirectRequest(@"EXEC [dbo].[batch_select_all_tables]", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(30000);
+
+                if (sql != null && sql.ReturnedRows(1, 1) > 0)
                 {
-                    VisitForTopologicalSort(dep, dependencies, visited, tempMarks, result);
-                }
-            }
-
-            tempMarks.Remove(table);
-            visited.Add(table);
-            result.Add(table);
-        }
-    }
-    private void Visit(
-        string table,
-        Dictionary<string, List<string>> dependencies,
-        HashSet<string> visited,
-        HashSet<string> temporaryMarks,
-        List<string> result,
-        List<List<string>> circularRefs)
-
-    {
-        if (temporaryMarks.Contains(table))
-        {
-            // Détection d'une circularité - on l'ajoute à la liste plutôt que de throw
-            var cycle = new List<string>(temporaryMarks.SkipWhile(t => t != table).Append(table));
-            if (!circularRefs.Any(c => c.SequenceEqual(cycle)))
-            {
-                circularRefs.Add(cycle);
-            }
-            return;
-        }
-
-        if (!visited.Contains(table))
-        {
-            temporaryMarks.Add(table);
-
-            if (dependencies.ContainsKey(table))
-            {
-                foreach (var dependency in dependencies[table])
-                {
-                    Visit(dependency, dependencies, visited, temporaryMarks, result, circularRefs);
-                }
-            }
-
-            temporaryMarks.Remove(table);
-            visited.Add(table);
-            result.Add(table);
-        }
-    }
-    private void DisableAllForeignKeys()
-    {
-        DynamicSql sql = ExecuteProcedure("batch_disable_all_foreign_keys");            
-    }
-    private void ImportTable(string tableName)
-    {            
-        string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{Environment.GetEnvironmentVariable("PFTLSITE")}.csv");
-        if (!File.Exists(csvPath))
-        {
-            Console.WriteLine($"Fichier CSV manquant pour {tableName}");
-            return;
-        }
-
-        bool hasIdentity = HasIdentityColumn(tableName);
-        string pkColumn = hasIdentity ? GetPrimaryKeyColumn(tableName) : null;
-        var records = ReadCsvFile(csvPath, tableName);
-        var idMap = new Dictionary<object, object>();
-
-
-        try
-        {
-            int inserted = 0;
-            int doublons = 0;
-            
-            foreach (var record in records)
-            {
-                // 1. Récupérer les colonnes UNIQUE (autre que l'ID)
-                var uniqueColumns = GetUniqueColumns(tableName);
-                if (uniqueColumns.Count > 0)
-                {
-                    // 2. Générer une signature unique pour la vérification
-                    var keySignature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
-
-                    // 3. Vérifier en mémoire
-                    if (!_uniqueKeyTracker.ContainsKey(tableName))
-                        _uniqueKeyTracker[tableName] = new HashSet<string>();
-
-                    if (_uniqueKeyTracker[tableName].Contains(keySignature))
+                    for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
                     {
-                        doublons++;
+                        var table = sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1);
+                        if (string.IsNullOrWhiteSpace(table)) continue;
+
+                        // Filtre insensible à la casse
+                        if (_ignoredTables.Any(x => x.Equals(table, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+
+                        tables.Add(table);
+                    }
+
+                    return tables;
+                }
+                return tables;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GetAllTables] Proc batch_select_all_tables a échoué : {ex.Message}");
+                return tables;
+            }
+        }
+        private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 500, HashSet<string> nullFkColumns = null)
+        {
+            Console.WriteLine("_______________________");
+            Console.WriteLine($"[IMPORT] {tableName}");
+
+            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{_siteSource}.csv");
+            if (!File.Exists(csvPath)) { Console.WriteLine($"CSV introuvable : {tableName}"); return; }
+
+            var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+            if (lines.Length < 2) { Console.WriteLine($"CSV vide : {tableName}"); return; }
+
+            var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+            var fkInfos = GetForeignKeyInfo(tableName);
+            var identityColumn = GetIdentityColumn(tableName);
+            bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+
+            var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
+
+            var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
+            var oldIdPerRow = new List<string>();
+            int structureSkipped = 0;
+
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var vals = ParseCsvSemicolon(lines[i]);
+                if (vals.Count != columnNames.Count) { structureSkipped++; continue; }
+
+                var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
+
+                string oldId = null;
+                if (hasIdentity && row.ContainsKey(identityColumn))
+                {
+                    oldId = (row[identityColumn] ?? "").ToString();
+                    row.Remove(identityColumn); // ne jamais insérer l'IDENTITY
+                }
+                oldIdPerRow.Add(oldId);
+
+                foreach (var fk in fkInfos)
+                {
+                    if (!row.ContainsKey(fk.ColumnName)) continue;
+
+                    // 1) FK marquée "différée" -> on force NULL à l'insert
+                    if (nullFkColumns != null && nullFkColumns.Contains(fk.ColumnName))
+                    {
+                        row[fk.ColumnName] = null;
                         continue;
                     }
+
+                    // 2) forceNullFK global (rare)
+                    if (forceNullFK)
+                    {
+                        row[fk.ColumnName] = null;
+                        continue;
+                    }
+
+                    // 3) mapping normal
+                    var oldFk = (row[fk.ColumnName] ?? "").ToString();
+                    if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
+
+                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+                        row[fk.ColumnName] = newFk;
+                    else if (IsForeignKeyNullable(fk))
+                        row[fk.ColumnName] = null;
+                    else
+                    {
+                        // >>> PASS-THROUGH : si la valeur existe déjà chez le parent, on la garde telle quelle
+                        if (TryPassThroughExistingId(fk.ReferencedTableName, oldFk))
+                        {
+                            row[fk.ColumnName] = oldFk; // on conserve la valeur existante
+                        }
+                        else
+                        {
+                            throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
+                        }
+                    }
+                }
+                var meta = GetColumnsMetaCached(tableName);
+
+                // Remplir les NULL non autorisés (ou mettre le DEFAULT littéral)
+                foreach (var col in columnNames)
+                {
+                    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!row.ContainsKey(col)) continue;
+
+                    meta.TryGetValue(col, out var m);
+                    if (m?.IsComputed == true) continue;                 // colonnes calculées: on n’insère rien
+
+                    var s = (row[col] ?? "").ToString();
+                    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
+
+                    // nullabilité "fiable" : méta + (filet) sys.columns (DynamicSql)
+                    bool isNullable = (m?.IsNullable ?? true);
+                    if (isNullable)                                      // si la méta dit nullable, on confirme côté SQL
+                        isNullable = IsColumnNullableSql(tableName, col);
+
+                    if (isNullish)
+                    {
+                        if (!isNullable)
+                        {
+                            // 1) DEFAULT de la colonne (simple)
+                            if (m != null && TryParseSimpleDefault(m.ColumnDefault, out var defVal))
+                            {
+                                row[col] = defVal;                       // BuildValuesBatch gèrera le quoting / pass-through
+                                                                         // Console.WriteLine($"[DEFAULT] {tableName}.{col} <- {defVal}");
+                            }
+                            else
+                            {
+                                // 2) Fallback typé (jamais null)
+                                var fb = GetTypeFallback(m?.DataType);
+                                row[col] = fb;
+                                // Console.WriteLine($"[FALLBACK] {tableName}.{col} <- {fb} (type={m?.DataType})");
+                            }
+                        }
+                        else
+                        {
+                            row[col] = null;                             // vraie valeur NULL autorisée
+                        }
+                    }
                 }
 
-                // Insertion
-                var newId = InsertAndGetNewId(tableName, record, hasIdentity, pkColumn);
-                
-                // 5. Mettre à jour le tracker si insertion réussie
-                if (newId != null && uniqueColumns.Count > 0)
+                // Dernier filet: s’assurer qu’aucun NOT NULL ne reste à null
+                foreach (var col in columnNames)
                 {
-                    var signature = string.Join("|", uniqueColumns.Select(col => record[col]?.ToString() ?? "NULL"));
-                    _uniqueKeyTracker[tableName].Add(signature);
+                    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!row.ContainsKey(col)) continue;
+
+                    if (!IsColumnNullableSql(tableName, col))
+                    {
+                        var v = row[col];
+                        if (v == null || (v is string ss && ss.Equals("NULL", StringComparison.OrdinalIgnoreCase)))
+                            row[col] = GetTypeFallback(meta.TryGetValue(col, out var m2) ? m2.DataType : null);
+                    }
+                }
+                prepared.Add(row);
+            }
+
+            if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }
+            var notInsertable = GetNotInsertableColumns(tableName);
+            var insertCols = columnNames.Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) && !notInsertable.Contains(c)).ToList();  
+            string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+
+            int inserted = 0, duplicates = 0, errors = 0;
+            Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+
+            for (int start = 0; start < prepared.Count; start += batchSize)
+            { 
+                int count = Math.Min(batchSize, prepared.Count - start);
+                var batchRows = prepared.GetRange(start, count);
+                var oldIdsBatch = oldIdPerRow.GetRange(start, count);
+
+                var meta = GetColumnsMetaCached(tableName); 
+                string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes, meta);
+
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                string req = @"
+                    EXEC dbo.batch_safe_insert_with_type_conversion
+                    @TableName   = $t$,
+                    @Columns     = $cols$,
+                    @ValuesBatch = $vb$,
+                    @HasIdentity = $hid$,
+                    @IdentityCol = $idcol$;";
+                sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("t", tableName, true, 0);
+                sql.SetSecureParam("cols", columnsSql, true, 0);
+                sql.SetSecureParam("vb", valuesBatch, true, 0);
+                sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
+                sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(60000);
+
+                int rows = sql.ReturnedRows(1, 1);
+                for (int i = 1; i <= rows; i++)
+                {
+                    int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+                    string newId = sql.GetValueUsingColName(i, "NewID", 1, 1);
+                    string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+
+                    // récupère la ligne d’origine de ce batch
+                    Dictionary<string, object> rowForReject = null;
+                    if (rowIndex >= 1 && rowIndex <= batchRows.Count)
+                        rowForReject = batchRows[rowIndex - 1];
+
+                    if (!string.IsNullOrEmpty(err))
+                    {
+                        if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            duplicates++;
+
+                            if (rowForReject != null)
+                                AppendRejectedRow(tableName, insertCols, rowForReject, "Doublon");
+
+                            // mapping aussi quand Doublon si la PS renvoie l'ID existant
+                            if (hasIdentity && !string.IsNullOrEmpty(newId)
+                                && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+                            {
+                                var oldId = oldIdsBatch[rowIndex - 1];
+                                if (!string.IsNullOrEmpty(oldId))
+                                {
+                                    if (!_idMappings.ContainsKey(tableName))
+                                        _idMappings[tableName] = new Dictionary<object, object>();
+
+                                    _idMappings[tableName][oldId] = newId; // on mappe même en doublon
+                                }
+                            }
+                        }
+                        else
+                        {
+                            errors++;
+                            Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
+                            if (rowForReject != null)
+                                AppendRejectedRow(tableName, insertCols, rowForReject, err);
+                        }
+                        continue;
+                    }
+
+                    inserted++;
+
+                    if (hasIdentity && !string.IsNullOrEmpty(newId) && rowIndex >= 1 && rowIndex <= oldIdsBatch.Count)
+                    {
+                        var oldId = oldIdsBatch[rowIndex - 1];
+                        if (!string.IsNullOrEmpty(oldId))
+                        {
+                            if (!_idMappings.ContainsKey(tableName))
+                                _idMappings[tableName] = new Dictionary<object, object>();
+                            if (!_idMappings[tableName].ContainsKey(oldId))
+                                _idMappings[tableName][oldId] = newId;
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
+        }
+        private bool TryPassThroughExistingId(string table, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+
+            if (!_existingIdCache.TryGetValue(table, out var set))
+            {
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var idCol = GetIdentityColumn(table); // si null, prends la colonne FK cible si tu la connais
+                if (string.IsNullOrEmpty(idCol)) return false; // pas d’identity connu → on ne tente pas
+
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                string req = @"EXEC dbo.batch_pass_through_existingId @TableName = $t$,@idCol = $cols$";
+                sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("cols", idCol, true, 0);
+                sql.SetSecureParam("t", table, true, 0);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(60000);
+                for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+                    set.Add(sql.GetValueUsingColName(i, "K", 1, 1) ?? "");
+                _existingIdCache[table] = set;
+            }
+
+            return set.Contains(value);
+        }
+        private List<string> OrderTablesByDependencies(IEnumerable<string> tables, Dictionary<string, HashSet<string>> _deferredFkColumns)
+        {
+            // Build graph: child -> parents
+            var parents = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            var indeg = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var t in tables)
+            {
+                var fks = GetForeignKeyInfo(t);
+                var parentSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var fk in fks)
+                {
+                    // ne compte pas les FK différées
+                    if (_deferredFkColumns.TryGetValue(t, out var set) && set.Contains(fk.ColumnName))
+                        continue;
+                    parentSet.Add(fk.ReferencedTableName);
+                }
+
+                parents[t] = parentSet;
+                indeg[t] = parentSet.Count;
+            }
+
+            // Kahn
+            var q = new Queue<string>(indeg.Where(kv => kv.Value == 0).Select(kv => kv.Key));
+            var order = new List<string>();
+            while (q.Count > 0)
+            {
+                var n = q.Dequeue();
+                order.Add(n);
+                foreach (var m in tables)
+                {
+                    if (m == n) continue;
+                    if (parents.TryGetValue(m, out var p) && p.Contains(n))
+                    {
+                        indeg[m]--;
+                        if (indeg[m] == 0) q.Enqueue(m);
+                    }
+                }
+            }
+
+            // s’il reste un cycle, on laisse ces tables à la fin (elles seront importées avec FK différées déjà prévues)
+            if (order.Count < tables.Count())
+                order.AddRange(tables.Where(t => !order.Contains(t)));
+
+            return order;
+        }
+        private string BuildValuesBatch(List<Dictionary<string, object>> rows,List<string> insertCols,Dictionary<string, string> columnTypes, Dictionary<string, ColMeta> metaByCol)
+        {
+            var RS = ((char)30).ToString(); // record sep
+            var CS = ((char)29).ToString(); // column sep
+
+            var sb = new StringBuilder(rows.Count * 64);
+
+            for (int r = 0; r < rows.Count; r++)
+            {
+                if (r > 0) sb.Append(RS);
+
+                var row = rows[r];
+
+                for (int c = 0; c < insertCols.Count; c++)
+                {
+                    if (c > 0) sb.Append(CS);
+
+                    var col = insertCols[c];
+                    object raw = row.TryGetValue(col, out var v) ? v : null;
+
+                    // Types SQL connus (ex: "nvarchar", "int", "datetime2", etc.)
+                    columnTypes.TryGetValue(col, out var dt);
+                    dt = dt?.ToLowerInvariant() ?? "";
+
+                    // Métadonnées (nullable, computed, default…)
+                    metaByCol.TryGetValue(col, out var meta);
+                    bool isNullable = meta?.IsNullable ?? true;
+
+                    // 1) Normalisation stricte : si vide/"NULL"/null -> fallback si NOT NULL
+                    string token = FormatValueToken(raw, dt, isNullable);
+
+                    sb.Append(token);
+                }
+            }
+
+            return sb.ToString();
+        }
+        // Transforme la valeur .NET en token SQL prêt pour l’INSERT,
+        // en évitant d’émettre NULL pour une colonne NOT NULL
+        private string FormatValueToken(object raw, string dt, bool isNullable)
+        {
+            // Null ou "NULL" explicite ou chaîne vide ?
+            bool isNullish =
+                raw == null ||
+                (raw is string s0 && (string.IsNullOrWhiteSpace(s0) || s0.Equals("NULL", StringComparison.OrdinalIgnoreCase)));
+
+            if (isNullish)
+            {
+                if (isNullable)
+                    return "NULL";                  // OK de mettre NULL
+                else
+                    return GetTypeFallback(dt);     // pas nullable -> fallback raisonnable
+            }
+
+            // Chaîne
+            if (raw is string s)
+            {
+                // si la chaîne est vide mais colonne NOT NULL -> ''
+                if (s.Length == 0 && !isNullable)
+                    return "N''";
+
+                // déjà au format SQL ? (commence par N' et se termine par ')
+                if (s.Length >= 2 && s[0] == 'N' && s[1] == '\'' && s.EndsWith("'"))
+                    return s;
+
+                // Datetime ISO ? -> CONVERT(datetime2(0),'...',126)
+                if (dt.StartsWith("date", StringComparison.OrdinalIgnoreCase) ||
+                    dt.StartsWith("datetime", StringComparison.OrdinalIgnoreCase) ||
+                    dt.StartsWith("smalldatetime", StringComparison.OrdinalIgnoreCase))
+                {
+                    // laisse la proc gérer le convert, mais formate proprement
+                    // si la valeur ressemble déjà à 'YYYY-...Z' on garde comme littéral
+                    var lit = EscapeSqlLiteralN(s);
+                    if (lit == "N''" && !isNullable)
+                        return "N''";
+                    // On enveloppe par CONVERT pour rester robuste
+                    return $"CONVERT(datetime2(0), {lit.Substring(1)}, 126)"; // lit = N'...'
+                }
+
+                // Types texte -> N'...'
+                return EscapeSqlLiteralN(s);
+            }
+
+            // Booléen
+            if (raw is bool b)
+                return b ? "1" : "0";
+
+            // Numériques
+            if (raw is byte || raw is sbyte || raw is short || raw is ushort ||
+                raw is int || raw is uint || raw is long || raw is ulong ||
+                raw is float || raw is double || raw is decimal)
+                return Convert.ToString(raw, System.Globalization.CultureInfo.InvariantCulture);
+
+            // DateTime/.Offset
+            if (raw is DateTime dtm)
+                return $"CONVERT(datetime2(0), N'{dtm:yyyy-MM-ddTHH:mm:ss}', 126)";
+            if (raw is DateTimeOffset dto)
+                return $"CONVERT(datetime2(0), N'{dto:yyyy-MM-ddTHH:mm:ss}', 126)";
+
+            // Fallback générique : ToString comme texte
+            return EscapeSqlLiteralN(Convert.ToString(raw, System.Globalization.CultureInfo.InvariantCulture) ?? "");
+        }
+
+        // Fallback “raisonnable” pour NOT NULL selon le type SQL
+        private string GetTypeFallback(string dt)
+        {
+            dt = (dt ?? "").ToLowerInvariant();
+
+            if (dt == "int" || dt == "bigint" || dt == "smallint" || dt == "tinyint")
+                return "0";
+
+            if (dt == "bit")
+                return "0";
+
+            if (dt.StartsWith("decimal") || dt.StartsWith("numeric") || dt.StartsWith("money") || dt.StartsWith("float") || dt.StartsWith("real"))
+                return "0";
+
+            if (dt.StartsWith("date")) // date, datetime, datetime2, smalldatetime
+                return "CONVERT(datetime2(0), N'1900-01-01T00:00:00', 126)";
+
+            // nvarchar, nchar, varchar, char, text, ntext, etc.
+            return "N''";
+        }
+
+        // Quote + N prefix + échappement des quotes
+        private string EscapeSqlLiteralN(string s)
+        {
+            if (s == null) return "NULL";
+            return "N'" + s.Replace("'", "''") + "'";
+        }
+
+        private static readonly DateTime SqlDateTimeMin = new DateTime(1753, 1, 1);
+        private static readonly string[] DateParseFormats = new[]
+        {
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-ddTHH:mm:ss",
+            "yyyy-MM-dd",
+            "dd/MM/yyyy HH:mm:ss",
+            "dd/MM/yyyy",
+            "MM/dd/yyyy HH:mm:ss",
+            "MM/dd/yyyy"
+        };
+
+        private string GetIdentityColumn(string tableName)
+        {
+            var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+            string req = @"EXEC dbo.batch_get_identity_columns @table = $t$";
+            sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("t", tableName, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
+
+            return sql.ReturnedRows(1, 1) > 0 ? sql.GetValueUsingColName(1, "COLUMN_NAME", 1, 1) : null;
+        }
+        // Clé: table; Valeur: liste de ses FK sortantes
+        private Dictionary<string, List<ForeignKeyInfo>> GetForeignKeysByTable(IEnumerable<string> tables)
+        {
+            var res = new Dictionary<string, List<ForeignKeyInfo>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var t in tables)
+                res[t] = GetForeignKeyInfo(t);
+            return res;
+        }
+        private ImportPlan BuildPlan(List<string> normalTables,
+                             List<string> extendedTables,
+                             Dictionary<string, List<ForeignKeyInfo>> fkMap)
+        {
+            var plan = new ImportPlan();
+
+            // Tri topo parents
+            var (orderParents, sccParents) = TopoSortWithCycles(normalTables, fkMap);
+            plan.NormalOrder.AddRange(orderParents);
+            MarkDeferredFksForCycles(sccParents, fkMap, plan);
+
+            // Tri topo étendues
+            var (orderExt, sccExt) = TopoSortWithCycles(extendedTables, fkMap);
+            plan.ExtendedOrder.AddRange(orderExt);
+            MarkDeferredFksForCycles(sccExt, fkMap, plan);
+
+            return plan;
+        }
+        // Kahn + SCC: renvoie ordre topo partiel + SCC (cycles)
+        private (List<string> order, List<HashSet<string>> sccs) TopoSortWithCycles(
+            List<string> nodes,
+            Dictionary<string, List<ForeignKeyInfo>> fkMap)
+        {
+            // Graphe: edge A->B si A a une FK vers B (A dépend de B)
+            var deps = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            var rev = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var n in nodes)
+            {
+                deps[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                rev[n] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            foreach (var n in nodes)
+            {
+                if (!fkMap.TryGetValue(n, out var fks)) continue;
+                foreach (var fk in fks)
+                {
+                    if (!nodes.Contains(fk.ReferencedTableName, StringComparer.OrdinalIgnoreCase)) continue;
+                    deps[n].Add(fk.ReferencedTableName);
+                    rev[fk.ReferencedTableName].Add(n);
+                }
+            }
+
+            var order = new List<string>();
+            var q = new Queue<string>(deps.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key));
+            var inDeg = deps.ToDictionary(kv => kv.Key, kv => kv.Value.Count, StringComparer.OrdinalIgnoreCase);
+
+            while (q.Count > 0)
+            {
+                var u = q.Dequeue();
+                order.Add(u);
+                foreach (var v in rev[u])
+                {
+                    inDeg[v]--;
+                    if (inDeg[v] == 0) q.Enqueue(v);
+                }
+            }
+
+            // SCC (Kosaraju simple)
+            var remaining = inDeg.Where(kv => kv.Value > 0).Select(kv => kv.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var sccs = ComputeSccs(remaining, deps, rev);
+
+            // Ajoute les nœuds cycliques en fin d’ordre pour être parcourus quand même
+            foreach (var scc in sccs)
+                order.AddRange(scc);
+
+            // Filet de sécurité : aucune table ne doit disparaître
+            foreach (var n in nodes)
+            {
+                if (!order.Contains(n, StringComparer.OrdinalIgnoreCase))
+                    order.Add(n);
+            }
+
+            return (order.Distinct(StringComparer.OrdinalIgnoreCase).ToList(), sccs);
+        }
+        private List<HashSet<string>> ComputeSccs(HashSet<string> nodes,
+            Dictionary<string, HashSet<string>> deps,
+            Dictionary<string, HashSet<string>> rev)
+        {
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var stack = new Stack<string>();
+            void Dfs1(string u)
+            {
+                visited.Add(u);
+                foreach (var v in deps[u])
+                    if (nodes.Contains(v) && !visited.Contains(v)) Dfs1(v);
+                stack.Push(u);
+            }
+            foreach (var n in nodes) if (!visited.Contains(n)) Dfs1(n);
+
+            var visited2 = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var comps = new List<HashSet<string>>();
+            void Dfs2(string u, HashSet<string> comp)
+            {
+                visited2.Add(u);
+                comp.Add(u);
+                foreach (var v in rev[u])
+                    if (nodes.Contains(v) && !visited2.Contains(v)) Dfs2(v, comp);
+            }
+            while (stack.Count > 0)
+            {
+                var u = stack.Pop();
+                if (visited2.Contains(u)) continue;
+                var comp = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                Dfs2(u, comp);
+                if (comp.Count >= 2 || HasSelfRefNonTrivial(u)) // auto-cycle si FK vers soi-même
+                    comps.Add(comp);
+            }
+            return comps;
+
+            bool HasSelfRefNonTrivial(string t)
+                => deps.TryGetValue(t, out var d) && d.Contains(t);
+        }
+        // Marque, pour chaque table d’un cycle, les colonnes FK vers des tables du même cycle
+        // -> on les mettra à NULL à l’insert, puis on fera un fix-up UPDATE.
+        private void MarkDeferredFksForCycles(List<HashSet<string>> sccs,
+                                              Dictionary<string, List<ForeignKeyInfo>> fkMap,
+                                              ImportPlan plan)
+        {
+            foreach (var scc in sccs)
+            {
+                foreach (var table in scc)
+                {
+                    if (!fkMap.TryGetValue(table, out var fks)) continue;
+                    foreach (var fk in fks)
+                    {
+                        if (!scc.Contains(fk.ReferencedTableName)) continue; // pas intra-cycle
+                                                                             // Si FK nullable -> on peut différer
+                        if (IsForeignKeyNullable(fk))
+                        {
+                            if (!plan.DeferredFkByTable.TryGetValue(table, out var set))
+                            {
+                                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                plan.DeferredFkByTable[table] = set;
+                            }
+                            set.Add(fk.ColumnName);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[INFO] Cycle non-nullable détecté: {table}.{fk.ColumnName} → {fk.ReferencedTableName}. " +
+                                              $"Solution conseillée: DISABLE/ENABLE ciblé de la contrainte le temps de l'import, puis CHECK.");
+                        }
+                    }
+                }
+            }
+        }
+        private void FixupDeferredForeignKeys(string tableName, HashSet<string> columns)
+        {
+            if (columns == null || columns.Count == 0) return;
+            Console.WriteLine("_______________________");
+            Console.WriteLine($"[FIXUP] {tableName} : mise à jour FK différées ({string.Join(",", columns)})");
+
+            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{_siteSource}.csv");
+            if (!File.Exists(csvPath)) { Console.WriteLine($"[FIXUP] CSV introuvable {tableName}"); return; }
+
+            var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+            if (lines.Length < 2) return;
+
+            var cols = lines[0].Split(';').Select(s => s.Trim()).ToList();
+            var idCol = GetIdentityColumn(tableName);
+            if (string.IsNullOrEmpty(idCol))
+            {
+                Console.WriteLine($"[FIXUP] {tableName} sans IDENTITY : skip (utiliser clé business si besoin).");
+                return;
+            }
+
+            // pour chaque ligne CSV : retrouver le newId et construire SET col = mappedId
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var vals = lines[i].Split(';');
+                if (vals.Length != cols.Count) continue;
+
+                var row = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (int c = 0; c < cols.Count; c++) row[cols[c]] = vals[c];
+
+                var oldId = row.ContainsKey(idCol) ? row[idCol] : null;
+                if (string.IsNullOrEmpty(oldId)) continue;
+
+                if (!_idMappings.TryGetValue(tableName, out var tableMap) || !tableMap.TryGetValue(oldId, out var newId))
+                    continue; // ligne non insérée (doublon/erreur)
+
+                // Build SET ...
+                var setParts = new List<string>();
+                foreach (var col in columns)
+                {
+                    if (!row.TryGetValue(col, out var oldFkVal) || string.IsNullOrWhiteSpace(oldFkVal))
+                    {
+                        setParts.Add($"[{col}]=NULL");
+                        continue;
+                    }
+                    // retrouver la table référencée
+                    var fk = GetForeignKeyInfo(tableName).FirstOrDefault(f => f.ColumnName.Equals(col, StringComparison.OrdinalIgnoreCase));
+                    if (fk == null) { setParts.Add($"[{col}]=NULL"); continue; }
+
+                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFkVal, out var mapped))
+                        setParts.Add($"[{col}]={mapped}");
+                    else
+                        setParts.Add($"[{col}]=NULL"); // faute de mieux (sinon lever une erreur)
+                }
+                if (setParts.Count == 0) continue;
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                string req = @"EXEC dbo.batch_fixup_deferred_foreignKeys @tableName = $t$, @setParts = $s$, @idCol = $i$, @newId = $n$";
+                sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("t", tableName, true, 0);
+                sql.SetSecureParam("s", string.Join(",", setParts), true, 0);
+                sql.SetSecureParam("i", idCol, true, 0);
+                sql.SetSecureParam("n", newId, true, 0);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(30000);
+            }
+        }        
+        
+        // colonnes à exclure de l'INSERT (computed/rowversion)
+        private HashSet<string> GetNotInsertableColumns(string table)
+        {
+            var cols = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Computed
+            {
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                sql.AddDirectRequest(@"
+                    SELECT c.name AS ColName
+                    FROM sys.computed_columns cc
+                    JOIN sys.columns c ON c.object_id = cc.object_id AND c.column_id = cc.column_id
+                    JOIN sys.objects o ON o.object_id = c.object_id
+                    WHERE o.name = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("t", table, true, 0);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(30000);
+                for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
+                    cols.Add(sql.GetValueUsingColName(i, "ColName", 1, 1));
+            }
+
+            // rowversion/timestamp
+            {
+                var sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
+                sql2.AddDirectRequest(@"
+                    SELECT COLUMN_NAME
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = $t$
+                    AND DATA_TYPE IN ('timestamp','rowversion');", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql2.SetSecureParam("t", table, true, 0);
+                sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql2.Execute(30000);
+                for (int i = 1; i <= sql2.ReturnedRows(1, 1); i++)
+                    cols.Add(sql2.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
+            }
+
+            return cols;
+        }
+        /// Import dédié aux tables de relation "pures":
+        /// - utilise la même SP que ImportTableCommon (détection de doublons par PK/UK)
+        /// - ne gère pas de FK différées (pas utile ici)
+        /// - ne met pas à jour _idMappings (en général pas d'IDENTITY utile comme clé de référence)
+        private void ImportPureTableWithProc(string tableName, int batchSize = 500)
+        {
+            Console.WriteLine("_______________________");
+            Console.WriteLine($"[IMPORT PURE] {tableName}");
+
+            string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{_siteSource}.csv");
+            if (!File.Exists(csvPath)) { Console.WriteLine($"? CSV introuvable : {tableName}"); return; }
+
+            var lines = File.ReadAllLines(csvPath, Encoding.UTF8);
+            if (lines.Length < 2) { Console.WriteLine($"CSV vide : {tableName}"); return; }
+
+            var columnNames = lines[0].Split(';').Select(c => c.Trim()).ToList();
+            var identityColumn = GetIdentityColumn(tableName);                   // peut exister (on ne l'insère jamais)
+            var fkInfos = GetForeignKeyInfo(tableName);
+            bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+
+            // Types SQL par colonne pour un quoting correct dans BuildValuesBatch
+            var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
+
+            // Préparation des lignes (mapping FK + retrait éventuel de l'IDENTITY)
+            var prepared = new List<Dictionary<string, object>>(lines.Length - 1);
+            int structureSkipped = 0;
+
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var vals = lines[i].Split(';');
+                if (vals.Length != columnNames.Count) { structureSkipped++; continue; }
+
+                var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+                for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
+
+                // On n’insère jamais la colonne IDENTITY si elle existe
+                if (hasIdentity && row.ContainsKey(identityColumn))
+                    row.Remove(identityColumn);
+
+                // Mapping FK (comme dans ImportTableCommon, mais sans différé ici)
+                foreach (var fk in fkInfos)
+                {
+                    if (!row.ContainsKey(fk.ColumnName)) continue;
+
+                    var oldFk = (row[fk.ColumnName] ?? "").ToString();
+                    if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
+
+                    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
+                        row[fk.ColumnName] = newFk;
+                    else if (IsForeignKeyNullable(fk))
+                        row[fk.ColumnName] = null;           // on laisse à NULL si nullable
+                    else
+                        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
+                }
+
+                var meta = GetColumnsMetaCached(tableName);
+                foreach (var col in columnNames)
+                {
+                    if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!row.ContainsKey(col)) continue;
+
+                    meta.TryGetValue(col, out var m);                    // m peut être null
+                    if (m?.IsComputed == true) continue;                 // colonnes calculées: on n'insère pas
+
+                    var s = (row[col] ?? "").ToString();
+                    var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
+
+                    bool isNullable = m?.IsNullable ?? true;
+                    if (isNullable)                                      // si la méta dit nullable, on confirme côté SQL
+                        isNullable = IsColumnNullableSql(tableName, col);
+
+                    if (isNullish)
+                    {
+                        if (!isNullable)
+                        {
+                            if (m != null && TryParseSimpleDefault(m.ColumnDefault, out var defVal))
+                                row[col] = defVal;                       // DEFAULT littéral
+                            else
+                                row[col] = GetTypeFallback(m?.DataType); // fallback typé (évite l'échec)
+                        }
+                        else
+                        {
+                            row[col] = null;                             // vraie valeur NULL autorisée
+                        }
+                    }
+                }
+
+                prepared.Add(row);
+            }
+
+            if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }
+
+            // Colonnes réellement insérées (sans l'IDENTITY)
+            var insertCols = columnNames.Where(c => !hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)).ToList();
+            string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+
+            int inserted = 0, duplicates = 0, errors = 0;
+            Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+
+            for (int start = 0; start < prepared.Count; start += batchSize)
+            {
+                int count = Math.Min(batchSize, prepared.Count - start);
+                var batchRows = prepared.GetRange(start, count);
+
+                // Fabrique le @ValuesBatch avec nos séparateurs NCHAR(30)/NCHAR(29)
+                var meta = GetColumnsMetaCached(tableName); 
+                string valuesBatch = BuildValuesBatch(batchRows, insertCols, columnTypes, meta);
+
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                string req = @"
+                EXEC dbo.batch_safe_insert_with_type_conversion
+                @TableName   = $t$,
+                @Columns     = $cols$,
+                @ValuesBatch = $vb$,
+                @HasIdentity = $hid$,
+                @IdentityCol = $idcol$;";
+
+                sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("t", tableName, true, 0);
+                sql.SetSecureParam("cols", columnsSql, true, 0);
+                sql.SetSecureParam("vb", valuesBatch, true, 0);
+                sql.SetSecureParam("hid", hasIdentity ? 1 : 0, true, 0);
+                sql.SetSecureParam("idcol", hasIdentity ? identityColumn : null, true, 0);
+                sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+                sql.Execute(60000);
+
+                int rows = sql.ReturnedRows(1, 1);
+                for (int i = 1; i <= rows; i++)
+                {
+                    int rowIndex = 0; int.TryParse(sql.GetValueUsingColName(i, "RowIndex", 1, 1), out rowIndex);
+                    string err = sql.GetValueUsingColName(i, "ErrorMessage", 1, 1);
+
+                    // récupère la ligne d’origine (alignée sur RowIndex 1..N du batch)
+                    Dictionary<string, object> rowForReject = null;
+                    if (rowIndex >= 1 && rowIndex <= batchRows.Count)
+                        rowForReject = batchRows[rowIndex - 1];
+
+                    if (!string.IsNullOrEmpty(err))
+                    {
+                        if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            duplicates++;
+                            if (rowForReject != null)
+                                AppendRejectedRow(tableName, insertCols, rowForReject, "Doublon");
+                        }
+                        else
+                        {
+                            errors++;
+                            Console.WriteLine($"[ERREUR INSERT] {tableName} (batch row {rowIndex}) : {err}");
+                            if (rowForReject != null)
+                                AppendRejectedRow(tableName, insertCols, rowForReject, err);
+                        }
+                        continue;
+                    }
+
                     inserted++;
                 }
-                if (newId != null && pkColumn != null && record.ContainsKey(pkColumn))
-                {
-                    idMap[record[pkColumn]] = newId;
-                }
             }
 
-            if (idMap.Count > 0)
+            Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
+        }
+        private void AppendRejectedRow(string tableName,IList<string> insertCols, Dictionary<string, object> row, string reason)
+        {
+            Directory.CreateDirectory(Path.Combine(_importPath, "Rejected"));
+            var rejPath = Path.Combine(
+                _importPath,
+                "Rejected",
+                $"Export_Migration_{tableName}_{_siteSource}_rejected.csv"
+            );
+
+            var header = string.Join(";", insertCols.Concat(new[] { "_Reason" }));
+            var line = string.Join(";", insertCols.Select(c =>
+                            (row.TryGetValue(c, out var v) && v != null) ? v.ToString() : "NULL")
+                         .Concat(new[] { reason?.Replace(";", " ").Replace("\r", " ").Replace("\n", " ") ?? "" }));
+
+            var writeHeader = !File.Exists(rejPath);
+            using (var sw = new StreamWriter(rejPath, append: true, Encoding.UTF8))
             {
-                _idMappings[tableName] = idMap;
-            }
-
-            Console.WriteLine($"{doublons} ligne(s) en doublons trouvée(s)");
-            Console.WriteLine($"{inserted} ligne(s) ajoutée(s)");                
-        }
-        catch(Exception e)
-        {
-            Console.WriteLine(e.ToString());
-        }
-    }
-    private List<string> GetUniqueColumns(string tableName)
-    {
-        // Récupère les colonnes UNIQUE (sauf ID si auto-incrémenté)
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest(@"
-            SELECT COL_NAME(ic.object_id, ic.column_id) AS UniqueColumn
-            FROM sys.indexes i
-            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-            WHERE i.is_unique = 1
-            AND OBJECT_NAME(ic.object_id) = $tableName$
-            AND (COL_NAME(ic.object_id, ic.column_id) <> 'ID' OR $hasIdentity$ = 0)",
-            MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-        sql.SetSecureParam("tableName", tableName, true, 0);
-        sql.SetSecureParam("hasIdentity", HasIdentityColumn(tableName) ? 1 : 0, true, 0);
-        sql.Execute();
-
-        var columns = new List<string>();
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            columns.Add(sql.GetValueUsingColName(i, "UniqueColumn", 1, 1));
-        }
-        return columns;
-    }  
-
-    private object InsertAndGetNewId(string tableName, Dictionary<string,object> record, bool hasIdentity, string pkColumn)
-    {
-        var (columns, values) = BuildInsertParameters(record, tableName);
-
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-
-        // Utilisation d'une procédure stockée sécurisée pour l'insertion
-        string request = @"EXEC [dbo].[batch_safe_insert_with_type_conversion] 
-                  @TableName = $table$, 
-                  @Columns = $cols$, 
-                  @Values = $vals$,
-                  @HasIdentity = $identity$";
-
-        sql.AddDirectRequest(request, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSecureParam("table", tableName, true, 0);
-        sql.SetSecureParam("cols", columns, true, 0);
-        sql.SetSecureParam("vals", values, true, 0);
-        sql.SetSecureParam("identity", hasIdentity ? 1 : 0, true, 0);
-
-        sql.Execute();
-
-        if (hasIdentity && pkColumn != null && sql.ReturnedRows(1, 1) > 0)
-        {
-            return sql.GetValueUsingColName(1, "NewID", 1, 1);
-        }
-
-        return null;
-    }
-    private bool IsComputedColumn(string tableName, string columnName)
-    {
-        DynamicSql sql = ExecuteProcedure("batch_is_computed_column",
-            TableName: tableName,
-            ColumnName: columnName);
-        return sql.GetValueUsingColName(1, "IsComputed", 1, 1) == "1";
-    }
-
-    private bool HasIdentityColumn(string tableName)
-    {
-        DynamicSql sql = ExecuteProcedure("batch_has_identity_column", TableName: tableName);
-        return Int32.Parse(sql.GetValueUsingColName(1, "Result", 1, 1)) != 0;
-    }
-
-    private string GetPrimaryKeyColumn(string tableName)
-    {
-        DynamicSql sql = ExecuteProcedure("batch_get_primary_key_column", TableName: tableName);
-        return sql.GetValueUsingColName(1, "PrimaryKeyColumn", 1, 1);
-    }
-
-
-    private List<Dictionary<string, object>> ReadCsvFile(string csvPath, string tableName)
-    {
-        Console.WriteLine("Lecture de fichier csv en cours...");
-        var records = new List<Dictionary<string, object>>();
-        var columns = GetTableColumns(tableName).ToList();
-        var columnTypes = columns.ToDictionary(col => col, col => GetColumnType(tableName, col));
-        int expectedValueCount = columns.Count;
-        bool structureValid = true;
-
-        try
-        {
-            using (var reader = new StreamReader(csvPath, Encoding.UTF8))
-            {
-                string line;
-                int lineNumber = 0;
-
-                while ((line = reader.ReadLine()) != null)
-                {
-                    lineNumber++;
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-
-                    var values = line.Split(';');
-                    if (values.Length != expectedValueCount)
-                    {
-                        Console.WriteLine($"[Erreur Structurelle] Ligne {lineNumber}: {values.Length} valeurs au lieu de {expectedValueCount}. Le fichier semble mal formé. Arrêt de l'import.");
-                        structureValid = false;
-                        break;
-                    }
-
-                    var record = new Dictionary<string, object>();
-                    for (int i = 0; i < columns.Count; i++)
-                    {
-                        try
-                        {
-                            record[columns[i]] = ConvertValue(values[i], columnTypes[columns[i]]);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"[Ligne {lineNumber}] Erreur conversion {columns[i]}: {ex.Message}");
-                            record = null;
-                            break;
-                        }
-                    }
-
-                    if (record != null)
-                    {
-                        records.Add(record);
-                    }
-                }
-                Console.WriteLine($"{lineNumber} ligne à importer");
+                if (writeHeader) sw.WriteLine(header);
+                sw.WriteLine(line);
             }
         }
-        catch (Exception ex)
+        private Dictionary<string, ColMeta> GetColumnsMetaCached(string table)
         {
-            Console.WriteLine($"Erreur lecture {csvPath}: {ex.Message}");
+            if (_colMetaCache.TryGetValue(table, out var meta)) return meta;
+            var m = GetColumnsMeta(table);
+            _colMetaCache[table] = m;
+            return m;
         }
-        return structureValid ? records : new List<Dictionary<string, object>>();
-    }
 
-    private object ConvertValue(string value, string columnType)
-    {
-        if (string.IsNullOrEmpty(value))
-            return null;
-
-        try
+        // Lecture dynamique du schéma
+        private Dictionary<string, ColMeta> GetColumnsMeta(string table)
         {
-            string lowerType = columnType.ToLower();
+            var meta = new Dictionary<string, ColMeta>(StringComparer.OrdinalIgnoreCase);
 
-            if (lowerType == "int")
-                return int.Parse(value);
-            if (lowerType == "bigint")
-                return long.Parse(value);
-            if (lowerType == "bit")
-                return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase);
-            if (lowerType == "datetime" || lowerType == "datetime2")
-                return DateTime.Parse(value);
-            if (lowerType == "date")
-                return DateTime.ParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-            if (lowerType == "decimal" || lowerType == "numeric")
-                return decimal.Parse(value, CultureInfo.InvariantCulture);
-            if (lowerType == "float")
-                return double.Parse(value, CultureInfo.InvariantCulture);
-            if (lowerType == "uniqueidentifier")
-                return Guid.Parse(value);
-
-            return value; // Type string par défaut
-        }
-        catch
-        {
-            return value; // Retourne la valeur originale si conversion échoue
-        }
-    }
-
-    private HashSet<string> GetTableColumns(string tableName)
-    {
-        var columns = new HashSet<string>();
-        DynamicSql sql = ExecuteProcedure("batch_get_table_columns", TableName: tableName);
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            columns.Add(sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1));
-        }            
-        return columns;
-    }
-
-    private string GetColumnType(string tableName, string columnName)
-    {
-        var columns = new HashSet<string>();
-        DynamicSql sql = ExecuteProcedure("batch_get_table_columns_type", TableName: tableName, ColumnName: columnName);
-        return  sql.GetValueUsingColName(1, "DATA_TYPE", 1, 1);
-    }
-
-    private List<ForeignKeyInfo> GetForeignKeyInfo(string tableName)
-    {
-        var foreignKeys = new List<ForeignKeyInfo>();
-        DynamicSql sql = ExecuteProcedure("batch_get_table_foreign_keys", TableName: tableName);
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            foreignKeys.Add(new ForeignKeyInfo
-            {
-                TableName = tableName,
-                ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
-                ReferencedTableName = sql.GetValueUsingColName(i, "ReferencedTableName", 1, 1),
-                ReferencedColumnName = sql.GetValueUsingColName(i, "ReferencedColumnName", 1, 1)
-            });
-        }   
-        return foreignKeys;
-    }
-    private void ValidateDataIntegrity()
-    {
-        DynamicSql sql = ExecuteProcedure("batch_validate_data_integrity");            
-        if (sql.ReturnedResults() > 0)
-        {
-            Console.WriteLine("Erreurs d'intégrité trouvées:");
+            // Base: nullable / default / type / length
+            var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+            sql.AddDirectRequest(@"
+            SELECT 
+                c.COLUMN_NAME,
+                c.DATA_TYPE,
+                CASE WHEN c.IS_NULLABLE='YES' THEN 1 ELSE 0 END AS IsNullable,
+                c.COLUMN_DEFAULT,
+                c.CHARACTER_MAXIMUM_LENGTH AS MaxLen
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            WHERE c.TABLE_NAME = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql.SetSecureParam("t", table, true, 0);
+            sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql.Execute(30000);
             for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
             {
-                Console.WriteLine($"- {sql.GetValueUsingColName(i, "Table", 1, 1)}.{sql.GetValueUsingColName(i, "Constraint", 1, 1)} : {sql.GetValueUsingColName(i, "Where", 1, 1)}");                  
-            }
-            throw new Exception("Erreurs de contraintes détectées");
-        }            
-    }     
-      
-    private (string Columns, string Values) BuildInsertParameters(Dictionary<string, object> record, string tableName)
-    {
-        var columns = string.Join(", ", record.Keys.Where(k => !IsComputedColumn(tableName, k)));
-        var values = string.Join(", ", record.Keys.Select(k => FormatValueForSql(record[k], GetColumnType(tableName, k))));
-
-        return (columns, values);
-    }
-    
-    private string FormatValueForSql(object value, string sqlType)
-    {
-        if (value == null) return "NULL";
-
-        try
-        {
-            switch (sqlType.ToLower())
-            {
-                case "datetime":
-                case "datetime2":
-                case "smalldatetime":
-                    if (value is DateTime dt)
-                        return $"'{dt:yyyy-MM-dd HH:mm:ss}'";
-                    return $"TRY_CONVERT(DATETIME, '{value}')";
-
-                case "date":
-                    if (value is DateTime date)
-                        return $"'{date:yyyy-MM-dd}'";
-                    return $"TRY_CONVERT(DATE, '{value}')";
-
-                case "bit":
-                    return (bool)value ? "1" : "0";
-
-                case "uniqueidentifier":
-                    return $"'{value}'";
-
-                case "decimal":
-                case "numeric":
-                case "float":
-                    return Convert.ToDecimal(value).ToString(CultureInfo.InvariantCulture);
-
-                default:
-                    return $"'{value.ToString().Replace("'", "''")}'";
-            }
-        }
-        catch
-        {
-            return $"'{value.ToString().Replace("'", "''")}'";
-        }
-    }
-    private void EnableAllForeignKeys()
-    {
-        try
-        {
-            Console.WriteLine("Vérification des contraintes FK...");
-
-            // 1. D'abord vérifier sans activer
-            var violations = GetForeignKeyViolations();
-
-            if (violations.Count > 0)
-            {
-                Console.WriteLine("Violations trouvées :");
-                foreach (var v in violations)
+                var m = new ColMeta
                 {
-                    Console.WriteLine($"- {v.TableName}.{v.ColumnName} => {v.ReferencedTable}.{v.ReferencedColumn}");
+                    Name = sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1),
+                    DataType = sql.GetValueUsingColName(i, "DATA_TYPE", 1, 1),
+                    IsNullable = "1" == sql.GetValueUsingColName(i, "IsNullable", 1, 1),
+                    ColumnDefault = sql.GetValueUsingColName(i, "COLUMN_DEFAULT", 1, 1),
+                };
+                int.TryParse(sql.GetValueUsingColName(i, "MaxLen", 1, 1), out m.MaxLen);
+                meta[m.Name] = m;
+            }
+
+            // Computed columns
+            var sql2 = new DynamicSql { Dsn = "PXE1_PXE" };
+            sql2.AddDirectRequest(@"
+            SELECT c.name AS ColName
+            FROM sys.computed_columns cc
+            JOIN sys.columns c ON c.object_id = cc.object_id AND c.column_id = cc.column_id
+            JOIN sys.objects o ON o.object_id = c.object_id
+            WHERE o.name = $t$;", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql2.SetSecureParam("t", table, true, 0);
+            sql2.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql2.Execute(30000);
+            for (int i = 1; i <= sql2.ReturnedRows(1, 1); i++)
+            {
+                var col = sql2.GetValueUsingColName(i, "ColName", 1, 1);
+                if (meta.TryGetValue(col, out var m)) m.IsComputed = true;
+            }
+
+            // rowversion/timestamp -> traiter comme "non insérable"
+            var sql3 = new DynamicSql { Dsn = "PXE1_PXE" };
+            sql3.AddDirectRequest(@"
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = $t$ AND DATA_TYPE IN ('timestamp','rowversion');", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+            sql3.SetSecureParam("t", table, true, 0);
+            sql3.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+            sql3.Execute(30000);
+            for (int i = 1; i <= sql3.ReturnedRows(1, 1); i++)
+            {
+                var col = sql3.GetValueUsingColName(i, "COLUMN_NAME", 1, 1);
+                if (meta.TryGetValue(col, out var m)) m.IsComputed = true;
+            }
+
+            return meta;
+        }
+
+        // DEFAULT simple ? -> on renvoie une valeur "brute" (non quotée), ex: foo, 0, 1
+        private static bool TryParseSimpleDefault(string defaultDef, out object value)
+        {
+            value = null;
+            if (string.IsNullOrWhiteSpace(defaultDef)) return false;
+
+            // enlève les parenthèses autour de ((…))
+            var s = defaultDef.Trim();
+            while (s.Length > 1 && s.StartsWith("(") && s.EndsWith(")"))
+                s = s.Substring(1, s.Length - 2).Trim();
+
+            if (string.Equals(s, "NULL", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // DEFAULT N'abc' / 'abc'
+            if (s.StartsWith("N'", StringComparison.Ordinal) || s.StartsWith("'", StringComparison.Ordinal))
+            {
+                var start = s.StartsWith("N'") ? 2 : 1;
+                if (s.EndsWith("'") && s.Length >= start + 1)
+                {
+                    var inner = s.Substring(start, s.Length - start - 1).Replace("''", "'");
+                    value = inner;                  // chaîne .NET -> sera quotée par BuildValuesBatch
+                    return true;
                 }
-
-                // 2. Corriger automatiquement
-                Console.WriteLine("Correction automatique...");
-                RepairForeignKeyViolations();
             }
 
-            // 3. Activer avec vérification
-            Console.WriteLine("Activation des contraintes...");
-            ExecuteProcedure("batch_enable_fk_constraints");
+            // entier / décimal simple
+            if (int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i)) { value = i; return true; }
+            if (decimal.TryParse(s, NumberStyles.Number, CultureInfo.InvariantCulture, out var d)) { value = d; return true; }
+
+            // expressions connues: CONVERT(...), CAST(...), GETDATE()...
+            if (s.StartsWith("CONVERT(", StringComparison.OrdinalIgnoreCase) ||
+                s.StartsWith("CAST(", StringComparison.OrdinalIgnoreCase) ||
+                s.Equals("GETDATE()", StringComparison.OrdinalIgnoreCase))
+            { value = s; return true; }
+
+            return false;
         }
-        catch (Exception ex)
+
+       
+        static List<string> ParseCsvSemicolon(string line)
         {
-            Console.WriteLine($"ERREUR Contraintes FK : {ex.Message}");
-            throw;
-        }
-    }
+            var res = new List<string>();
+            if (line == null) return res;
 
-    private void RepairForeignKeyViolations()
-    {
-        // 1. Identifier toutes les violations
-        var violations = GetForeignKeyViolations();
+            bool inQuotes = false;
+            var sb = new StringBuilder();
 
-        foreach (var violation in violations)
-        {
-            Console.WriteLine($"Correction violation: {violation.TableName}.{violation.ColumnName}");
-
-            // 2. Stratégie de correction (à adapter selon vos besoins)
-            ExecuteProcedure("batch_repair_fk_violation",
-                violation.TableName,
-                violation.ColumnName,
-                violation.ReferencedTable);
-        }
-    }
-    public List<ForeignKeyViolation> GetForeignKeyViolations()
-    {
-        var violations = new List<ForeignKeyViolation>();
-
-        DynamicSql sql = new DynamicSql { Dsn = "PXE1_PXE" };
-        sql.AddDirectRequest("EXEC batch_get_fk_violations", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.Execute();
-
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            violations.Add(new ForeignKeyViolation
+            for (int i = 0; i < line.Length; i++)
             {
-                TableName = sql.GetValueUsingColName(i, "TableName", 1, 1),
-                ColumnName = sql.GetValueUsingColName(i, "ColumnName", 1, 1),
-                ReferencedTable = sql.GetValueUsingColName(i, "ReferencedTable", 1, 1),
-                ReferencedColumn = sql.GetValueUsingColName(i, "ReferencedColumn", 1, 1),
-                ConstraintName = sql.GetValueUsingColName(i, "ConstraintName", 1, 1)
-            });
-        }
+                char c = line[i];
 
-        return violations;
-    }
-    private void LoadRelationTables()
-    {
-        var sql = ExecuteProcedure("batch_get_all_relation_tables");
-
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            var table = sql.GetValueUsingColName(i, "TableName", 1, 1);
-            var isExtended = sql.GetValueUsingColName(i, "IsExtended", 1, 1) == "1";
-
-            if (isExtended)
-                _extendedRelations.Add(table);
-            else
-                _pureRelations.Add(table);
-        }
-    }
-
-    private void ImportTablesWithFKReadiness(IEnumerable<string> tables)
-    {
-        var skipped = new List<string>();
-        var pass = 1;
-
-        foreach (var table in tables)
-        {
-            if (_importedTables.Contains(table)) continue;
-
-            Console.WriteLine($"______________________________");
-            Console.WriteLine($"Traitement de la table {table}");
-            string[] skiptables = { "eventlog", "eventlog_errors", "HISTORY", "HSTPOVAR", "settings" };
-            if (skiptables.Contains(table))
-            {
-                Console.WriteLine($"{table} ingoré pour le moment");
-                continue;
+                if (c == '"')
+                {
+                    // guillemet dans un champ guillemeté : "" -> "
+                    if (inQuotes && i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        sb.Append('"');
+                        i++; // skip le second "
+                    }
+                    else
+                    {
+                        inQuotes = !inQuotes; // on entre/sort du champ
+                    }
+                }
+                else if (c == ';' && !inQuotes)
+                {
+                    res.Add(sb.ToString());
+                    sb.Clear();
+                }
+                else
+                {
+                    sb.Append(c);
+                }
             }
-            var fks = GetForeignKeyInfo(table);
-            bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
+            res.Add(sb.ToString());
+            return res;
+        }
+        private readonly Dictionary<string, Dictionary<string, bool>> _nullabilityCache = new Dictionary<string, Dictionary<string, bool>>(StringComparer.OrdinalIgnoreCase);
 
-            if (!ready)
+        private bool IsColumnNullableSql(string table, string column)
+        {
+            if (!_nullabilityCache.TryGetValue(table, out var map))
             {
-                Console.WriteLine($"[ATTENTE] (pass {pass}) {table} : FK non résolues. Mise en attente.");
-                skipped.Add(table);
-                continue;
+                map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                _nullabilityCache[table] = map;
+
+                var sql = new DynamicSql { Dsn = "PXE1_PXE" };
+                string req = @"
+                    SELECT c.name AS ColName, c.is_nullable
+                    FROM sys.tables t
+                    JOIN sys.schemas s ON s.schema_id = t.schema_id
+                    JOIN sys.columns c ON c.object_id = t.object_id
+                    WHERE s.name = N'dbo' AND t.name = $tbl$
+                    ORDER BY c.column_id;";
+                sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+                sql.SetSecureParam("tbl", table, true, 0);
+                sql.Execute(30000);
+
+                int rows = sql.ReturnedRows(1, 1);
+                for (int i = 1; i <= rows; i++)
+                {
+                    string col = sql.GetValueUsingColName(i, "ColName", 1, 1);
+                    string nul = sql.GetValueUsingColName(i, "is_nullable", 1, 1);
+                    if (!string.IsNullOrEmpty(col))
+                        map[col] = nul == "1";
+                }
             }
-            Console.WriteLine($"[IMPORT] (pass {pass}) {table}");
-            ImportTable(table);
-            _importedTables.Add(table);
+            return map.TryGetValue(column, out var isNul) ? isNul : true; // défaut prudent
         }
 
-        // Relancer la passe si des tables étaient en attente
-        if (skipped.Count > 0)
+        private sealed class ImportPlan
         {
-            if (pass > 5)
-            {
-                Console.WriteLine("⚠️ Trop de passes sans progrès. Tables restantes non résolues :");
-                foreach (var t in skipped)
-                    Console.WriteLine($" - {t}");
-                throw new Exception("Import bloqué : certaines dépendances FK n'ont pas pu être satisfaites.");
-            }
-
-            pass++;
-            Console.WriteLine($"🔁 Nouvelle passe pour {skipped.Count} table(s) ignorée(s).");
-            ImportTablesWithFKReadiness(skipped); // récursion contrôlée
+            public List<string> NormalOrder { get; } = new List<string>();           // ordre topo
+            public List<string> ExtendedOrder { get; } = new List<string>();          // ordre topo sur étendues
+            public Dictionary<string, HashSet<string>> DeferredFkByTable { get; } = new Dictionary<string, HashSet<string>>(); // table -> FK à mettre à NULL puis fix-up
         }
-    }
-    private void ImportExtendedRelationsSafely()
-    {
-        var orderedTables = GetOrderedExtendedRelations();
-        var skipped = new List<string>();
-        int pass = 1;
-
-        foreach (var table in orderedTables)
+        private sealed class ColMeta
         {
-            Console.WriteLine($"______________________________");
-            Console.WriteLine($"Traitement de la table {table}");
-            if (_importedTables.Contains(table)) continue;
-
-            var fks = GetForeignKeyInfo(table);
-            bool ready = fks.All(fk => _idMappings.ContainsKey(fk.ReferencedTableName));
-
-            if (!ready)
-            {
-                Console.WriteLine($"[ATTENTE] {table} (relation étendue) : FK manquantes");
-                skipped.Add(table);
-                continue;
-            }
-
-            Console.WriteLine($"[IMPORT] {table} (relation étendue)");
-            ImportExtendedRelationTable(table);
-            _importedTables.Add(table);
+            public string Name;
+            public string DataType;
+            public bool IsNullable;
+            public bool IsComputed;
+            public string ColumnDefault; // ex: (N'foo'), ('bar'), ((0)), (0), (1)
+            public int MaxLen;
         }
-
-        if (skipped.Count > 0)
-        {
-            if (pass > 5)
-            {
-                Console.WriteLine("🛑 Tables de relation étendues non importables après plusieurs passes :");
-                foreach (var t in skipped) Console.WriteLine($" - {t}");
-                throw new Exception("Import échoué pour des relations étendues à cause de dépendances non résolues.");
-            }
-
-            pass++;
-            Console.WriteLine($"🔁 Nouvelle passe relations étendues : {skipped.Count} table(s)");
-            ImportExtendedRelationsSafely(); // récursion contrôlée
-        }
-    }
-    private List<string> GetOrderedExtendedRelations()
-    {
-        var ordered = new List<string>();
-        var visited = new HashSet<string>();
-
-        void Visit(string table)
-        {
-            if (visited.Contains(table)) return;
-
-            var fks = GetForeignKeyInfo(table);
-            foreach (var fk in fks)
-            {
-                if (_extendedRelations.Contains(fk.ReferencedTableName))
-                    Visit(fk.ReferencedTableName);
-            }
-
-            visited.Add(table);
-            ordered.Add(table);
-        }
-
-        foreach (var table in _extendedRelations)
-        {
-            Visit(table);
-        }
-
-        return ordered;
-    }
-    private List<string> GetAllTables()
-    {
-        var tables = new List<string>();
-        DynamicSql sql = new DynamicSql();
-        sql.Dsn = "PXE1_PXE";            
-        sql.AddDirectRequest(@"EXEC [dbo].[batch_select_all_tables]", MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-        sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-        sql.Execute(30000);
-        for (int i = 1; i <= sql.ReturnedRows(1, 1); i++)
-        {
-            tables.Add(sql.GetValueUsingColName(i, "TABLE_NAME", 1, 1));
-        }
-        var filtred = tables.Where(t => !_ignoredTables.Contains(t,StringComparer.OrdinalIgnoreCase)).ToList();
-        return filtred;
-    }
-
-
-    public class ForeignKeyViolation
-    {
-        public string TableName { get; set; }
-        public string ColumnName { get; set; }
-        public string ReferencedTable { get; set; }
-        public string ReferencedColumn { get; set; }
-        public string ConstraintName { get; set; }
     }
 }
