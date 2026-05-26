@@ -1,70 +1,92 @@
-using var reader = new StreamReader(csvPath, Encoding.UTF8);
-
-// lecture header
-string headerLine = reader.ReadLine();
-
-if (string.IsNullOrWhiteSpace(headerLine))
+private IEnumerable<List<string>> ReadCsvRows(StreamReader reader)
 {
-    Console.WriteLine($"CSV vide : {tableName}");
-    return;
+    var row = new List<string>();
+    var sb = new StringBuilder();
+
+    bool inQuotes = false;
+
+    while (true)
+    {
+        int raw = reader.Read();
+
+        // EOF
+        if (raw == -1)
+        {
+            row.Add(sb.ToString());
+
+            if (row.Count > 1 || row[0].Length > 0)
+                yield return row;
+
+            yield break;
+        }
+
+        char c = (char)raw;
+
+        // guillemet
+        if (c == '"')
+        {
+            // "" => quote échappé
+            if (inQuotes && reader.Peek() == '"')
+            {
+                sb.Append('"');
+                reader.Read(); // skip second "
+            }
+            else
+            {
+                inQuotes = !inQuotes;
+            }
+
+            continue;
+        }
+
+        // séparateur ;
+        if (c == ';' && !inQuotes)
+        {
+            row.Add(sb.ToString());
+            sb.Clear();
+            continue;
+        }
+
+        // nouvelle ligne
+        if ((c == '\r' || c == '\n') && !inQuotes)
+        {
+            // gérer CRLF
+            if (c == '\r' && reader.Peek() == '\n')
+                reader.Read();
+
+            row.Add(sb.ToString());
+            sb.Clear();
+
+            yield return row;
+
+            row = new List<string>();
+            continue;
+        }
+
+        sb.Append(c);
+    }
 }
 
-var columnNames = headerLine
-    .Split(';')
-    .Select(c => c.Trim())
-    .ToList();
 
-var fkInfos = GetForeignKeyInfo(tableName);
-var identityColumn = GetIdentityColumn(tableName);
-bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
 
-var columnTypes = columnNames.ToDictionary(
-    c => c,
-    c => GetColumnType(tableName, c),
-    StringComparer.OrdinalIgnoreCase);
-
-// IMPORTANT : plus de préallocation géante
-var prepared = new List<Dictionary<string, object>>();
-
-var oldIdPerRow = new List<string>();
-
-int structureSkipped = 0;
-
-string currentLine;
-
-while ((currentLine = reader.ReadLine()) != null)
+using (var reader = new StreamReader(csvPath, Encoding.UTF8))
 {
-    var vals = ParseCsvSemicolon(currentLine);
+    var csvEnumerator = ReadCsvRows(reader).GetEnumerator();
 
-    if (vals.Count != columnNames.Count)
+    // HEADER
+    if (!csvEnumerator.MoveNext())
     {
-        structureSkipped++;
-        continue;
+        Console.WriteLine($"CSV vide : {tableName}");
+        return;
     }
 
-    var row = new Dictionary<string, object>(
-        StringComparer.OrdinalIgnoreCase);
+    var columnNames = csvEnumerator.Current
+        .Select(c => c.Trim())
+        .ToList();
 
-    for (int c = 0; c < columnNames.Count; c++)
-        row[columnNames[c]] = vals[c];
 
-    string oldId = null;
 
-    if (hasIdentity && row.ContainsKey(identityColumn))
-    {
-        oldId = (row[identityColumn] ?? "").ToString();
 
-        // ne jamais insérer l'IDENTITY
-        row.Remove(identityColumn);
-    }
-
-    oldIdPerRow.Add(oldId);
-
-    // ===========================
-    // TOUT TON CODE MÉTIER EXISTANT
-    // FK / NULL / DEFAULT / FALLBACK
-    // etc...
-    // ===========================
-
-    prepared.Add(row);
-}
+while (csvEnumerator.MoveNext())
+{
+    var vals = csvEnumerator.Current;
