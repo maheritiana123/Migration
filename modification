@@ -1,16 +1,77 @@
-private string EscapeCsvValue(string value)
+private void ExportTableToCsv2(string tableName)
 {
-    if (value == null)
-        return "";
+    int offset = 0;
+    int batchSize = 1000;
+    bool headerWritten = false;
 
-    // échappe les quotes
-    value = value.Replace("\"", "\"\"");
+    string site = Environment.GetEnvironmentVariable("PFTLSITE");
+    string csvPath = Path.Combine(this.outputPathFile,
+        $"Export_Migration_{tableName}_{site}.csv");
 
-    // IMPORTANT :
-    // supprime les retours ligne
-    value = value.Replace("\r", "\\r")
-                 .Replace("\n", "\\n");
+    using (var writer = new StreamWriter(csvPath, false, Encoding.UTF8))
+    {
+        while (true)
+        {
+            DynamicSql sql = new DynamicSql();
+            sql.Dsn = "PXE1_PXE";
 
-    // encapsule toujours
-    return $"\"{value}\"";
+            sql.AddDirectRequest(
+                @"EXEC [dbo].[batch_select_export]
+                    @TableName = $tab$,
+                    @Offset = $off$,
+                    @BatchSize = $bs$",
+                MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+            sql.SetSecureParam("tab", tableName, true, 0);
+            sql.SetSecureParam("off", offset, true, 0);
+            sql.SetSecureParam("bs", batchSize, true, 0);
+
+            sql.SetSite(site);
+
+            sql.Execute(30000);
+
+            int colCount = sql.ReturnedCols(1, 1);
+            int rowCount = sql.ReturnedRows(1, 1);
+
+            if (rowCount == 0)
+                break;
+
+            // header une seule fois
+            if (!headerWritten)
+            {
+                var columnNames = new List<string>();
+
+                for (int c = 1; c <= colCount; c++)
+                    columnNames.Add(sql.GetColName(c, 1, 1));
+
+                writer.WriteLine(string.Join(";", columnNames));
+
+                headerWritten = true;
+            }
+
+            // données
+            for (int r = 1; r <= rowCount; r++)
+            {
+                var values = new List<string>();
+
+                for (int c = 1; c <= colCount; c++)
+                {
+                    var value = sql.GetValue(r, c, 1, 1);
+
+                    values.Add(EscapeCsvValue(value));
+                }
+
+                writer.WriteLine(string.Join(";", values));
+            }
+
+            writer.Flush();
+
+            offset += rowCount;
+
+            Console.WriteLine(
+                $"[{tableName}] batch exporté : {rowCount} lignes (offset={offset})");
+        }
+    }
+
+    Console.WriteLine($"Export terminé : {tableName}");
 }
