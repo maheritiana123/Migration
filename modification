@@ -1,39 +1,92 @@
-CREATE PROCEDURE [dbo].[batch_select_export]
-(
-    @TableName NVARCHAR(128),
-    @Offset INT,
-    @BatchSize INT
-)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @SQL NVARCHAR(MAX);
-
-    SET @SQL = '
-        SELECT *
-        FROM ' + QUOTENAME(@TableName) + '
-        ORDER BY 1
-        OFFSET ' + CAST(@Offset AS NVARCHAR) + ' ROWS
-        FETCH NEXT ' + CAST(@BatchSize AS NVARCHAR) + ' ROWS ONLY';
-
-    EXEC sp_executesql @SQL;
-END
-
-
-int offset = 0;
-int batchSize = 5000;
-
-while (true)
+private void ExportTableToCsv2(string tableName)
 {
-    // EXEC export batch
+    string site = Environment.GetEnvironmentVariable("PFTLSITE");
 
-    int rows = sql.ReturnedRows(1,1);
+    int offset = 0;
+    int batchSize = 5000;
 
-    if (rows == 0)
-        break;
+    string csvPath = Path.Combine(
+        this.outputPathFile,
+        $"Export_Migration_{tableName}_{site}.csv");
 
-    // écrire CSV
+    bool headerWritten = false;
 
-    offset += rows;
+    // IMPORTANT :
+    // true = append pour concaténer les batches
+    using (var writer = new StreamWriter(csvPath, false, Encoding.UTF8))
+    {
+        while (true)
+        {
+            DynamicSql sql = new DynamicSql();
+
+            sql.Dsn = "PXE1_PXE";
+
+            sql.AddDirectRequest(@"
+                EXEC [dbo].[batch_select_export]
+                    @TableName = $tabName$,
+                    @Offset = $offset$,
+                    @BatchSize = $batch$",
+                MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
+
+            sql.SetSecureParam("tabName", tableName, true, 0);
+            sql.SetSecureParam("offset", offset, true, 0);
+            sql.SetSecureParam("batch", batchSize, true, 0);
+
+            sql.SetSite(site);
+
+            sql.Execute(30000);
+
+            int colCount = sql.ReturnedCols(1, 1);
+            int rowCount = sql.ReturnedRows(1, 1);
+
+            // plus de données -> stop
+            if (rowCount == 0)
+                break;
+
+            // =========================
+            // 1. Écrire l'en-tête UNE SEULE FOIS
+            // =========================
+            var columnNames = new List<string>();
+
+            for (int c = 1; c <= colCount; c++)
+            {
+                columnNames.Add(sql.GetColName(c, 1, 1));
+            }
+
+            if (!headerWritten)
+            {
+                writer.WriteLine(
+                    string.Join(";", columnNames.Select(EscapeCsvValue)));
+
+                headerWritten = true;
+            }
+
+            // =========================
+            // 2. Écrire les lignes du batch
+            // =========================
+            for (int r = 1; r <= rowCount; r++)
+            {
+                var values = new List<string>();
+
+                foreach (var col in columnNames)
+                {
+                    var value = sql.GetValueUsingColName(r, col, 1, 1);
+
+                    values.Add(EscapeCsvValue(value));
+                }
+
+                writer.WriteLine(string.Join(";", values));
+            }
+
+            writer.Flush();
+
+            // batch suivant
+            offset += rowCount;
+
+            Console.WriteLine(
+                $"[{tableName}] batch exporté : {rowCount} lignes (offset={offset})");
+        }
+    }
+
+    Console.WriteLine($"Export terminé : {tableName}");
 }
