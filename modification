@@ -75,3 +75,7 @@ private void ExportTableToCsv2(string tableName)
 
     Console.WriteLine($"Export terminé : {tableName}");
 }
+
+ORDER BY (SELECT NULL)
+OFFSET @Offset ROWS
+FETCH NEXT @BatchSize ROWS ONLY
