@@ -1,165 +1,392 @@
-private void ImportTableCommon(string tableName, bool forceNullFK = false, int batchSize = 50, HashSet<string> nullFkColumns = null)
-{
-    Console.WriteLine("_______________________");
-    Console.WriteLine($"[IMPORT] {tableName}");
+/******************************************************************************
+ * Procédure [batch_safe_insert_with_type_conversion_batch] :
+ * [batch_safe_insert_with_type_conversion_batch]
+ ******************************************************************************/
 
-    string csvPath = Path.Combine(_importPath, $"Export_Migration_{tableName}_{_siteSource}.csv");
-    if (!File.Exists(csvPath)) { Console.WriteLine($"CSV introuvable : {tableName}"); return; }
+/* ============================================================
+   1) Utilitaire : scinder une liste par virgules en gardant l’ordre
+   ============================================================ */
+	IF OBJECT_ID('dbo.SplitByCommaOrdered') IS NULL
+		EXEC('CREATE FUNCTION dbo.SplitByCommaOrdered(@s nvarchar(max))
+	RETURNS @t TABLE (Item nvarchar(max), Ord int)
+	AS
+	BEGIN
+	  DECLARE @p int=1, @o int=1, @n int, @x nvarchar(max);
+	  IF @s IS NULL RETURN;
+	  WHILE 1=1
+	  BEGIN
+		SET @n = CHARINDEX('','', @s, @p);
+		IF @n=0 SET @x = SUBSTRING(@s, @p, LEN(@s)-@p+1);
+		ELSE    SET @x = SUBSTRING(@s, @p, @n-@p);
+		INSERT INTO @t(Item, Ord) VALUES(LTRIM(RTRIM(@x)), @o);
+		SET @o=@o+1; IF @n=0 BREAK; SET @p=@n+1;
+	  END
+	  RETURN
+	END');
+	GO
 
-    using (var reader = new StreamReader(csvPath, Encoding.UTF8))
-    {
-        var csvEnumerator = ReadCsvRows(reader).GetEnumerator();
+/* ============================================================
+   2) Procédure d’insertion batch
+   ============================================================ */
+IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
+    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
+GO
 
-        // HEADER
-        if (!csvEnumerator.MoveNext())
-        {
-            Console.WriteLine($"CSV vide : {tableName}");
-            return;
-        }
+CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName      NVARCHAR(128),
+    @Columns        NVARCHAR(MAX),      -- ex: [Col1],[Col2]
+    @ValuesBatch    NVARCHAR(MAX),      -- lignes: NCHAR(30), colonnes: NCHAR(29)
+    @HasIdentity    BIT          = 0,
+    @IdentityCol    NVARCHAR(128)= NULL -- si NULL et @HasIdentity=1 : auto-détection
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET LOCK_TIMEOUT 5000;
+    SET DEADLOCK_PRIORITY LOW;
 
-        var columnNames = csvEnumerator.Current
-            .Select(c => c.Trim())
-            .ToList();
-        var fkInfos = GetForeignKeyInfo(tableName);
-        var identityColumn = GetIdentityColumn(tableName);
-        bool hasIdentity = !string.IsNullOrEmpty(identityColumn);
+    DECLARE @RS nchar(1) = NCHAR(30);  -- record separator (ligne)
+    DECLARE @CS nchar(1) = NCHAR(29);  -- column separator
 
-        var columnTypes = columnNames.ToDictionary(c => c, c => GetColumnType(tableName, c), StringComparer.OrdinalIgnoreCase);
-        var notInsertable = GetNotInsertableColumns(tableName);
-        var insertCols = columnNames.Where(c => (!hasIdentity || !c.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) && !notInsertable.Contains(c)).ToList();
-        string columnsSql = string.Join(",", insertCols.Select(c => $"[{c}]"));
+    BEGIN TRY
 
-        int inserted = 0, duplicates = 0, errors = 0;
-        var prepared = new List<Dictionary<string, object>>();
-        var oldIdPerRow = new List<string>();
-        int structureSkipped = 0;
+        -- Détection de la colonne IDENTITY si demandée
+        IF @HasIdentity = 1 AND (@IdentityCol IS NULL OR LEN(@IdentityCol)=0)
+        BEGIN
+            SELECT TOP (1) @IdentityCol = c.COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            WHERE c.TABLE_NAME = @TableName
+              AND COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1;
+        END
 
-        while (csvEnumerator.MoveNext())
-        {
-            var vals = csvEnumerator.Current;
-            if (vals.Count != columnNames.Count) { structureSkipped++; continue; }
+        /* ============================================================
+           Contraintes PK / UNIQUE
+           ============================================================ */
+        DECLARE @pk TABLE
+        (
+            ConstraintName NVARCHAR(255),
+            ColName NVARCHAR(128),
+            Ord INT
+        );
 
-            var row = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-            for (int c = 0; c < columnNames.Count; c++) row[columnNames[c]] = vals[c];
+        INSERT INTO @pk(ConstraintName, ColName, Ord)
+        SELECT
+            tc.CONSTRAINT_NAME,
+            kcu.COLUMN_NAME,
+            kcu.ORDINAL_POSITION
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+          ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+         AND tc.TABLE_NAME = kcu.TABLE_NAME
+        WHERE tc.TABLE_NAME = @TableName
+          AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
+          AND (@IdentityCol IS NULL OR kcu.COLUMN_NAME <> @IdentityCol);
 
-            string oldId = null;
-            if (hasIdentity && row.ContainsKey(identityColumn))
-            {
-                oldId = (row[identityColumn] ?? "").ToString();
-                row.Remove(identityColumn); // ne jamais insérer l'IDENTITY
-            }
-            oldIdPerRow.Add(oldId);
+        -- Résultats (une ligne par ligne du batch)
+        DECLARE @out TABLE
+        (
+            RowIndex     INT,
+            NewID        NVARCHAR(100),
+            ErrorMessage NVARCHAR(MAX)
+        );
 
-            foreach (var fk in fkInfos)
-            {
-                if (!row.ContainsKey(fk.ColumnName)) continue;
+        -- Batch vide ?
+        IF @ValuesBatch IS NULL OR LEN(@ValuesBatch)=0
+        BEGIN
+            INSERT INTO @out VALUES (0, NULL, N'Batch vide (aucune donnée)');
 
-                // 1) FK marquée "différée" -> on force NULL à l'insert
-                if (nullFkColumns != null && nullFkColumns.Contains(fk.ColumnName))
-                {
-                    row[fk.ColumnName] = null;
-                    continue;
-                }
+            SELECT RowIndex, NewID, ErrorMessage
+            FROM @out
+            ORDER BY RowIndex;
 
-                // 2) forceNullFK global (rare)
-                if (forceNullFK)
-                {
-                    row[fk.ColumnName] = null;
-                    continue;
-                }
+            RETURN;
+        END
 
-                // 3) mapping normal
-                var oldFk = (row[fk.ColumnName] ?? "").ToString();
-                if (string.IsNullOrWhiteSpace(oldFk)) { row[fk.ColumnName] = null; continue; }
+        -- Préparer liste des colonnes avec l’ordre
+        DECLARE @cols TABLE(ColName nvarchar(128), Ord int);
 
-                if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) && map.TryGetValue(oldFk, out var newFk))
-                    row[fk.ColumnName] = newFk;
-                else if (IsForeignKeyNullable(fk))
-                    row[fk.ColumnName] = null;
-                else
-                {
-                    // >>> PASS-THROUGH : si la valeur existe déjà chez le parent, on la garde telle quelle
-                    if (TryPassThroughExistingId(fk.ReferencedTableName, oldFk))
-                    {
-                        row[fk.ColumnName] = oldFk; // on conserve la valeur existante
-                    }
-                    else
-                    {
-                        throw new Exception($"Mapping manquant pour FK {fk.ColumnName} -> {fk.ReferencedTableName} (table {tableName})");
-                    }
-                }
-            }
-            var meta = GetColumnsMetaCached(tableName);
+        INSERT INTO @cols(ColName, Ord)
+        SELECT
+            LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']',''))),
+            Ord
+        FROM dbo.SplitByCommaOrdered(@Columns);
 
-            // Remplir les NULL non autorisés (ou mettre le DEFAULT littéral)
-            foreach (var col in columnNames)
-            {
-                if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
-                if (!row.ContainsKey(col)) continue;
+        -- Boucle sur les lignes du batch
+        DECLARE @len    INT  = LEN(@ValuesBatch);
+        DECLARE @cur    INT  = 1;
+        DECLARE @next   INT;
+        DECLARE @line   NVARCHAR(MAX);
+        DECLARE @rowIdx INT  = 0;
 
-                meta.TryGetValue(col, out var m);
-                if (m?.IsComputed == true) continue;                 // colonnes calculées: on n’insère rien
+        WHILE @cur <= @len
+        BEGIN
+            -- Isoler ligne courante
+            SET @next = CHARINDEX(@RS, @ValuesBatch, @cur);
 
-                var s = (row[col] ?? "").ToString();
-                var isNullish = string.IsNullOrWhiteSpace(s) || s.Equals("NULL", StringComparison.OrdinalIgnoreCase);
+            IF @next = 0
+                SET @line = SUBSTRING(@ValuesBatch, @cur, @len - @cur + 1);
+            ELSE
+                SET @line = SUBSTRING(@ValuesBatch, @cur, @next - @cur);
 
-                // nullabilité "fiable" : méta + (filet) sys.columns (DynamicSql)
-                bool isNullable = (m?.IsNullable ?? true);
-                if (isNullable)                                      // si la méta dit nullable, on confirme côté SQL
-                    isNullable = IsColumnNullableSql(tableName, col);
+            IF @next = 0
+                SET @cur = @len + 1;
+            ELSE
+                SET @cur = @next + 1;
 
-                if (isNullish)
-                {
-                    if (!isNullable)
-                    {
-                        // 1) DEFAULT de la colonne (simple)
-                        if (m != null && TryParseSimpleDefault(m.ColumnDefault, out var defVal))
-                        {
-                            row[col] = defVal;                       // BuildValuesBatch gèrera le quoting / pass-through
-                                                                     // Console.WriteLine($"[DEFAULT] {tableName}.{col} <- {defVal}");
-                        }
-                        else
-                        {
-                            // 2) Fallback typé (jamais null)
-                            var fb = GetTypeFallback(m?.DataType);
-                            row[col] = fb;
-                            // Console.WriteLine($"[FALLBACK] {tableName}.{col} <- {fb} (type={m?.DataType})");
-                        }
-                    }
-                    else
-                    {
-                        row[col] = null;                             // vraie valeur NULL autorisée
-                    }
-                }
-            }
+            SET @rowIdx = @rowIdx + 1;
 
-            // Dernier filet: s’assurer qu’aucun NOT NULL ne reste à null
-            foreach (var col in columnNames)
-            {
-                if (hasIdentity && col.Equals(identityColumn, StringComparison.OrdinalIgnoreCase)) continue;
-                if (!row.ContainsKey(col)) continue;
+            -- Ligne vide ?
+            SET @line = LTRIM(RTRIM(@line));
 
-                if (!IsColumnNullableSql(tableName, col))
-                {
-                    var v = row[col];
-                    if (v == null || (v is string ss && ss.Equals("NULL", StringComparison.OrdinalIgnoreCase)))
-                        row[col] = GetTypeFallback(meta.TryGetValue(col, out var m2) ? m2.DataType : null);
-                }
-            }
-            prepared.Add(row);
-            if (prepared.Count >= batchSize)
-            {
-                if (prepared.Count >= batchSize)
-                {
-                    FlushImportBatch(tableName,prepared, oldIdPerRow,insertCols,columnTypes, hasIdentity,identityColumn,ref inserted,ref duplicates,ref errors);
-                }
-            }
-        }
-        if (prepared.Count == 0) { Console.WriteLine($"Table {tableName} : 0 ligne exploitable (structure)."); return; }                
-        Console.WriteLine($"{prepared.Count} lignes à importer (batch={batchSize})...");
+            IF @line IS NULL OR LEN(@line)=0
+            BEGIN
+                INSERT INTO @out
+                VALUES(@rowIdx, NULL, N'Ligne vide ignorée');
 
-        FlushImportBatch(
-            tableName,prepared,oldIdPerRow,insertCols,columnTypes,hasIdentity,identityColumn,ref inserted,ref duplicates,ref errors);
-        Console.WriteLine($"Table {tableName} : {inserted} insérées, {duplicates} doublons ignorés, {errors} erreurs, {structureSkipped} lignes sautées (structure).");
-    }
-}
+                CONTINUE;
+            END
+
+            /* ============================================================
+               Contrôle structure colonnes / valeurs
+               ============================================================ */
+            DECLARE @valCount INT =
+                (LEN(@line) - LEN(REPLACE(@line, @CS, N''))) + 1;
+
+            DECLARE @colCount INT =
+                (LEN(@Columns) - LEN(REPLACE(@Columns, N',', N''))) + 1;
+
+            IF @valCount <> @colCount
+            BEGIN
+                INSERT INTO @out(RowIndex, NewID, ErrorMessage)
+                VALUES
+                (
+                    @rowIdx,
+                    NULL,
+                    N'ERR: Nombre de valeurs <> colonnes. Attendu='
+                    + CAST(@colCount AS nvarchar(10))
+                    + N' | Trouvé=' + CAST(@valCount AS nvarchar(10))
+                    + N' | Row="' + @line + N'"'
+                );
+
+                CONTINUE;
+            END
+
+            /* ============================================================
+               Détection doublons
+               ============================================================ */
+            IF EXISTS(SELECT 1 FROM @pk)
+            BEGIN
+                DECLARE @exists bit = 0;
+                DECLARE @dupId nvarchar(100) = NULL;
+
+                DECLARE @constraintName NVARCHAR(255);
+
+                DECLARE curDup CURSOR LOCAL FAST_FORWARD FOR
+                SELECT DISTINCT ConstraintName
+                FROM @pk;
+
+                OPEN curDup;
+
+                FETCH NEXT FROM curDup INTO @constraintName;
+
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    DECLARE @whereClause nvarchar(max) = N'';
+
+                    DECLARE @ord int = 1;
+                    DECLARE @p int = 1;
+                    DECLARE @n int;
+                    DECLARE @token nvarchar(max);
+
+                    DECLARE @work nvarchar(max) = @line;
+
+                    WHILE 1=1
+                    BEGIN
+                        SET @n = CHARINDEX(@CS, @work, @p);
+
+                        IF @n = 0
+                            SET @token = SUBSTRING(@work, @p, LEN(@work)-@p+1);
+                        ELSE
+                            SET @token = SUBSTRING(@work, @p, @n-@p);
+
+                        DECLARE @col nvarchar(128);
+
+                        SELECT @col = ColName
+                        FROM @cols
+                        WHERE Ord=@ord;
+
+                        IF EXISTS
+                        (
+                            SELECT 1
+                            FROM @pk
+                            WHERE ConstraintName = @constraintName
+                              AND ColName = @col
+                        )
+                        BEGIN
+                            SET @whereClause =
+                                @whereClause
+                                + CASE WHEN LEN(@whereClause)>0 THEN N' AND ' ELSE N'' END
+                                + QUOTENAME(@col)
+                                + N' = '
+                                + CASE
+                                    WHEN UPPER(LTRIM(RTRIM(@token)))='NULL'
+                                        THEN N'NULL'
+                                    ELSE @token
+                                  END;
+                        END
+
+                        SET @ord = @ord + 1;
+
+                        IF @n = 0 BREAK;
+
+                        SET @p = @n + 1;
+                    END
+
+                    IF LEN(@whereClause) > 0
+                    BEGIN
+                        DECLARE @checkSql nvarchar(max) =
+                            N'SELECT @out = CASE WHEN EXISTS
+                            (
+                                SELECT 1
+                                FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK)
+                                WHERE ' + @whereClause + N'
+                            )
+                            THEN 1 ELSE 0 END';
+
+                        EXEC sp_executesql
+                            @checkSql,
+                            N'@out bit OUTPUT',
+                            @out=@exists OUTPUT;
+
+                        IF @exists = 1
+                        BEGIN
+                            -- Récupération ID existant pour mapping
+                            IF @HasIdentity = 1
+                               AND @IdentityCol IS NOT NULL
+                            BEGIN
+                                DECLARE @selDupSql nvarchar(max) =
+                                    N'SELECT TOP 1
+                                        @nid = CONVERT(nvarchar(100), '
+                                        + QUOTENAME(@IdentityCol) + N')
+                                      FROM ' + QUOTENAME(@TableName)
+                                      + N' WHERE ' + @whereClause;
+
+                                EXEC sp_executesql
+                                    @selDupSql,
+                                    N'@nid nvarchar(100) OUTPUT',
+                                    @nid=@dupId OUTPUT;
+                            END
+
+                            INSERT INTO @out
+                            (
+                                RowIndex,
+                                NewID,
+                                ErrorMessage
+                            )
+                            VALUES
+                            (
+                                @rowIdx,
+                                @dupId,
+                                N'Doublon'
+                            );
+
+                            BREAK;
+                        END
+                    END
+
+                    FETCH NEXT FROM curDup INTO @constraintName;
+                END
+
+                CLOSE curDup;
+                DEALLOCATE curDup;
+
+                IF @exists = 1
+                    CONTINUE;
+            END
+
+            /* ============================================================
+               Liste de valeurs INSERT
+               ============================================================ */
+            DECLARE @values nvarchar(max) =
+                REPLACE(@line, @CS, N',');
+
+            /* ============================================================
+               INSERT
+               ============================================================ */
+            DECLARE @sql nvarchar(max);
+
+            SET @sql =
+                N'SET NOCOUNT ON; '
+                + N'INSERT INTO '
+                + QUOTENAME(@TableName)
+                + N' (' + @Columns + N') '
+                + N'SELECT ' + @values + N'; ';
+
+            IF @HasIdentity = 1
+               AND @IdentityCol IS NOT NULL
+            BEGIN
+                SET @sql =
+                    @sql
+                    + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
+            END
+
+            BEGIN TRY
+                IF @HasIdentity = 1
+                   AND @IdentityCol IS NOT NULL
+                BEGIN
+                    DECLARE @newId nvarchar(100) = NULL;
+
+                    EXEC sp_executesql
+                        @sql,
+                        N'@nid nvarchar(100) OUTPUT',
+                        @nid = @newId OUTPUT;
+
+                    IF @newId IS NULL OR @newId = N''
+                    BEGIN
+                        INSERT INTO @out
+                        VALUES
+                        (
+                            @rowIdx,
+                            NULL,
+                            N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals='
+                            + @values
+                        );
+                    END
+                    ELSE
+                    BEGIN
+                        INSERT INTO @out
+                        VALUES(@rowIdx, @newId, NULL);
+                    END
+                END
+                ELSE
+                BEGIN
+                    EXEC sp_executesql @sql;
+
+                    INSERT INTO @out
+                    VALUES(@rowIdx, NULL, NULL);
+                END
+            END TRY
+            BEGIN CATCH
+                INSERT INTO @out
+                VALUES
+                (
+                    @rowIdx,
+                    NULL,
+                    N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values
+                );
+            END CATCH
+        END
+
+        -- Résultat final
+        SELECT
+            RowIndex,
+            NewID,
+            ErrorMessage
+        FROM @out
+        ORDER BY RowIndex;
+
+    END TRY
+    BEGIN CATCH
+        PRINT ERROR_MESSAGE();
+		THROW;
+    END CATCH
+END
