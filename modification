@@ -1,15 +1,16 @@
-DECLARE @sql NVARCHAR(MAX) = '';
-
-SELECT @sql += '
-ALTER TABLE [' + SCHEMA_NAME(schema_id) + '].[' + name + '] NOCHECK CONSTRAINT ALL;'
-FROM sys.tables;
-
-SELECT @sql += '
-DELETE FROM [' + SCHEMA_NAME(schema_id) + '].[' + name + '];'
-FROM sys.tables;
-
-SELECT @sql += '
-ALTER TABLE [' + SCHEMA_NAME(schema_id) + '].[' + name + '] WITH CHECK CHECK CONSTRAINT ALL;'
-FROM sys.tables;
-
-EXEC sp_executesql @sql;
+SELECT SUM(x.[count]) AS TotalExactApplication
+FROM (
+    SELECT
+        ec.evc_id,
+        ec.evc_log_id,
+        (
+            SELECT COUNT(*)
+            FROM eventlog el
+            WHERE el.evt_class_id = ec.evc_id
+        ) AS [count]
+    FROM eventclasses ec
+    WHERE ec.evc_log_id IN (
+        SELECT log_id
+        FROM logs
+    )
+) x;
