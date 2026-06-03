@@ -1,18 +1,15 @@
-SELECT SUM(x.nb) AS TotalAffiche
-FROM (
-    SELECT ec.evc_id,
-           COUNT(el.evt_id) AS nb
-    FROM eventclasses ec
-    LEFT JOIN eventlog el ON el.evt_class_id = ec.evc_id
-    WHERE ec.evc_log_id IS NULL
-    GROUP BY ec.evc_id
+DECLARE @sql NVARCHAR(MAX) = '';
 
-    UNION ALL
+SELECT @sql += '
+ALTER TABLE [' + SCHEMA_NAME(schema_id) + '].[' + name + '] NOCHECK CONSTRAINT ALL;'
+FROM sys.tables;
 
-    SELECT ec.evc_id,
-           COUNT(el.evt_id) AS nb
-    FROM logs l
-    JOIN eventclasses ec ON ec.evc_log_id = l.log_id
-    LEFT JOIN eventlog el ON el.evt_class_id = ec.evc_id
-    GROUP BY ec.evc_id
-) x;
+SELECT @sql += '
+DELETE FROM [' + SCHEMA_NAME(schema_id) + '].[' + name + '];'
+FROM sys.tables;
+
+SELECT @sql += '
+ALTER TABLE [' + SCHEMA_NAME(schema_id) + '].[' + name + '] WITH CHECK CHECK CONSTRAINT ALL;'
+FROM sys.tables;
+
+EXEC sp_executesql @sql;
