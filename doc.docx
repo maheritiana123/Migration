@@ -1,0 +1,104 @@
+ASVC : Gestion des comptes de service
+Les comptes de services permettent de se connecter au LDAP/AD du groupe afin d'y récupérer des informations. Ces comptes sont pilotés par une application interne sous le nom de ASVC. Y sont référencé les comptes de services, les mots de passes et l'audit des accès. 
+
+Un compte de service est un compte technique nécessaire au fonctionnement d’un système ou d’une application. Ces comptes ont généralement des privilèges élevés qui sont nécessaires pour effectuer des tâches ou des fonctions spécialisées et ne sont généralement pas des comptes utilisés par un utilisateur humain.
+
+L'équipe gestionnaire verra les comptes qu’elle peut gérer dans une liste. Elle pourra visualiser ou modifier le mot de passe associé au compte. La visualisation se fait dans un champ texte et pourra être sélectionnable afin de permettre le copier/coller. Chaque action de visualisation ou de modification de mot de passe est loguée. Un commentaire doit obligatoirement être saisi pour justifier la visualisation de ce mot de passe.
+Un compte devra être révisé obligatoirement une fois par an par l’équipe propriétaire du compte. Si le compte a été modifié depuis moins de 90 jours, on considère que la révision a été effectuée.
+Lorsqu’un compte est supprimé par le propriétaire, il est simplement désactivé pendant 30 jours. Pendant cette période il peut être réactivé.
+
+Référentiel des comptes de service et compte admin PCIDSS (env. de transaction bancaire). Gestion des comptes, des demandes, suivi et révision des comptes.  Permet de stocker de manière sécurisée les mots de passe de ces comptes: appel à LCRY pour création et stockage de mot de passe.
+
+PXE : Référentiel des postes de travail
+Description
+PXE est une application qui permet qui permet de gérer la construction (kit) des postes de travail.
+A chaque poste de travail est associé une « fiche PXE » qui décrit :
+•	Les informations techniques du poste (Type de matériel, Système d’exploitation, etc.)
+•	Les applications à installer sur le poste
+•	Les imprimantes/scanner à configurer 
+Les profils poste de travail
+On entend par "profil" une configuration et des paramétrages spécifiques du poste de travail. Il existe plusieurs profils de poste de travail
+•	AGENCE : poste de travail installé dans les caisses/agences du groupe. Il est fortement couplé au serveur de la caisse/agence
+•	SIEGE : Poste de travail
+•	COMVISION : Poste de travail dédié à la communication dynamique (marketing, communication interne, borne tactile, ...) utilisé principalement dans agences/caisse du groupe. "Tout sur ComVision"
+•	SECUVISION : solution de videosurveillance Secuvision. Documentation "Tout sur Secuvision"
+
+ACERT : application de gestion des certificats numériques
+L’application ASEC_CERTIF a pour objet d’enregistrer des demandes de création de certificats numériques et de suivre leurs traitements.
+ 
+Fonctionnalités :
+·         Demande de certificat numérique
+·         Renouvellement d’un certificat arrivant à expiration
+·         Révocation d’un certificat car compromis
+·         Suivi du traitement des demandes par les administrateurs
+·         Surveillance des certificats arrivant à expiration
+
+
+PFTL : Service de logs
+Section du site PFTL, permettant de rechercher et d’afficher les logs de la base de logs PFTL.
+La section « Service de logs » du site PFTL permet ainsi, à la fois la recherche de logs, mais aussi de configurer celle-ci (définition de masques de saisie et d’affichage, sauvegarde par chaque utilisateur des combinaisons de critères les plus utilisées par celui-ci, définition d’offuscations applicatives).
+
+
+
+
+
+
+
+
+
+
+
+
+
+Mission chez Euro Information
+Secteur Système et réseaux - DEVELOPPEMENT DES COUCHES TECHNIQUES - WEB OUTILS APPLICATIONS
+Technologies : .NET/C#, DevBooster (Framework interne à base de C# et Xaml), JQuery, Git, GitLab, Azure DevOps
+Base de données : SQL Server
+Mission : 
+•	Développement des nouvelles fonctionnalités
+o	Procédure stockée
+o	Webservice
+o	Projet batch 
+o	Mise en place des jobs
+o	Rédaction des différentes spécifications technique 
+o	Projet Web
+•	Maintenance et support 
+•	Participé à des différentes réunions d’équipe ou des réunions avec des client   
+o	Daily, planning poker, planning de sprint, retrospection, PO
+o	Démo avec le client, Brain storming, éclaircissement des évolutions 
+Projet : 
+1.	ASVC : Gestion des comptes de service
+
+Les comptes de services permettent de se connecter au LDAP/AD du groupe afin d'y récupérer des informations. Ces comptes sont pilotés par une application interne sous le nom de ASVC. Y sont référencé les comptes de services, les mots de passes et l'audit des accès. 
+Un compte de service est un compte technique nécessaire au fonctionnement d’un système ou d’une application. Ces comptes ont généralement des privilèges élevés qui sont nécessaires pour effectuer des tâches ou des fonctions spécialisées et ne sont généralement pas des comptes utilisés par un utilisateur humain.
+
+2.	PXE : Référentiel des postes de travail
+
+PXE est une application qui permet qui permet de gérer la construction (kit) des postes de travail.
+A chaque poste de travail est associé une « fiche PXE » qui décrit :
+•	Les informations techniques du poste (Type de matériel, Système d’exploitation, etc.)
+•	Les applications à installer sur le poste
+•	Les imprimantes/scanner à configurer
+
+3.	ACERT : application de gestion des certificats numériques
+L’application ASEC_CERTIF a pour objet d’enregistrer des demandes de création de certificats numériques et de suivre leurs traitements. 
+Fonctionnalités :
+•	Demande de certificat numérique
+•	Renouvellement d’un certificat arrivant à expiration
+•	Révocation d’un certificat car compromis
+•	Suivi du traitement des demandes par les administrateurs
+•	Surveillance des certificats arrivant à expiration
+
+4.	PFTL : Service de logs
+Le site PFTL est le portail d’accueil vers les services de suivi et de gestion des différentes entités de l’infrastructure des WEBFARMs (suivi et administration des services MIDDLEWARE, recherche de logs, administration diverses, etc.).
+Le site PFTL permet aujourd’hui principalement :
+•	de suivre en temps réel les services Middleware sur les webfarms
+•	de rechercher des informations dans le service de Logs
+•	de rechercher des informations sur les applications et leurs TSIs associées
+•	d’effectuer des conversions base 36
+•	de visualiser et purger le cache Middleware sur les serveurs COM
+Service de logs : Section du site PFTL permettant de consulter les logs PFTL (recherche de logs) et de configurer cettte recherche (masques de saisie et d'affichage, combinaisons de critères pré-remplis..)
+Webservice d'accès aux logs : Webservice permettant d'accéder aux logs PFTL.
+Monitoring IIS : Section du site PFTL permettant de consulter les logs  IIS (recherche de logs) et les statistiques IIS (consolidées au niveau WEBFARM et application), ainsi que les logs HTTPERR.
+Administration TN3270 : Section du site PFTL permettant le suivi des services Middleware sur les serveurs HIS, ainsi que la gestion des éléments physiques et logiques permettant les connexions au HOST.
+Administration GNF : Section du site PFTL offrant une gestion simplifiée d’un serveur GNF (gestion des bases fédérées, des partitions, des applications, catégories de fichiers) ainsi qu’un suivi de ces entités.
