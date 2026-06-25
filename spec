@@ -1,512 +1,97 @@
-/******************************************************************************
- * Procédure batch_get_table_columns :
- * Récupère les colonnes d'une table avec leur type
- * @TableName : Nom de la table
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_get_table_columns]', N'P') IS NOT NULL
-DROP PROCEDURE [dbo].[batch_get_table_columns]
-GO
-CREATE PROCEDURE [dbo].[batch_get_table_columns]
-    @TableName NVARCHAR(128)
-AS
-BEGIN
-    SET NOCOUNT ON
-    SELECT COLUMN_NAME, DATA_TYPE
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = @TableName
-    ORDER BY ORDINAL_POSITION
-END
-GO
+Spécifications techniques – Séparation des équipes gestionnaires par environnement
+1. Objet
+Cette évolution a pour objectif de limiter l'administration des comptes de service selon l'environnement des sites auxquels ils sont rattachés.
+Aujourd'hui, un compte de service est créé depuis l'application de production et peut être associé à des sites appartenant à différents environnements. Les équipes gestionnaires ne sont pas différenciées par environnement.
+L'objectif est de distinguer les équipes gestionnaires dédiées aux environnements TEST, RECETTE et PROD, afin qu'une équipe ne puisse administrer que les comptes correspondant à son environnement.
+2. Existant
+Configuration
+Les équipes gestionnaires sont actuellement stockées dans la table CONFIGURATION via une unique entrée.
+Clé
+Valeur
+ADMIN_TEAMS
+Liste des équipes séparées par ";"
+Exemple
 
-/******************************************************************************
- * Procédure batch_select_all_tables :
- * Récupère tous les tables dans la bd
- * @TableName : Nom de la table
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_select_all_tables]', N'P') IS NOT NULL
-DROP PROCEDURE [dbo].[batch_select_all_tables]
-GO
-CREATE PROCEDURE [dbo].[batch_select_all_tables]
-AS
-BEGIN
-    SET NOCOUNT ON
-    SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'
-END
-GO
+ADMIN_TEAMS
+1320;1430;3A10;3D60
+Toutes les équipes sont considérées comme équivalentes.
+Gestion des comptes
+Lors de la création d'un compte de service :
+une équipe gestionnaire est sélectionnée ;
+un ou plusieurs sites sont associés au compte.
+Aucune vérification n'est réalisée entre l'équipe gestionnaire sélectionnée et l'environnement des sites.
+3. Evolution de la base de données
+Le format actuel de stockage est conservé.
+La configuration sera découpée en plusieurs entrées.
+Clé
+ADMIN_TEAMS_TEST
+ADMIN_TEAMS_RECETTE
+ADMIN_TEAMS_PROD
+Chaque valeur conservera le format actuel.
+Exemple
 
-/******************************************************************************
- * Procédure batch_get_table_columns_type :
- * Récupère les colonnes d'une table avec leur type
- * @TableName : Nom de la table
- * @ColumnName : nom du colonne 
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_get_table_columns_type]', N'P') IS NOT NULL
-DROP PROCEDURE [dbo].[batch_get_table_columns_type]
-GO
-CREATE PROCEDURE [dbo].[batch_get_table_columns_type]
-    @TableName NVARCHAR(128),
-	@ColumnName NVARCHAR(128)
-AS
-BEGIN
-    SET NOCOUNT ON
-    SELECT COLUMN_NAME, DATA_TYPE
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = @TableName AND COLUMN_NAME = @ColumnName
-END
-GO
+ADMIN_TEAMS_TEST
 
-/******************************************************************************
- * Procédure batch_get_table_foreign_keys :
- * Récupère les clés étrangères d'une table
- * @TableName : Nom de la table
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_get_table_foreign_keys]', N'P') IS NOT NULL
-DROP PROCEDURE [dbo].[batch_get_table_foreign_keys]
-GO
-CREATE PROCEDURE [dbo].[batch_get_table_foreign_keys]
-    @TableName NVARCHAR(128)
-AS
-BEGIN
-    SET NOCOUNT ON;
+1320;1430;2950
 
-    SELECT 
-        KCU.COLUMN_NAME,
-        PK.TABLE_NAME AS REFERENCED_TABLE,
-        CASE 
-            WHEN C.IS_NULLABLE = 'YES' THEN 1 ELSE 0
-        END AS IS_NULLABLE
-    FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS RC
-    INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE KCU
-        ON KCU.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS TC
-        ON TC.CONSTRAINT_NAME = RC.CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS PK
-        ON PK.CONSTRAINT_NAME = RC.UNIQUE_CONSTRAINT_NAME
-    INNER JOIN INFORMATION_SCHEMA.COLUMNS C
-        ON C.TABLE_NAME = KCU.TABLE_NAME
-        AND C.COLUMN_NAME = KCU.COLUMN_NAME
-    WHERE KCU.TABLE_NAME = @TableName
-    ORDER BY KCU.ORDINAL_POSITION;
-END
-GO
+ADMIN_TEAMS_RECETTE
 
-/******************************************************************************
- * Procédure [batch_safe_insert_with_type_conversion_batch] :
- * [batch_safe_insert_with_type_conversion_batch]
- ******************************************************************************/
+3A10;3A20
 
-/* ============================================================
-   1) Utilitaire : scinder une liste par virgules en gardant l’ordre
-   ============================================================ */
-	IF OBJECT_ID('dbo.SplitByCommaOrdered') IS NULL
-		EXEC('CREATE FUNCTION dbo.SplitByCommaOrdered(@s nvarchar(max))
-	RETURNS @t TABLE (Item nvarchar(max), Ord int)
-	AS
-	BEGIN
-	  DECLARE @p int=1, @o int=1, @n int, @x nvarchar(max);
-	  IF @s IS NULL RETURN;
-	  WHILE 1=1
-	  BEGIN
-		SET @n = CHARINDEX('','', @s, @p);
-		IF @n=0 SET @x = SUBSTRING(@s, @p, LEN(@s)-@p+1);
-		ELSE    SET @x = SUBSTRING(@s, @p, @n-@p);
-		INSERT INTO @t(Item, Ord) VALUES(LTRIM(RTRIM(@x)), @o);
-		SET @o=@o+1; IF @n=0 BREAK; SET @p=@n+1;
-	  END
-	  RETURN
-	END');
-	GO
+ADMIN_TEAMS_PROD
 
-/* ============================================================
-   2) Procédure d’insertion batch
-   ============================================================ */
-IF OBJECT_ID(N'[dbo].[batch_safe_insert_with_type_conversion]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_safe_insert_with_type_conversion];
-GO
+3D60;3M20
+L'ancienne clé ADMIN_TEAMS sera conservée durant la phase de migration puis supprimée une fois l'ensemble des traitements adaptés.
+4. Détermination de l'environnement
+L'environnement d'un compte sera déterminé à partir des sites qui lui sont associés.
+Chaque site possède déjà une information permettant de connaître son environnement.
+Aucune évolution de la table SITE n'est nécessaire.
+5. Evolution des traitements
+Création d'un compte
+Lors de la création :
+récupération des sites sélectionnés ;
+détermination de leur environnement ;
+récupération des équipes autorisées pour cet environnement ;
+contrôle de l'équipe sélectionnée.
+Si l'équipe n'appartient pas à l'environnement du ou des sites sélectionnés, la création est refusée.
+Modification d'un compte
+Les mêmes contrôles devront être réalisés lors de la modification.
+En cas de changement de sites, la cohérence entre l'équipe gestionnaire et les nouveaux sites devra être vérifiée.
+Administration des équipes
+L'écran d'administration devra permettre de gérer indépendamment les équipes :
+TEST
+RECETTE
+PROD
+Chaque modification devra mettre à jour la clé de configuration correspondante.
+6. Contrôles
+Les contrôles devront être réalisés côté serveur.
+Pour chaque site associé au compte :
+déterminer son environnement ;
+récupérer les équipes autorisées ;
+vérifier que l'équipe sélectionnée appartient à cette liste.
+En cas d'incohérence, le traitement devra être interrompu.
+Exemple :
 
-CREATE PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
-    @TableName      NVARCHAR(128),
-    @Columns        NVARCHAR(MAX),      -- ex: [Col1],[Col2]
-    @ValuesBatch    NVARCHAR(MAX),      -- lignes: NCHAR(30), colonnes: NCHAR(29)
-    @HasIdentity    BIT          = 0,
-    @IdentityCol    NVARCHAR(128)= NULL -- si NULL et @HasIdentity=1 : auto-détection
-AS
-BEGIN
-    SET NOCOUNT ON;
-    SET LOCK_TIMEOUT 5000;
-    SET DEADLOCK_PRIORITY LOW;
+Equipe gestionnaire : 1320
 
-    -- Séparateurs (doivent matcher le côté C#)
-    DECLARE @RS nchar(1) = NCHAR(30);  -- record separator (ligne)
-    DECLARE @CS nchar(1) = NCHAR(29);  -- column separator
-	BEGIN TRY
-		BEGIN TRANSACTION;
+Environnement autorisé :
+TEST
 
-			-- Détection de la colonne IDENTITY si demandée
-			IF @HasIdentity = 1 AND ( @IdentityCol IS NULL OR LEN(@IdentityCol)=0 )
-			BEGIN
-				SELECT TOP (1) @IdentityCol = c.COLUMN_NAME
-				FROM INFORMATION_SCHEMA.COLUMNS c
-				WHERE c.TABLE_NAME = @TableName
-				  AND COLUMNPROPERTY(OBJECT_ID(c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') = 1;
-			END
+Site sélectionné :
+Production
 
-			-- Colonnes PK/UNIQUE (hors éventuelle identity), agrégées pour SQL 2016
-			DECLARE @pkCols NVARCHAR(MAX);
-			;WITH PKU AS (
-				SELECT kcu.COLUMN_NAME
-				FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-				JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
-				  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
-				 AND tc.TABLE_NAME      = kcu.TABLE_NAME
-				WHERE tc.TABLE_NAME = @TableName
-				  AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY','UNIQUE')
-				  AND ( @IdentityCol IS NULL OR kcu.COLUMN_NAME <> @IdentityCol )
-			)
-			SELECT @pkCols = STUFF((
-				SELECT ',' + QUOTENAME(PKU.COLUMN_NAME)
-				FROM PKU
-				FOR XML PATH(''), TYPE).value('.','nvarchar(max)'),1,1,''
-			);
-
-			-- Résultats (une ligne par ligne du batch)
-			DECLARE @out TABLE (
-				RowIndex     INT,
-				NewID        NVARCHAR(100),
-				ErrorMessage NVARCHAR(MAX)
-			);
-
-			-- Batch vide ?
-			IF @ValuesBatch IS NULL OR LEN(@ValuesBatch)=0
-			BEGIN
-				INSERT INTO @out VALUES (0, NULL, N'Batch vide (aucune donnée)');
-				SELECT RowIndex, NewID, ErrorMessage FROM @out ORDER BY RowIndex;
-				RETURN;
-			END
-
-			-- Préparer liste des colonnes avec l’ordre
-			DECLARE @cols TABLE(ColName nvarchar(128), Ord int);
-			INSERT INTO @cols(ColName, Ord)
-			SELECT LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']',''))), Ord
-			FROM dbo.SplitByCommaOrdered(@Columns);
-
-			-- Préparer set de colonnes PK/UK pour test rapide
-			DECLARE @pk TABLE(ColName nvarchar(128) PRIMARY KEY);
-			IF @pkCols IS NOT NULL AND LEN(@pkCols)>0
-			BEGIN
-				INSERT INTO @pk(ColName)
-				SELECT LTRIM(RTRIM(REPLACE(REPLACE(Item,'[',''),']','')))
-				FROM dbo.SplitByCommaOrdered(@pkCols);
-			END
-
-			-- Boucle sur les lignes du batch (découpage manuel)
-			DECLARE @len    INT  = LEN(@ValuesBatch);
-			DECLARE @cur    INT  = 1;              -- position dans @ValuesBatch
-			DECLARE @next   INT;                   -- position du prochain @RS
-			DECLARE @line   NVARCHAR(MAX);         -- ligne courante (texte brut)
-			DECLARE @rowIdx INT  = 0;              -- 1..N
-
-			WHILE @cur <= @len
-			BEGIN
-				-- Isoler la ligne courante
-				SET @next = CHARINDEX(@RS, @ValuesBatch, @cur);
-				IF @next = 0
-					SET @line = SUBSTRING(@ValuesBatch, @cur, @len - @cur + 1);
-				ELSE
-					SET @line = SUBSTRING(@ValuesBatch, @cur, @next - @cur);
-
-				IF @next = 0 SET @cur = @len + 1 ELSE SET @cur = @next + 1;
-
-				-- Index de ligne ++
-				SET @rowIdx = @rowIdx + 1;
-
-				-- Trim & ligne vide ?
-				SET @line = LTRIM(RTRIM(@line));
-				IF @line IS NULL OR LEN(@line)=0
-				BEGIN
-					INSERT INTO @out VALUES(@rowIdx, NULL, N'Ligne vide ignorée');
-					CONTINUE;
-				END
-
-				-- 1) Contrôle nb colonnes/valeurs
-				DECLARE @valCount INT = (LEN(@line) - LEN(REPLACE(@line, @CS, N''))) + 1;
-				DECLARE @colCount INT = (LEN(@Columns) - LEN(REPLACE(@Columns, N',', N''))) + 1;
-
-				IF @valCount <> @colCount
-				BEGIN
-					INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-					VALUES(@rowIdx, NULL,
-						   N'ERR: Nombre de valeurs <> colonnes. Attendu='
-						   + CAST(@colCount AS nvarchar(10))
-						   + N' | Trouvé=' + CAST(@valCount AS nvarchar(10))
-						   + N' | Row="' + @line + N'"');
-					CONTINUE;
-				END
-
-				-- 2) Détection doublon (PK/UK)
-				DECLARE @whereClause nvarchar(max) = N'';
-				IF EXISTS(SELECT 1 FROM @pk)
-				BEGIN
-					DECLARE @ord int = 1, @p int = 1, @n int, @token nvarchar(max);
-					DECLARE @work nvarchar(max) = @line;
-
-					WHILE 1=1
-					BEGIN
-						SET @n = CHARINDEX(@CS, @work, @p);
-						IF @n = 0 SET @token = SUBSTRING(@work, @p, LEN(@work)-@p+1);
-						ELSE      SET @token = SUBSTRING(@work, @p, @n-@p);
-
-						DECLARE @col nvarchar(128) =
-							(SELECT ColName FROM @cols WHERE Ord=@ord);
-
-						IF @col IS NOT NULL AND EXISTS(SELECT 1 FROM @pk WHERE ColName=@col)
-						BEGIN
-							SET @whereClause = @whereClause
-								+ CASE WHEN LEN(@whereClause)>0 THEN N' AND ' ELSE N'' END
-								+ QUOTENAME(@col) + N' = '
-								+ CASE WHEN UPPER(LTRIM(RTRIM(@token))) = N'NULL'
-									   THEN N'NULL' ELSE @token END;
-						END
-
-						SET @ord = @ord + 1;
-						IF @n = 0 BREAK;
-						SET @p = @n + 1;
-					END
-
-					IF LEN(@whereClause) > 0
-					BEGIN
-						DECLARE @exists bit = 0;
-						DECLARE @checkSql nvarchar(max) =
-							N'SELECT @out = CASE WHEN EXISTS (SELECT 1 FROM '
-							+ QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE '
-							+ @whereClause + N') THEN 1 ELSE 0 END';
-						EXEC sp_executesql @checkSql, N'@out bit OUTPUT', @out=@exists OUTPUT;
-
-						IF @exists = 1
-						BEGIN
-							DECLARE @dupId nvarchar(100) = NULL;
-
-							IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL AND LEN(ISNULL(@whereClause,N'')) > 0
-							BEGIN
-								DECLARE @selDupSql nvarchar(max) =
-									N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
-									N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
-
-								EXEC sp_executesql
-									 @selDupSql,
-									 N'@nid nvarchar(100) OUTPUT',
-									 @nid = @dupId OUTPUT;
-							END
-
-							INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-							VALUES(@rowIdx, @dupId, N'Doublon');  -- NewID peut être NULL si pas d’identity
-							CONTINUE;
-						END
-					END
-				END
-
-				-- 3) Liste de valeurs pour l'INSERT (remplacer @CS par des virgules)
-				DECLARE @values nvarchar(max) = REPLACE(@line, @CS, N',');
-
-				-- 4) INSERT : version SCOPE_IDENTITY() (safe vs triggers),
-				--    mais uniquement si @HasIdentity = 1 ET @IdentityCol non NULL.
-				DECLARE @sql nvarchar(max);
-				SET @sql = N'SET NOCOUNT ON; '
-						 + N'INSERT INTO ' + QUOTENAME(@TableName) + N' (' + @Columns + N') '
-						 + N'SELECT ' + @values + N'; ';
-
-				IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-				BEGIN
-					SET @sql = @sql + N'SET @nid = CONVERT(nvarchar(100), SCOPE_IDENTITY());';
-				END
-
-				BEGIN TRY
-					IF @HasIdentity = 1 AND @IdentityCol IS NOT NULL
-					BEGIN
-						DECLARE @newId nvarchar(100) = NULL;  -- réinit à chaque ligne
-						EXEC sp_executesql
-							@sql,
-							N'@nid nvarchar(100) OUTPUT',
-							@nid = @newId OUTPUT;
-
-						-- Fallback si SCOPE_IDENTITY() vide : relire par PK/UNIQUE
-						IF (@newId IS NULL OR @newId = N'')
-						BEGIN
-							IF LEN(ISNULL(@whereClause, N'')) > 0
-							BEGIN
-								DECLARE @selIdSql nvarchar(max) =
-									N'SELECT @nid = CONVERT(nvarchar(100), ' + QUOTENAME(@IdentityCol) + N') ' +
-									N'FROM ' + QUOTENAME(@TableName) + N' WITH (NOLOCK) WHERE ' + @whereClause + N';';
-
-								DECLARE @nid2 nvarchar(100) = NULL;
-								EXEC sp_executesql
-									 @selIdSql,
-									 N'@nid nvarchar(100) OUTPUT',
-									 @nid = @nid2 OUTPUT;
-
-								IF (@nid2 IS NOT NULL AND @nid2 <> N'')
-									SET @newId = @nid2;
-							END
-						END
-
-						IF @newId IS NULL OR @newId = N''
-						BEGIN
-							INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-							VALUES(@rowIdx, NULL, N'ERR: aucune ligne insérée (SCOPE_IDENTITY() vide) | vals=' + @values);
-						END
-						ELSE
-						BEGIN
-							INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-							VALUES(@rowIdx, @newId, NULL);
-						END
-					END
-					ELSE
-					BEGIN
-						-- Table sans identity : simple insert
-						EXEC sp_executesql @sql;
-						INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-						VALUES(@rowIdx, NULL, NULL);
-					END
-				END TRY
-				BEGIN CATCH
-					INSERT INTO @out(RowIndex, NewID, ErrorMessage)
-					VALUES(@rowIdx, NULL, N'ERR: ' + ERROR_MESSAGE() + N' | vals=' + @values);
-				END CATCH
-			END -- WHILE lignes
-
-			-- Retour des résultats
-			SELECT RowIndex, NewID, ErrorMessage
-			FROM @out
-			ORDER BY RowIndex;
-		COMMIT;
-    END TRY
-    BEGIN CATCH
-        -- Annuler la transaction en cas d'erreur
-        ROLLBACK;
-
-        -- Gérer l'erreur
-        PRINT ERROR_MESSAGE();
-    END CATCH;
-END
-GO
-/******************************************************************************
- * Procédure [batch_pass_through_existingId] :
- * TryPassThroughExistingId
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_pass_through_existingId]', N'P') IS NOT NULL
-	DROP PROCEDURE [dbo].[batch_pass_through_existingId];
-GO
-CREATE PROCEDURE [dbo].[batch_pass_through_existingId]
-    @idCol NVARCHAR(255),
-    @TableName NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @sql NVARCHAR(MAX);
-
-    SET @sql = 'SELECT CAST([' + @idCol + '] AS nvarchar(200)) AS K FROM [' + @TableName + '] WITH (NOLOCK)';
-
-    EXEC sp_executesql @sql;
-END;
-GO
-
-/******************************************************************************
- * Procédure [dbo].[batch_get_fk_column_nullable] :
- * IsForeignKeyNullable
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_get_fk_column_nullable]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_get_fk_column_nullable];
-GO
-CREATE PROCEDURE [dbo].[batch_get_fk_column_nullable]
-    @table NVARCHAR(255),
-    @col NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @sql NVARCHAR(MAX);
-
-    SET @sql = 'SELECT is_nullable
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = ''' + @table + ''' AND COLUMN_NAME = ''' + @col + '''';
-
-    EXEC sp_executesql @sql;
-END;
-GO
-
-/******************************************************************************
- * Procédure [dbo].[batch_get_identity_columns] :
- * batch_get_identity_columns
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_get_identity_columns]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_get_identity_columns];
-GO
-CREATE PROCEDURE [dbo].[batch_get_identity_columns]
-    @table NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @sql NVARCHAR(MAX);
-
-    SET @sql = 'SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = ''' + @table + '''
-                AND COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, ''IsIdentity'') = 1';
-
-    EXEC sp_executesql @sql;
-END;
-GO
-
-/******************************************************************************
- * Procédure [dbo].[batch_fixup_deferred_foreignKeys] :
- * FixupDeferredForeignKeys
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_fixup_deferred_foreignKeys]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_fixup_deferred_foreignKeys];
-GO
-CREATE PROCEDURE [dbo].[batch_fixup_deferred_foreignKeys]
-    @tableName NVARCHAR(255),
-    @setParts NVARCHAR(MAX),
-    @idCol NVARCHAR(255),
-    @newId NVARCHAR(255)
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    DECLARE @sql NVARCHAR(MAX);
-	 BEGIN TRY
-        BEGIN TRANSACTION;
-			SET @sql = 'UPDATE [' + @tableName + '] SET ' + @setParts + ' WHERE [' + @idCol + ']=' + @newId;
-
-			EXEC sp_executesql @sql;
-			COMMIT;
-    END TRY
-    BEGIN CATCH
-        -- Annuler la transaction en cas d'erreur
-        ROLLBACK;
-
-        -- Gérer l'erreur
-        PRINT ERROR_MESSAGE();
-    END CATCH;
-END;
-GO
-
-/******************************************************************************
- * Procédure [dbo].[batch_select_export] :
- ******************************************************************************/
-IF OBJECT_ID(N'[dbo].[batch_select_export]', N'P') IS NOT NULL
-    DROP PROCEDURE [dbo].[batch_select_export];
-GO
-CREATE PROCEDURE [dbo].[batch_select_export]
-    @TableName NVARCHAR(128)
-AS
-BEGIN
-    DECLARE @SQL NVARCHAR(MAX);
-
-    SET @SQL = 'SELECT * FROM ' + QUOTENAME(@TableName);
-
-    EXEC sp_executesql @SQL;
-END;
-GO
+=> Création refusée
+7. Migration
+Une reprise des données sera nécessaire.
+Les équipes actuellement présentes dans ADMIN_TEAMS devront être réparties entre :
+ADMIN_TEAMS_TEST
+ADMIN_TEAMS_RECETTE
+ADMIN_TEAMS_PROD
+Cette répartition sera fournie par le métier.
+8. Impacts
+Cette évolution impacte :
+la gestion de la configuration des équipes gestionnaires ;
+l'administration des équipes ;
+la création d'un compte de service ;
+la modification d'un compte de service ;
+les contrôles de validation côté serveur.
