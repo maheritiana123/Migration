@@ -1,16 +1,42 @@
-SELECT SUM(x.[count]) AS TotalExactApplication
-FROM (
-    SELECT
-        ec.evc_id,
-        ec.evc_log_id,
-        (
-            SELECT COUNT(*)
-            FROM eventlog el
-            WHERE el.evt_class_id = ec.evc_id
-        ) AS [count]
-    FROM eventclasses ec
-    WHERE ec.evc_log_id IN (
-        SELECT log_id
-        FROM logs
-    )
-) x;
+if (File.Exists(SOR001))
+{
+    const char temporarySeparator = '\u001F';
+
+    string temporaryFile = SOR001 + ".tmp";
+
+    using (var reader = new StreamReader(SOR001, Encoding.UTF8))
+    using (var writer = new StreamWriter(
+        temporaryFile,
+        false,
+        new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)))
+    {
+        string? line;
+
+        while ((line = reader.ReadLine()) != null)
+        {
+            string[] columns = line.Split(temporarySeparator);
+
+            string csvLine = string.Join(
+                ";",
+                columns.Select(EscapeCsvValue));
+
+            writer.WriteLine(csvLine);
+        }
+    }
+
+    File.Delete(SOR001);
+    File.Move(temporaryFile, SOR001);
+}
+
+
+
+private static string EscapeCsvValue(string? value)
+{
+    value ??= string.Empty;
+
+    // Un guillemet présent dans la donnée doit être doublé.
+    value = value.Replace("\"", "\"\"");
+
+    // Toutes les valeurs sont encadrées de guillemets.
+    return $"\"{value}\"";
+}
