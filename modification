@@ -1,42 +1,162 @@
-if (File.Exists(SOR001))
+1. Cache à ajouter au niveau de la classe
+private readonly Dictionary<string, List<string>> _duplicateLogColumnsCache = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+2. Méthode qui récupère les colonnes utiles
+private List<string> GetDuplicateLogColumns(string tableName)
 {
-    const char temporarySeparator = '\u001F';
+    List<string> cachedColumns;
 
-    string temporaryFile = SOR001 + ".tmp";
+    if (_duplicateLogColumnsCache.TryGetValue(tableName, out cachedColumns))
+        return cachedColumns;
 
-    using (var reader = new StreamReader(SOR001, Encoding.UTF8))
-    using (var writer = new StreamWriter(
-        temporaryFile,
-        false,
-        new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)))
+    var columns = new List<string>();
+
+    DynamicSql sql = new DynamicSql
     {
-        string? line;
+        Dsn = "PXE1_PXE"
+    };
 
-        while ((line = reader.ReadLine()) != null)
-        {
-            string[] columns = line.Split(temporarySeparator);
+    string request = @"
+        SELECT
+            kcu.COLUMN_NAME,
+            kcu.ORDINAL_POSITION
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+           AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+           AND kcu.TABLE_NAME = tc.TABLE_NAME
+           AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+        WHERE tc.TABLE_NAME = $table$
+          AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+          AND COLUMNPROPERTY(
+                OBJECT_ID(kcu.TABLE_SCHEMA + '.' + kcu.TABLE_NAME),
+                kcu.COLUMN_NAME,
+                'IsIdentity'
+              ) = 0
+        ORDER BY
+            kcu.ORDINAL_POSITION";
 
-            string csvLine = string.Join(
-                ";",
-                columns.Select(EscapeCsvValue));
+    sql.AddDirectRequest(
+        request,
+        MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
 
-            writer.WriteLine(csvLine);
-        }
+    sql.SetSecureParam("table", tableName, true, 0);
+    sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
+    sql.Execute(30000);
+
+    int rowCount = sql.ReturnedRows(1, 1);
+
+    for (int i = 1; i <= rowCount; i++)
+    {
+        string columnName =
+            sql.GetValueUsingColName(i, "COLUMN_NAME", 1, 1);
+
+        if (string.IsNullOrWhiteSpace(columnName))
+            continue;
+
+        bool alreadyAdded = columns.Any(
+            c => string.Equals(
+                c,
+                columnName,
+                StringComparison.OrdinalIgnoreCase));
+
+        if (!alreadyAdded)
+            columns.Add(columnName);
     }
 
-    File.Delete(SOR001);
-    File.Move(temporaryFile, SOR001);
+    _duplicateLogColumnsCache[tableName] = columns;
+
+    return columns;
 }
 
+3. Méthode qui construit et écrit le log
 
-
-private static string EscapeCsvValue(string? value)
+private void LogDuplicateRow(
+    string tableName,
+    int rowIndex,
+    Dictionary<string, object> duplicateRow,
+    string oldId)
 {
-    value ??= string.Empty;
+    var logParts = new List<string>();
+    var usefulColumns = GetDuplicateLogColumns(tableName);
 
-    // Un guillemet présent dans la donnée doit être doublé.
-    value = value.Replace("\"", "\"\"");
+    foreach (string columnName in usefulColumns)
+    {
+        object value;
 
-    // Toutes les valeurs sont encadrées de guillemets.
-    return $"\"{value}\"";
+        if (!duplicateRow.TryGetValue(columnName, out value))
+            continue;
+
+        string displayValue =
+            value == null || string.IsNullOrWhiteSpace(value.ToString())
+                ? "NULL"
+                : value.ToString();
+
+        logParts.Add(columnName + "=" + displayValue);
+    }
+
+    // Cas où la seule PK est l'IDENTITY et qu'il n'existe aucune UNIQUE utile.
+    if (logParts.Count == 0)
+    {
+        logParts.Add(
+            "OldId=" +
+            (string.IsNullOrWhiteSpace(oldId) ? "inconnu" : oldId));
+    }
+
+    string message =
+        "[DOUBLON]" +
+        " Table=" + tableName +
+        " | BatchRow=" + rowIndex +
+        " | " + string.Join(" | ", logParts);
+
+    // Utilise ici la méthode qui écrit déjà dans ton fichier de log actuel.
+    WriteLog(message);
+}
+4- Bloc final dans ImportTableCommon
+
+if (!string.IsNullOrEmpty(err))
+{
+    if (err.IndexOf(
+            "Doublon",
+            StringComparison.OrdinalIgnoreCase) >= 0)
+    {
+        duplicates++;
+
+        if (rowIndex >= 1 && rowIndex <= batchRows.Count)
+        {
+            Dictionary<string, object> duplicateRow =
+                batchRows[rowIndex - 1];
+
+            string oldId = null;
+
+            if (rowIndex <= oldIdsBatch.Count)
+                oldId = oldIdsBatch[rowIndex - 1];
+
+            LogDuplicateRow(
+                tableName,
+                rowIndex,
+                duplicateRow,
+                oldId);
+        }
+        else
+        {
+            WriteLog(
+                "[DOUBLON]" +
+                " Table=" + tableName +
+                " | BatchRow=" + rowIndex +
+                " | Détail indisponible");
+        }
+    }
+    else
+    {
+        errors++;
+
+        WriteLog(
+            "[ERREUR INSERT]" +
+            " Table=" + tableName +
+            " | BatchRow=" + rowIndex +
+            " | " + err);
+    }
+
+    continue;
 }
