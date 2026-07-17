@@ -4,6 +4,32 @@ if (!string.IsNullOrEmpty(err))
     {
         duplicates++;
 
+        // ======== AJOUT : Log du doublon ========
+        if (rowIndex >= 1 && rowIndex <= batchRows.Count)
+        {
+            var duplicateRow = batchRows[rowIndex - 1];
+            var usefulColumns = GetDuplicateLogColumns(tableName);
+
+            var logParts = new List<string>();
+
+            foreach (string column in usefulColumns)
+            {
+                object value;
+                if (duplicateRow.TryGetValue(column, out value))
+                {
+                    logParts.Add(
+                        column + "=" +
+                        (value == null ? "NULL" : value.ToString()));
+                }
+            }
+
+            WriteLog(
+                "[DOUBLON] Table=" + tableName +
+                " | " + string.Join(" | ", logParts));
+        }
+        // ======== FIN AJOUT ========
+
+        // ======== CODE EXISTANT (inchangé) ========
         if (hasIdentity
             && !string.IsNullOrEmpty(newId)
             && rowIndex >= 1
@@ -20,6 +46,7 @@ if (!string.IsNullOrEmpty(err))
                 _idMappings[tableName][oldId] = newId;
             }
         }
+        // ======== FIN CODE EXISTANT ========
     }
     else
     {
