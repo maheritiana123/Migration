@@ -1,55 +1,68 @@
-if (err.IndexOf("Doublon", StringComparison.OrdinalIgnoreCase) >= 0)
-{
-    duplicates++;
+Spécification technique
 
-    // ===== LOG DU DOUBLON =====
-    if (rowForReject != null)
-    {
-        var duplicateColumns = GetDuplicateLogColumns(tableName);
+Le traitement concerne l’export CSV généré avec BcpInject.
 
-        var values = new List<string>();
+Le séparateur ; posait problème lorsque ce caractère était présent dans les données, notamment dans le champ Description. Cela provoquait un décalage des colonnes.
 
-        foreach (string column in duplicateColumns)
-        {
-            object value;
+La correction consiste à :
 
-            if (rowForReject.TryGetValue(column, out value))
-            {
-                values.Add(
-                    column + "=" +
-                    (value == null ? "NULL" : value.ToString()));
-            }
-        }
+utiliser un séparateur technique temporaire dans BcpInject, par exemple CHAR(31) ;
+relire le fichier après l’export ;
+découper les colonnes avec ce séparateur temporaire ;
+entourer chaque valeur avec des guillemets ;
+doubler les guillemets déjà présents dans les données ;
+reconstruire le fichier final avec ; comme séparateur.
 
-        // si aucune colonne PK/UNIQUE exploitable
-        if (values.Count == 0
-            && rowIndex >= 1
-            && rowIndex <= oldIdPerRow.Count)
-        {
-            values.Add("OldId=" + oldIdPerRow[rowIndex - 1]);
-        }
+Exemple :
 
-        WriteLog(
-            "[DOUBLON] Table=" + tableName +
-            " | " +
-            string.Join(" | ", values));
-    }
+Compte bloqué; à vérifier
 
-    // ===== CODE EXISTANT =====
-    if (hasIdentity
-        && !string.IsNullOrEmpty(newId)
-        && rowIndex >= 1
-        && rowIndex <= oldIdPerRow.Count)
-    {
-        var oldId = oldIdPerRow[rowIndex - 1];
+devient :
 
-        if (!string.IsNullOrEmpty(oldId))
-        {
-            if (!_idMappings.ContainsKey(tableName))
-                _idMappings[tableName] =
-                    new Dictionary<object, object>();
+"Compte bloqué; à vérifier"
+Cas de test
+Cas 1 — Valeur normale
 
-            _idMappings[tableName][oldId] = newId;
-        }
-    }
-}
+Entrée :
+
+Compte actif
+
+Résultat attendu :
+
+"Compte actif"
+Cas 2 — Valeur contenant un ;
+
+Entrée :
+
+Compte bloqué; à vérifier
+
+Résultat attendu :
+
+"Compte bloqué; à vérifier"
+
+La valeur doit rester dans une seule colonne.
+
+Cas 3 — Valeur contenant des guillemets
+
+Entrée :
+
+Compte "administrateur"
+
+Résultat attendu :
+
+"Compte ""administrateur"""
+Cas 4 — Valeur vide ou nulle
+
+Résultat attendu :
+
+""
+
+Le traitement ne doit pas générer d’erreur.
+
+Cas 5 — Plusieurs lignes
+
+Vérifier que :
+
+le nombre de lignes est conservé ;
+le nombre de colonnes reste identique ;
+aucun décalage n’est présent dans le fichier final.
