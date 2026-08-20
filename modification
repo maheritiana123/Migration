@@ -1,2 +1,194 @@
-FITMIND_TOKEN_SECRET=f7Xq9Lm2VnK8aP4rYc6Ht1Ws3Zd0Ju5Be9Ng7Rx2Qm4Cv8Lp
-FITMIND_ADMIN_TOKEN=N4vX8qLp2Kz7Tm5Rw9Yc1Hs6Jd3Bg0UfEa8Pn4Mx
+Il faut corriger les procédures stockées de façon à éliminer les vecteurs d'injections. Une procédure stockée est jugée vulnérable si elle contient des paramètres de types non sûrs concaténés dans une partie interprétable de la requête (soit dans un EXEC, EXEC sp_executesql, EXECUTE sp_executesql). Les procédures sans mot-clé EXEC ou EXECUTE sont considérées sécurisées.
+
+ 
+
+Un type est considéré sûr s'il fait partie de la liste suivante : "int", "bit", "decimal", "bigint", "numeric", "smallint", "smallmoney", "tinyint", "money", "bigint", "float", "real".
+
+Les paramètres d'entrée de type VARCHAR ou NVARCHAR de taille 4 ou moins seront également considérés comme sécurisés. La limite à 4 caractères permet de continuer à passer en paramètre les chaînes 'asc' ou 'desc' pour couvrir le cas d'un ORDER BY paramétré.
+
+La sécurisation de telles procédures consiste en la bonne utilisation d'EXEC/EXECUTE sp_executesql c'est à dire en définissant les paramètres passés lors de l'exécution de la requête. Même dans ce cas de figure, il faut veiller à ne plus concaténer les paramètres.
+
+Remarque importante sur les exemples
+Les exemples ci-dessous présentent des cas ressemblant à ceux fréquemment trouvés dans lesquels l'utilisation du mot-clé EXEC/EXECUTE n'est pas nécessaire. Réécrire ces requêtes sans EXEC/EXECUTE sera sécurisé et améliorera également les performances de la procédure.
+
+Exemple avec EXECUTE
+
+sp avec exec
+
+Procédure équivalente sans EXECUTE
+
+sp sans exec
+
+Exemples (avant / après)
+Exemple avec clause WHERE
+
+Le code suivant :
+
+ 
+
+where_vulnerable
+
+doit être remplacé par :
+
+ 
+
+where_secure
+
+Exemple avec clause LIKE
+
+Le code suivant :
+
+ 
+
+like_vulnerable
+
+doit être remplacé par :
+
+ 
+
+like_secure
+
+Ce dernier exemple peut nécessiter plus d'explications : le contenu d'@SEL n'est qu'une seule chaîne. La concaténation est construite à l'intérieur de la chaîne mais le paramètre @Name n'est pas directement concaténé. Lorsque la requête est passée via sp_executesql, elle va être reconstruite et la concaténation s'opérera à ce moment-là. Comme le type du paramètre aura été proprement passé à sp_executesql, le serveur pourra résoudre la chaîne (et les éventuels caractères spéciaux contenus dans le paramètre seront correctement échappés).
+
+ 
+
+Notez que dans certains cas, comme par exemple la concaténation de contenu entièrement dynamique (cas d'une clause WHERE pour du filtrage) un tel passage à sp_executesql n'est pas envisageable. Il faut alors soit :
+
+Réécrire la partie statique de la clause (les WHERE col1 =) dans la procédure stockée et ne passer que les paramètres comme indiqué au dessus. Dans ce cas, il faudra discriminer la requête à exécuter en fonction du nombre de paramètres d'entrée.
+Abandonner la procédure stockée et passer en requête inlinée dans le code serveur de l'application. Il faudra alors s'assurer que les paramètres sont correctement résolus via les API de passage de paramètre du langage utilisé côté serveur.
+ 
+
+Il ne faut pas uniquement ajouter sp_executesql
+
+L'exemple ci-dessous n'est pas sécurisé car le paramètre d'entrée est toujours directement concaténé. Ainsi, il sera intégré au corps de la requête avant d'être filtré par sp_executesql. Aucune sécurisation n'est donc appliquée.
+
+ 
+
+like_vuln_spexec
+
+Cas particuliers
+Dans certains cas, le simple remplacement d'une concaténation par une substitution via sp_executesql n'est pas adapté. Par exemple, si la partie paramétrée de la requête est dynamique et dépend du choix des utilisateurs (exemple : clause WHERE avec nombre de conditions variables), il ne sera pas possible de simplement retirer la concaténation. Cette section présente les cas particuliers identifiés et comment les résoudre.
+
+Clause WHERE ... IN avec liste de paramètres variable
+On considère la procédure suivante :
+
+ 
+
+where_in_vuln
+
+ 
+
+Cette dernière n'est pas sécurisée à cause de la concaténation de la liste des paramètres. Il est cependant impossible de remplacer la fin de cette procédure par :
+
+ 
+
+where_in_imp
+
+ 
+
+car la liste des paramètres sera alors considérée comme une chaîne unique.
+
+Nous proposons la solution suivante :
+
+ 
+
+where_in_secure
+
+ 
+
+Cette dernière prend la liste des valeurs sur lesquelles effectuer la sélection et les ordonne dans une table temporaire. Le WHERE ... IN de la procédure d'origine est alors remplacé par une jointure sur la table temporaire ainsi construite qui remplira le même office.
+
+Cette solution est sécurisée : la condition de jointure ne s'attend pas à trouver des éléments interprétables et va donc tout considérer comme du contenu "à comparer", désactivant ainsi toute tentative d'injection.
+
+De plus, cette solution est particulièrement adaptable : on peut définir plusieurs colonnes dans la table temporaire et ranger les entrées en fonction de leur type (par exemple).
+
+Enfin, il faut noter que l'utilisation d'une jointure va rajouter des colonnes dans les lignes remontées : il faut donc éviter le SELECT * et ne choisir que les colonnes qui nous intéressent.
+
+Clause WHERE avec conditions dynamiques
+On considère la procédure suivante :
+
+ 
+
+where_dynamic_vulnerable
+
+ 
+
+Cette dernière n'est pas sécurisée à cause de la concaténation des conditions de sélection du WHERE. Il est cependant impossible de remplacer la fin de cette procédure par :
+
+ 
+
+where_dynamic_imp
+
+ 
+
+car la liste des paramètres sera alors considérée comme une chaîne unique.
+
+La seule solution pour sécuriser un tel appel consiste à supprimer la procédure stockée et construire une requête côté serveur.
+
+La procédure stockée ci-dessus n'apporte rien en terme de performances : le calcul d'un plan d'exécution fiable est impossible à cause de l'imprévisibilité des conditions de sélection. Inliner une telle requête est donc pertinent.
+
+Un exemple en C# avec l'API SqlRequest de DevBooster et deux paramètres :
+
+ 
+
+where_dynamic_secure
+
+ 
+
+Plus d'exemples d'utilisation de l'API SqlRequestPart en section X de la documentation Pixis d'SqlProxy
+
+Note : si une clause WHERE revient dans une majorité des appels, une optimisation serait de construire une procédure stockée paramétrée pour cette clause WHERE en particulier, et de gérer le reste des clauses WHERE comme indiqué ci-dessus.
+
+Concaténation de nom de table ou de colonne
+On considère l'extrait de procédure suivant :
+
+ 
+
+tablename_vuln
+
+ 
+
+Cet extrait présente un problème de sécurité à cause de la concaténation du nom de table qui peut conduire à de l'injection. Il n'est pas non plus possible de substituer le paramètre via sp_executesql car la partie "SELECT FROM" de la procédure est précompilée. Si la variable contenant la table sur laquelle effectuer la sélection est passée sans concaténation, la compilation va échouer puisque ce nom ne peut pas être connu avant l'exécution.
+
+On propose alors d'utiliser la fonction QUOTENAME :
+
+ 
+
+tablename_secure
+
+ 
+
+Cette fonction va construire un délimiteur correct en encadrant la valeur passée en paramètre par [ ]. Ainsi, les tentatives d'injection vont échouer car toute la chaîne injectée sera considérée comme un nom de table/colonne et ne sera donc pas interprétée.
+
+Note : si vous êtes dans ce cas de figure, il faudrait sans doute repenser la logique des requêtes car un nom de table ne devrait pas être passé en paramètre. Un tel fonctionnement permet toujours du déplacement latéral (cibler une table d'une autre base). Nous vous conseillons alors d'entrer en contact avec Y520 via SARA SQLD001 pour un accompagnement.
+
+Concaténation d'une liste de plusieurs colonnes lors d'un ORDER BY
+On considère la procédure suivante :
+
+ 
+
+orderby_multiple_secure
+
+ 
+
+Cette dernière n'est pas sécurisée à cause de la concaténation de la liste des paramètres. Il est cependant impossible de remplacer la fin de cette procédure par :
+
+ 
+
+orderby_multiple_imp
+
+ 
+
+car la liste des colonnes sera alors considérée comme une chaîne unique.
+
+Nous proposons la solution suivante :
+
+ 
+
+orderby_multiple_secure
+
+ 
+
+Cette solution utilise une table temporaire dans laquelle stocker les noms des colonnes échappés via QUOTENAME sur lesquelles effectuer l'ORDER BY et un REPLACE permettant de rajouter les virgules pour assurer le bon fonctionnement de la clause ORDER BY.
+
+La sécurité est assurée par l'échappement via QUOTENAME.
