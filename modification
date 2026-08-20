@@ -1,16 +1,54 @@
-BEGIN CATCH
-    DECLARE @ErrMsg nvarchar(max) = ERROR_MESSAGE();
-    DECLARE @ErrNum int = ERROR_NUMBER();
-    DECLARE @ErrState int = ERROR_STATE();
-    DECLARE @XactState int = XACT_STATE();
+IF UPPER(@token) = N'NULL'
+BEGIN
+    SET @isNull = 1;
+    SET @raw = NULL;
+END
 
-    RAISERROR(
-        'INSERT batch erreur %d | State=%d | XACT_STATE=%d | %s',
-        16,
-        1,
-        @ErrNum,
-        @ErrState,
-        @XactState,
-        @ErrMsg
-    );
-END CATCH
+-- Cas Unicode : N'texte'
+ELSE IF LEN(@token) >= 3
+     AND UPPER(LEFT(@token, 2)) = N'N'''
+     AND RIGHT(@token, 1) = N''''
+BEGIN
+    -- N'1' devient 1
+    -- N'bonjour' devient bonjour
+    SET @raw =
+        SUBSTRING(
+            @token,
+            3,
+            LEN(@token) - 3
+        );
+
+    -- '' à l'intérieur d'une chaîne SQL devient '
+    SET @raw =
+        REPLACE(
+            @raw,
+            N'''''',
+            N''''
+        );
+END
+
+-- Cas classique : 'texte'
+ELSE IF LEN(@token) >= 2
+     AND LEFT(@token, 1) = N''''
+     AND RIGHT(@token, 1) = N''''
+BEGIN
+    SET @raw =
+        SUBSTRING(
+            @token,
+            2,
+            LEN(@token) - 2
+        );
+
+    SET @raw =
+        REPLACE(
+            @raw,
+            N'''''',
+            N''''
+        );
+END
+
+-- Nombre / bit / etc.
+ELSE
+BEGIN
+    SET @raw = @token;
+END;
