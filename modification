@@ -1,54 +1,1755 @@
-IF UPPER(@token) = N'NULL'
+ALTER PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName      NVARCHAR(128),
+    @Columns        NVARCHAR(MAX),
+    @ValuesBatch    NVARCHAR(MAX),
+    @HasIdentity    BIT = 0,
+    @IdentityCol    NVARCHAR(128) = NULL
+AS
 BEGIN
-    SET @isNull = 1;
-    SET @raw = NULL;
-END
+    SET NOCOUNT ON;
+    SET LOCK_TIMEOUT 5000;
+    SET DEADLOCK_PRIORITY LOW;
 
--- Cas Unicode : N'texte'
-ELSE IF LEN(@token) >= 3
-     AND UPPER(LEFT(@token, 2)) = N'N'''
-     AND RIGHT(@token, 1) = N''''
-BEGIN
-    -- N'1' devient 1
-    -- N'bonjour' devient bonjour
-    SET @raw =
-        SUBSTRING(
-            @token,
-            3,
-            LEN(@token) - 3
+    -- Important pour pouvoir gérer une erreur ligne par ligne
+    -- sans condamner systématiquement la transaction appelante.
+    SET XACT_ABORT OFF;
+
+    DECLARE @RS NCHAR(1) = NCHAR(30); -- séparateur lignes
+    DECLARE @CS NCHAR(1) = NCHAR(29); -- séparateur colonnes
+
+    BEGIN TRY
+
+        /* ============================================================
+           1. Validation de la table
+           ============================================================ */
+
+        DECLARE @objectId INT;
+
+        SELECT @objectId = t.object_id
+        FROM sys.tables t
+        INNER JOIN sys.schemas s
+            ON s.schema_id = t.schema_id
+        WHERE s.name = N'dbo'
+          AND t.name = @TableName;
+
+        IF @objectId IS NULL
+            THROW 50100, 'Table invalide.', 1;
+
+
+        /* ============================================================
+           2. Colonne IDENTITY
+           ============================================================ */
+
+        IF @HasIdentity = 1
+           AND (@IdentityCol IS NULL OR LEN(@IdentityCol) = 0)
+        BEGIN
+            SELECT TOP (1)
+                @IdentityCol = c.name
+            FROM sys.columns c
+            WHERE c.object_id = @objectId
+              AND c.is_identity = 1;
+        END;
+
+        IF @HasIdentity = 1
+           AND @IdentityCol IS NOT NULL
+           AND NOT EXISTS
+           (
+               SELECT 1
+               FROM sys.columns c
+               WHERE c.object_id = @objectId
+                 AND c.name = @IdentityCol
+                 AND c.is_identity = 1
+           )
+        BEGIN
+            THROW 50101, 'Colonne IDENTITY invalide.', 1;
+        END;
+
+
+        /* ============================================================
+           3. Colonnes à insérer + métadonnées
+           ============================================================ */
+
+        CREATE TABLE #Cols
+        (
+            Ord             INT PRIMARY KEY,
+            ColName         NVARCHAR(128) NOT NULL,
+            DataType        NVARCHAR(128) NULL,
+            MaxLength       INT NULL,
+            [Precision]     INT NULL,
+            Scale           INT NULL,
+            IsNullable      BIT NULL,
+            IsComputed      BIT NULL,
+            IsIdentity      BIT NULL,
+            SystemTypeId    INT NULL
         );
 
-    -- '' à l'intérieur d'une chaîne SQL devient '
-    SET @raw =
-        REPLACE(
-            @raw,
-            N'''''',
-            N''''
-        );
-END
+        INSERT INTO #Cols
+        (
+            Ord,
+            ColName
+        )
+        SELECT
+            Ord,
+            LTRIM(
+                RTRIM(
+                    REPLACE(
+                        REPLACE(Item, N'[', N''),
+                        N']',
+                        N''
+                    )
+                )
+            )
+        FROM dbo.SplitByCommaOrdered(@Columns);
 
--- Cas classique : 'texte'
-ELSE IF LEN(@token) >= 2
-     AND LEFT(@token, 1) = N''''
-     AND RIGHT(@token, 1) = N''''
-BEGIN
-    SET @raw =
-        SUBSTRING(
-            @token,
-            2,
-            LEN(@token) - 2
+
+        UPDATE x
+        SET
+            DataType =
+                TYPE_NAME(c.system_type_id),
+
+            MaxLength =
+                CASE
+                    WHEN c.max_length = -1
+                        THEN -1
+
+                    WHEN TYPE_NAME(c.system_type_id)
+                         IN (N'nvarchar', N'nchar')
+                        THEN c.max_length / 2
+
+                    ELSE c.max_length
+                END,
+
+            [Precision] = c.precision,
+            Scale = c.scale,
+            IsNullable = c.is_nullable,
+            IsComputed = c.is_computed,
+            IsIdentity = c.is_identity,
+            SystemTypeId = c.system_type_id
+
+        FROM #Cols x
+        INNER JOIN sys.columns c
+            ON c.object_id = @objectId
+           AND c.name = x.ColName;
+
+
+        -- Colonne inexistante ou interdite à l'insertion
+        IF EXISTS
+        (
+            SELECT 1
+            FROM #Cols
+            WHERE DataType IS NULL
+               OR IsComputed = 1
+               OR IsIdentity = 1
+               OR DataType IN (N'timestamp', N'rowversion')
+        )
+        BEGIN
+            THROW 50102, 'Liste de colonnes invalide.', 1;
+        END;
+
+
+        DECLARE @colCount INT =
+            (SELECT COUNT(*) FROM #Cols);
+
+
+        /* ============================================================
+           4. Contraintes PRIMARY KEY / UNIQUE
+           ============================================================ */
+
+        CREATE TABLE #Pk
+        (
+            ConstraintName NVARCHAR(255),
+            ColName        NVARCHAR(128),
+            ConstraintOrd  INT,
+            ColOrd         INT,
+            DataType       NVARCHAR(128),
+            MaxLength      INT,
+            [Precision]    INT,
+            Scale          INT
         );
 
-    SET @raw =
-        REPLACE(
-            @raw,
-            N'''''',
-            N''''
-        );
-END
 
--- Nombre / bit / etc.
-ELSE
-BEGIN
-    SET @raw = @token;
+        INSERT INTO #Pk
+        (
+            ConstraintName,
+            ColName,
+            ConstraintOrd,
+            ColOrd,
+            DataType,
+            MaxLength,
+            [Precision],
+            Scale
+        )
+        SELECT
+            tc.CONSTRAINT_NAME,
+            kcu.COLUMN_NAME,
+            kcu.ORDINAL_POSITION,
+            c.Ord,
+            c.DataType,
+            c.MaxLength,
+            c.[Precision],
+            c.Scale
+
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+
+        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+           AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+           AND kcu.TABLE_NAME = tc.TABLE_NAME
+           AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+
+        INNER JOIN #Cols c
+            ON c.ColName = kcu.COLUMN_NAME
+
+        WHERE tc.TABLE_SCHEMA = N'dbo'
+          AND tc.TABLE_NAME = @TableName
+          AND tc.CONSTRAINT_TYPE IN
+              (N'PRIMARY KEY', N'UNIQUE')
+          AND
+          (
+              @IdentityCol IS NULL
+              OR kcu.COLUMN_NAME <> @IdentityCol
+          );
+
+
+        /* ============================================================
+           5. Découpage sécurisé des valeurs
+
+           Les valeurs restent DATA.
+           Elles ne sont jamais incorporées dans le SQL dynamique.
+           ============================================================ */
+
+        CREATE TABLE #Vals
+        (
+            RowIndex INT NOT NULL,
+            ColOrd   INT NOT NULL,
+            RawValue NVARCHAR(MAX) NULL,
+            IsNull   BIT NOT NULL,
+
+            PRIMARY KEY(RowIndex, ColOrd)
+        );
+
+
+        DECLARE @batchLen INT =
+            LEN(ISNULL(@ValuesBatch, N''));
+
+        IF @batchLen = 0
+        BEGIN
+            SELECT
+                0 AS RowIndex,
+                CAST(NULL AS NVARCHAR(100)) AS NewID,
+                N'Batch vide (aucune donnée)' AS ErrorMessage;
+
+            RETURN;
+        END;
+
+
+        DECLARE @cur INT = 1;
+        DECLARE @next INT;
+        DECLARE @line NVARCHAR(MAX);
+        DECLARE @rowIdx INT = 0;
+
+
+        WHILE @cur <= @batchLen
+        BEGIN
+
+            SET @next =
+                CHARINDEX(@RS, @ValuesBatch, @cur);
+
+
+            IF @next = 0
+            BEGIN
+                SET @line =
+                    SUBSTRING(
+                        @ValuesBatch,
+                        @cur,
+                        @batchLen - @cur + 1
+                    );
+
+                SET @cur = @batchLen + 1;
+            END
+            ELSE
+            BEGIN
+                SET @line =
+                    SUBSTRING(
+                        @ValuesBatch,
+                        @cur,
+                        @next - @cur
+                    );
+
+                SET @cur = @next + 1;
+            END;
+
+
+            SET @rowIdx = @rowIdx + 1;
+
+
+            DECLARE @p INT = 1;
+            DECLARE @n INT;
+            DECLARE @token NVARCHAR(MAX);
+            DECLARE @ord INT = 1;
+
+
+            WHILE 1 = 1
+            BEGIN
+
+                SET @n =
+                    CHARINDEX(@CS, @line, @p);
+
+
+                IF @n = 0
+                    SET @token =
+                        SUBSTRING(
+                            @line,
+                            @p,
+                            LEN(@line) - @p + 1
+                        );
+                ELSE
+                    SET @token =
+                        SUBSTRING(
+                            @line,
+                            @p,
+                            @n - @p
+                        );
+
+
+                SET @token =
+                    LTRIM(RTRIM(@token));
+
+
+                DECLARE @isNull BIT = 0;
+                DECLARE @raw NVARCHAR(MAX);
+
+
+                --------------------------------------------------------
+                -- NULL
+                --------------------------------------------------------
+
+                IF UPPER(@token) = N'NULL'
+                BEGIN
+                    SET @isNull = 1;
+                    SET @raw = NULL;
+                END
+
+                --------------------------------------------------------
+                -- N'texte'
+                --------------------------------------------------------
+
+                ELSE IF LEN(@token) >= 3
+                     AND UPPER(LEFT(@token, 2)) = N'N'''
+                     AND RIGHT(@token, 1) = N''''
+                BEGIN
+                    SET @raw =
+                        SUBSTRING(
+                            @token,
+                            3,
+                            LEN(@token) - 3
+                        );
+
+                    SET @raw =
+                        REPLACE(
+                            @raw,
+                            N'''''',
+                            N''''
+                        );
+                END
+
+                --------------------------------------------------------
+                -- 'texte'
+                --------------------------------------------------------
+
+                ELSE IF LEN(@token) >= 2
+                     AND LEFT(@token, 1) = N''''
+                     AND RIGHT(@token, 1) = N''''
+                BEGIN
+                    SET @raw =
+                        SUBSTRING(
+                            @token,
+                            2,
+                            LEN(@token) - 2
+                        );
+
+                    SET @raw =
+                        REPLACE(
+                            @raw,
+                            N'''''',
+                            N''''
+                        );
+                END
+
+                --------------------------------------------------------
+                -- Valeur brute :
+                -- int / decimal / bit / guid / etc.
+                --------------------------------------------------------
+
+                ELSE
+                BEGIN
+                    SET @raw = @token;
+                END;
+
+
+                INSERT INTO #Vals
+                (
+                    RowIndex,
+                    ColOrd,
+                    RawValue,
+                    IsNull
+                )
+                VALUES
+                (
+                    @rowIdx,
+                    @ord,
+                    @raw,
+                    @isNull
+                );
+
+
+                SET @ord = @ord + 1;
+
+
+                IF @n = 0
+                    BREAK;
+
+
+                SET @p = @n + 1;
+
+            END;
+
+
+            IF (@ord - 1) <> @colCount
+            BEGIN
+                THROW 50103,
+                    'Nombre de valeurs différent du nombre de colonnes.',
+                    1;
+            END;
+
+        END;
+
+
+        /* ============================================================
+           6. Résultats
+           ============================================================ */
+
+        DECLARE @out TABLE
+        (
+            RowIndex     INT,
+            NewID        NVARCHAR(100),
+            ErrorMessage NVARCHAR(MAX)
+        );
+
+
+        DECLARE @totalRows INT =
+            (SELECT MAX(RowIndex) FROM #Vals);
+
+
+        SET @rowIdx = 1;
+
+
+        /* ============================================================
+           7. Traitement ligne par ligne
+           ============================================================ */
+
+        WHILE @rowIdx <= @totalRows
+        BEGIN
+
+            /* ========================================================
+               7A. VALIDATION DES CONVERSIONS
+
+               On vérifie AVANT l'INSERT.
+               Donc une mauvaise date / int / guid / etc.
+               ne détruit pas la transaction.
+               ======================================================== */
+
+            DECLARE @conversionError NVARCHAR(MAX) = NULL;
+
+            DECLARE
+                @checkOrd INT,
+                @checkCol NVARCHAR(128),
+                @checkType NVARCHAR(128),
+                @checkMaxLength INT,
+                @checkPrecision INT,
+                @checkScale INT,
+                @checkNullable BIT;
+
+
+            DECLARE curCheck CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                Ord,
+                ColName,
+                DataType,
+                MaxLength,
+                [Precision],
+                Scale,
+                IsNullable
+            FROM #Cols
+            ORDER BY Ord;
+
+
+            OPEN curCheck;
+
+
+            FETCH NEXT FROM curCheck
+            INTO
+                @checkOrd,
+                @checkCol,
+                @checkType,
+                @checkMaxLength,
+                @checkPrecision,
+                @checkScale,
+                @checkNullable;
+
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+
+                DECLARE @checkRaw NVARCHAR(MAX);
+                DECLARE @checkNull BIT;
+
+
+                SELECT
+                    @checkRaw = RawValue,
+                    @checkNull = IsNull
+                FROM #Vals
+                WHERE RowIndex = @rowIdx
+                  AND ColOrd = @checkOrd;
+
+
+                --------------------------------------------------------
+                -- NULL interdit
+                --------------------------------------------------------
+
+                IF @checkNull = 1
+                   AND @checkNullable = 0
+                BEGIN
+                    SET @conversionError =
+                        N'ERR NULL interdit'
+                        + N' | Colonne=' + @checkCol
+                        + N' | Type=' + @checkType;
+
+                    BREAK;
+                END;
+
+
+                --------------------------------------------------------
+                -- Valeur non NULL
+                --------------------------------------------------------
+
+                IF @checkNull = 0
+                BEGIN
+
+                    DECLARE @typeDeclaration NVARCHAR(200);
+
+
+                    ----------------------------------------------------
+                    -- Construction du vrai type SQL
+                    ----------------------------------------------------
+
+                    IF @checkType IN
+                    (
+                        N'varchar',
+                        N'char',
+                        N'varbinary',
+                        N'binary'
+                    )
+                    BEGIN
+                        SET @typeDeclaration =
+                            @checkType
+                            + N'('
+                            + CASE
+                                WHEN @checkMaxLength = -1
+                                    THEN N'MAX'
+                                ELSE
+                                    CAST(
+                                        @checkMaxLength
+                                        AS NVARCHAR(10)
+                                    )
+                              END
+                            + N')';
+                    END
+
+                    ELSE IF @checkType IN
+                    (
+                        N'nvarchar',
+                        N'nchar'
+                    )
+                    BEGIN
+                        SET @typeDeclaration =
+                            @checkType
+                            + N'('
+                            + CASE
+                                WHEN @checkMaxLength = -1
+                                    THEN N'MAX'
+                                ELSE
+                                    CAST(
+                                        @checkMaxLength
+                                        AS NVARCHAR(10)
+                                    )
+                              END
+                            + N')';
+                    END
+
+                    ELSE IF @checkType IN
+                    (
+                        N'decimal',
+                        N'numeric'
+                    )
+                    BEGIN
+                        SET @typeDeclaration =
+                            @checkType
+                            + N'('
+                            + CAST(
+                                @checkPrecision
+                                AS NVARCHAR(10)
+                              )
+                            + N','
+                            + CAST(
+                                @checkScale
+                                AS NVARCHAR(10)
+                              )
+                            + N')';
+                    END
+
+                    ELSE IF @checkType IN
+                    (
+                        N'datetime2',
+                        N'time',
+                        N'datetimeoffset'
+                    )
+                    BEGIN
+                        SET @typeDeclaration =
+                            @checkType
+                            + N'('
+                            + CAST(
+                                @checkScale
+                                AS NVARCHAR(10)
+                              )
+                            + N')';
+                    END
+
+                    ELSE
+                    BEGIN
+                        SET @typeDeclaration =
+                            @checkType;
+                    END;
+
+
+                    ----------------------------------------------------
+                    -- Les chaînes ne nécessitent pas TRY_CONVERT.
+                    -- On vérifie seulement la longueur.
+                    ----------------------------------------------------
+
+                    IF @checkType IN
+                    (
+                        N'varchar',
+                        N'nvarchar',
+                        N'char',
+                        N'nchar'
+                    )
+                    BEGIN
+
+                        IF @checkMaxLength <> -1
+                           AND LEN(@checkRaw) > @checkMaxLength
+                        BEGIN
+                            SET @conversionError =
+                                N'ERR longueur'
+                                + N' | Colonne=' + @checkCol
+                                + N' | Max='
+                                + CAST(
+                                    @checkMaxLength
+                                    AS NVARCHAR(10)
+                                  );
+
+                            BREAK;
+                        END;
+
+                    END
+
+                    ----------------------------------------------------
+                    -- text / ntext : données texte
+                    ----------------------------------------------------
+
+                    ELSE IF @checkType IN
+                    (
+                        N'text',
+                        N'ntext'
+                    )
+                    BEGIN
+                        -- rien à convertir
+                    END
+
+                    ----------------------------------------------------
+                    -- Autres types
+                    ----------------------------------------------------
+
+                    ELSE
+                    BEGIN
+
+                        DECLARE @conversionOk BIT = 0;
+                        DECLARE @conversionSql NVARCHAR(MAX);
+
+
+                        ------------------------------------------------
+                        -- Dates / heures
+                        ------------------------------------------------
+
+                        IF @checkType IN
+                        (
+                            N'date',
+                            N'datetime',
+                            N'datetime2',
+                            N'smalldatetime'
+                        )
+                        BEGIN
+
+                            SET @conversionSql =
+                                N'SELECT @ok =
+                                    CASE
+                                        WHEN
+                                            COALESCE
+                                            (
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 126),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 121),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 120),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 103),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v)
+                                            )
+                                            IS NULL
+                                        THEN 0
+                                        ELSE 1
+                                    END;';
+                        END
+
+                        ELSE IF @checkType = N'datetimeoffset'
+                        BEGIN
+
+                            SET @conversionSql =
+                                N'SELECT @ok =
+                                    CASE
+                                        WHEN
+                                            COALESCE
+                                            (
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 127),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v, 126),
+
+                                                TRY_CONVERT('
+                                                + @typeDeclaration
+                                                + N', @v)
+                                            )
+                                            IS NULL
+                                        THEN 0
+                                        ELSE 1
+                                    END;';
+                        END
+
+                        ------------------------------------------------
+                        -- Tous les autres types
+                        ------------------------------------------------
+
+                        ELSE
+                        BEGIN
+
+                            SET @conversionSql =
+                                N'SELECT @ok =
+                                    CASE
+                                        WHEN TRY_CONVERT('
+                                        + @typeDeclaration
+                                        + N', @v) IS NULL
+                                        THEN 0
+                                        ELSE 1
+                                    END;';
+                        END;
+
+
+                        EXEC sp_executesql
+                            @conversionSql,
+                            N'@v NVARCHAR(MAX),
+                              @ok BIT OUTPUT',
+                            @v = @checkRaw,
+                            @ok = @conversionOk OUTPUT;
+
+
+                        IF @conversionOk = 0
+                        BEGIN
+                            SET @conversionError =
+                                N'ERR CONVERSION'
+                                + N' | Colonne='
+                                + @checkCol
+                                + N' | Type='
+                                + @typeDeclaration
+                                + N' | Valeur='
+                                + ISNULL(@checkRaw, N'NULL');
+
+                            BREAK;
+                        END;
+
+                    END;
+
+                END;
+
+
+                FETCH NEXT FROM curCheck
+                INTO
+                    @checkOrd,
+                    @checkCol,
+                    @checkType,
+                    @checkMaxLength,
+                    @checkPrecision,
+                    @checkScale,
+                    @checkNullable;
+
+            END;
+
+
+            CLOSE curCheck;
+            DEALLOCATE curCheck;
+
+
+            ------------------------------------------------------------
+            -- Mauvaise valeur => ligne ignorée proprement
+            ------------------------------------------------------------
+
+            IF @conversionError IS NOT NULL
+            BEGIN
+
+                INSERT INTO @out
+                (
+                    RowIndex,
+                    NewID,
+                    ErrorMessage
+                )
+                VALUES
+                (
+                    @rowIdx,
+                    NULL,
+                    @conversionError
+                );
+
+
+                SET @rowIdx = @rowIdx + 1;
+
+                CONTINUE;
+
+            END;
+
+
+            /* ========================================================
+               7B. DÉTECTION DES DOUBLONS
+               ======================================================== */
+
+            DECLARE @exists BIT = 0;
+            DECLARE @dupId NVARCHAR(100) = NULL;
+
+            DECLARE @constraintName NVARCHAR(255);
+
+
+            DECLARE curDup CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT ConstraintName
+            FROM #Pk;
+
+
+            OPEN curDup;
+
+
+            FETCH NEXT FROM curDup
+            INTO @constraintName;
+
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+
+                DECLARE @whereClause NVARCHAR(MAX) = N'';
+
+
+                DECLARE
+                    @pkCol NVARCHAR(128),
+                    @pkColOrd INT,
+                    @pkType NVARCHAR(128),
+                    @pkMaxLength INT,
+                    @pkPrecision INT,
+                    @pkScale INT;
+
+
+                DECLARE curPk CURSOR LOCAL FAST_FORWARD FOR
+                SELECT
+                    ColName,
+                    ColOrd,
+                    DataType,
+                    MaxLength,
+                    [Precision],
+                    Scale
+                FROM #Pk
+                WHERE ConstraintName = @constraintName
+                ORDER BY ConstraintOrd;
+
+
+                OPEN curPk;
+
+
+                FETCH NEXT FROM curPk
+                INTO
+                    @pkCol,
+                    @pkColOrd,
+                    @pkType,
+                    @pkMaxLength,
+                    @pkPrecision,
+                    @pkScale;
+
+
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+
+                    IF LEN(@whereClause) > 0
+                        SET @whereClause += N' AND ';
+
+
+                    DECLARE @pkTypeDeclaration NVARCHAR(200);
+
+
+                    IF @pkType IN
+                    (
+                        N'varchar',
+                        N'char',
+                        N'varbinary',
+                        N'binary'
+                    )
+                    BEGIN
+                        SET @pkTypeDeclaration =
+                            @pkType
+                            + N'('
+                            + CASE
+                                WHEN @pkMaxLength = -1
+                                    THEN N'MAX'
+                                ELSE
+                                    CAST(
+                                        @pkMaxLength
+                                        AS NVARCHAR(10)
+                                    )
+                              END
+                            + N')';
+                    END
+
+                    ELSE IF @pkType IN
+                    (
+                        N'nvarchar',
+                        N'nchar'
+                    )
+                    BEGIN
+                        SET @pkTypeDeclaration =
+                            @pkType
+                            + N'('
+                            + CASE
+                                WHEN @pkMaxLength = -1
+                                    THEN N'MAX'
+                                ELSE
+                                    CAST(
+                                        @pkMaxLength
+                                        AS NVARCHAR(10)
+                                    )
+                              END
+                            + N')';
+                    END
+
+                    ELSE IF @pkType IN
+                    (
+                        N'decimal',
+                        N'numeric'
+                    )
+                    BEGIN
+                        SET @pkTypeDeclaration =
+                            @pkType
+                            + N'('
+                            + CAST(
+                                @pkPrecision
+                                AS NVARCHAR(10)
+                              )
+                            + N','
+                            + CAST(
+                                @pkScale
+                                AS NVARCHAR(10)
+                              )
+                            + N')';
+                    END
+
+                    ELSE IF @pkType IN
+                    (
+                        N'datetime2',
+                        N'time',
+                        N'datetimeoffset'
+                    )
+                    BEGIN
+                        SET @pkTypeDeclaration =
+                            @pkType
+                            + N'('
+                            + CAST(
+                                @pkScale
+                                AS NVARCHAR(10)
+                              )
+                            + N')';
+                    END
+
+                    ELSE
+                    BEGIN
+                        SET @pkTypeDeclaration =
+                            @pkType;
+                    END;
+
+
+                    DECLARE @pkValueExpression NVARCHAR(MAX);
+
+
+                    IF @pkType IN
+                    (
+                        N'varchar',
+                        N'nvarchar',
+                        N'char',
+                        N'nchar',
+                        N'text',
+                        N'ntext'
+                    )
+                    BEGIN
+
+                        SET @pkValueExpression =
+                            N'(SELECT RawValue
+                               FROM #Vals
+                               WHERE RowIndex = @ri
+                                 AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N')';
+
+                    END
+
+                    ELSE IF @pkType IN
+                    (
+                        N'date',
+                        N'datetime',
+                        N'datetime2',
+                        N'smalldatetime'
+                    )
+                    BEGIN
+
+                        SET @pkValueExpression =
+                            N'COALESCE
+                              (
+                                  TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                                    (SELECT RawValue
+                                     FROM #Vals
+                                     WHERE RowIndex = @ri
+                                       AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'), 126),
+
+                                  TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                                    (SELECT RawValue
+                                     FROM #Vals
+                                     WHERE RowIndex = @ri
+                                       AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'), 121),
+
+                                  TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                                    (SELECT RawValue
+                                     FROM #Vals
+                                     WHERE RowIndex = @ri
+                                       AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'), 120),
+
+                                  TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                                    (SELECT RawValue
+                                     FROM #Vals
+                                     WHERE RowIndex = @ri
+                                       AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'), 103),
+
+                                  TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                                    (SELECT RawValue
+                                     FROM #Vals
+                                     WHERE RowIndex = @ri
+                                       AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'))
+                              )';
+
+                    END
+
+                    ELSE
+                    BEGIN
+
+                        SET @pkValueExpression =
+                            N'TRY_CONVERT('
+                            + @pkTypeDeclaration
+                            + N',
+                               (SELECT RawValue
+                                FROM #Vals
+                                WHERE RowIndex = @ri
+                                  AND ColOrd = '
+                            + CAST(@pkColOrd AS NVARCHAR(10))
+                            + N'))';
+
+                    END;
+
+
+                    SET @whereClause +=
+                        N'(
+                            (
+                                (SELECT IsNull
+                                 FROM #Vals
+                                 WHERE RowIndex = @ri
+                                   AND ColOrd = '
+                        + CAST(@pkColOrd AS NVARCHAR(10))
+                        + N') = 1
+
+                                AND '
+                        + QUOTENAME(@pkCol)
+                        + N' IS NULL
+                            )
+
+                            OR
+
+                            (
+                                (SELECT IsNull
+                                 FROM #Vals
+                                 WHERE RowIndex = @ri
+                                   AND ColOrd = '
+                        + CAST(@pkColOrd AS NVARCHAR(10))
+                        + N') = 0
+
+                                AND '
+                        + QUOTENAME(@pkCol)
+                        + N' = '
+                        + @pkValueExpression
+                        + N'
+                            )
+                        )';
+
+
+                    FETCH NEXT FROM curPk
+                    INTO
+                        @pkCol,
+                        @pkColOrd,
+                        @pkType,
+                        @pkMaxLength,
+                        @pkPrecision,
+                        @pkScale;
+
+                END;
+
+
+                CLOSE curPk;
+                DEALLOCATE curPk;
+
+
+                IF LEN(@whereClause) > 0
+                BEGIN
+
+                    DECLARE @checkSql NVARCHAR(MAX);
+
+
+                    SET @checkSql =
+                        N'SELECT @found =
+                            CASE
+                                WHEN EXISTS
+                                (
+                                    SELECT 1
+                                    FROM [dbo].'
+                        + QUOTENAME(@TableName)
+                        + N' WITH (NOLOCK)
+                                    WHERE '
+                        + @whereClause
+                        + N'
+                                )
+                                THEN 1
+                                ELSE 0
+                            END;';
+
+
+                    EXEC sp_executesql
+                        @checkSql,
+                        N'@ri INT,
+                          @found BIT OUTPUT',
+                        @ri = @rowIdx,
+                        @found = @exists OUTPUT;
+
+
+                    IF @exists = 1
+                    BEGIN
+
+                        IF @HasIdentity = 1
+                           AND @IdentityCol IS NOT NULL
+                        BEGIN
+
+                            DECLARE @dupSql NVARCHAR(MAX);
+
+
+                            SET @dupSql =
+                                N'SELECT TOP (1)
+                                      @nid =
+                                      CONVERT(
+                                          NVARCHAR(100),
+                                          '
+                                + QUOTENAME(@IdentityCol)
+                                + N'
+                                      )
+                                  FROM [dbo].'
+                                + QUOTENAME(@TableName)
+                                + N'
+                                  WHERE '
+                                + @whereClause
+                                + N';';
+
+
+                            EXEC sp_executesql
+                                @dupSql,
+                                N'@ri INT,
+                                  @nid NVARCHAR(100) OUTPUT',
+                                @ri = @rowIdx,
+                                @nid = @dupId OUTPUT;
+
+                        END;
+
+
+                        BREAK;
+
+                    END;
+
+                END;
+
+
+                FETCH NEXT FROM curDup
+                INTO @constraintName;
+
+            END;
+
+
+            CLOSE curDup;
+            DEALLOCATE curDup;
+
+
+            IF @exists = 1
+            BEGIN
+
+                INSERT INTO @out
+                (
+                    RowIndex,
+                    NewID,
+                    ErrorMessage
+                )
+                VALUES
+                (
+                    @rowIdx,
+                    @dupId,
+                    N'Doublon'
+                );
+
+
+                SET @rowIdx = @rowIdx + 1;
+
+                CONTINUE;
+
+            END;
+
+
+            /* ========================================================
+               7C. INSERT
+               ======================================================== */
+
+            DECLARE @safeColumns NVARCHAR(MAX) = N'';
+            DECLARE @selectValues NVARCHAR(MAX) = N'';
+
+
+            DECLARE
+                @insertOrd INT,
+                @insertCol NVARCHAR(128),
+                @insertType NVARCHAR(128),
+                @insertMaxLength INT,
+                @insertPrecision INT,
+                @insertScale INT;
+
+
+            DECLARE curInsert CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                Ord,
+                ColName,
+                DataType,
+                MaxLength,
+                [Precision],
+                Scale
+            FROM #Cols
+            ORDER BY Ord;
+
+
+            OPEN curInsert;
+
+
+            FETCH NEXT FROM curInsert
+            INTO
+                @insertOrd,
+                @insertCol,
+                @insertType,
+                @insertMaxLength,
+                @insertPrecision,
+                @insertScale;
+
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+
+                IF LEN(@safeColumns) > 0
+                BEGIN
+                    SET @safeColumns += N',';
+                    SET @selectValues += N',';
+                END;
+
+
+                SET @safeColumns +=
+                    QUOTENAME(@insertCol);
+
+
+                DECLARE @insertTypeDeclaration NVARCHAR(200);
+
+
+                IF @insertType IN
+                (
+                    N'varchar',
+                    N'char',
+                    N'varbinary',
+                    N'binary'
+                )
+                BEGIN
+                    SET @insertTypeDeclaration =
+                        @insertType
+                        + N'('
+                        + CASE
+                            WHEN @insertMaxLength = -1
+                                THEN N'MAX'
+                            ELSE
+                                CAST(
+                                    @insertMaxLength
+                                    AS NVARCHAR(10)
+                                )
+                          END
+                        + N')';
+                END
+
+                ELSE IF @insertType IN
+                (
+                    N'nvarchar',
+                    N'nchar'
+                )
+                BEGIN
+                    SET @insertTypeDeclaration =
+                        @insertType
+                        + N'('
+                        + CASE
+                            WHEN @insertMaxLength = -1
+                                THEN N'MAX'
+                            ELSE
+                                CAST(
+                                    @insertMaxLength
+                                    AS NVARCHAR(10)
+                                )
+                          END
+                        + N')';
+                END
+
+                ELSE IF @insertType IN
+                (
+                    N'decimal',
+                    N'numeric'
+                )
+                BEGIN
+                    SET @insertTypeDeclaration =
+                        @insertType
+                        + N'('
+                        + CAST(
+                            @insertPrecision
+                            AS NVARCHAR(10)
+                          )
+                        + N','
+                        + CAST(
+                            @insertScale
+                            AS NVARCHAR(10)
+                          )
+                        + N')';
+                END
+
+                ELSE IF @insertType IN
+                (
+                    N'datetime2',
+                    N'time',
+                    N'datetimeoffset'
+                )
+                BEGIN
+                    SET @insertTypeDeclaration =
+                        @insertType
+                        + N'('
+                        + CAST(
+                            @insertScale
+                            AS NVARCHAR(10)
+                          )
+                        + N')';
+                END
+
+                ELSE
+                BEGIN
+                    SET @insertTypeDeclaration =
+                        @insertType;
+                END;
+
+
+                DECLARE @insertExpression NVARCHAR(MAX);
+
+
+                --------------------------------------------------------
+                -- Texte
+                --------------------------------------------------------
+
+                IF @insertType IN
+                (
+                    N'varchar',
+                    N'nvarchar',
+                    N'char',
+                    N'nchar',
+                    N'text',
+                    N'ntext'
+                )
+                BEGIN
+
+                    SET @insertExpression =
+                        N'(SELECT
+                              CASE
+                                  WHEN IsNull = 1
+                                      THEN NULL
+                                  ELSE RawValue
+                              END
+                           FROM #Vals
+                           WHERE RowIndex = @ri
+                             AND ColOrd = '
+                        + CAST(@insertOrd AS NVARCHAR(10))
+                        + N')';
+
+                END
+
+                --------------------------------------------------------
+                -- Dates
+                --------------------------------------------------------
+
+                ELSE IF @insertType IN
+                (
+                    N'date',
+                    N'datetime',
+                    N'datetime2',
+                    N'smalldatetime'
+                )
+                BEGIN
+
+                    SET @insertExpression =
+                        N'(SELECT
+                              CASE
+                                  WHEN IsNull = 1
+                                      THEN NULL
+                                  ELSE
+                                      COALESCE
+                                      (
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 126),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 121),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 120),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 103),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue)
+                                      )
+                              END
+                           FROM #Vals
+                           WHERE RowIndex = @ri
+                             AND ColOrd = '
+                        + CAST(@insertOrd AS NVARCHAR(10))
+                        + N')';
+
+                END
+
+                --------------------------------------------------------
+                -- datetimeoffset
+                --------------------------------------------------------
+
+                ELSE IF @insertType = N'datetimeoffset'
+                BEGIN
+
+                    SET @insertExpression =
+                        N'(SELECT
+                              CASE
+                                  WHEN IsNull = 1
+                                      THEN NULL
+                                  ELSE
+                                      COALESCE
+                                      (
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 127),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue, 126),
+
+                                          TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue)
+                                      )
+                              END
+                           FROM #Vals
+                           WHERE RowIndex = @ri
+                             AND ColOrd = '
+                        + CAST(@insertOrd AS NVARCHAR(10))
+                        + N')';
+
+                END
+
+                --------------------------------------------------------
+                -- Tous les autres types
+                --------------------------------------------------------
+
+                ELSE
+                BEGIN
+
+                    SET @insertExpression =
+                        N'(SELECT
+                              CASE
+                                  WHEN IsNull = 1
+                                      THEN NULL
+                                  ELSE
+                                      TRY_CONVERT('
+                        + @insertTypeDeclaration
+                        + N', RawValue)
+                              END
+                           FROM #Vals
+                           WHERE RowIndex = @ri
+                             AND ColOrd = '
+                        + CAST(@insertOrd AS NVARCHAR(10))
+                        + N')';
+
+                END;
+
+
+                SET @selectValues +=
+                    @insertExpression;
+
+
+                FETCH NEXT FROM curInsert
+                INTO
+                    @insertOrd,
+                    @insertCol,
+                    @insertType,
+                    @insertMaxLength,
+                    @insertPrecision,
+                    @insertScale;
+
+            END;
+
+
+            CLOSE curInsert;
+            DEALLOCATE curInsert;
+
+
+            /* ========================================================
+               SQL INSERT dynamique
+
+               Ce qui est dynamique ici :
+               - table : validée + QUOTENAME
+               - colonnes : sys.columns + QUOTENAME
+               - types : issus de sys.types
+               - positions : INT internes
+
+               Aucune valeur de @ValuesBatch n'est concaténée.
+               ======================================================== */
+
+            DECLARE @insertSql NVARCHAR(MAX);
+
+
+            SET @insertSql =
+                N'INSERT INTO [dbo].'
+                + QUOTENAME(@TableName)
+                + N' ('
+                + @safeColumns
+                + N') '
+                + N'SELECT '
+                + @selectValues
+                + N'; ';
+
+
+            IF @HasIdentity = 1
+               AND @IdentityCol IS NOT NULL
+            BEGIN
+
+                SET @insertSql +=
+                    N'SET @nid =
+                          CONVERT(
+                              NVARCHAR(100),
+                              SCOPE_IDENTITY()
+                          );';
+
+            END;
+
+
+            BEGIN TRY
+
+                DECLARE @newId NVARCHAR(100) = NULL;
+
+
+                IF @HasIdentity = 1
+                   AND @IdentityCol IS NOT NULL
+                BEGIN
+
+                    EXEC sp_executesql
+                        @insertSql,
+                        N'@ri INT,
+                          @nid NVARCHAR(100) OUTPUT',
+                        @ri = @rowIdx,
+                        @nid = @newId OUTPUT;
+
+                END
+                ELSE
+                BEGIN
+
+                    EXEC sp_executesql
+                        @insertSql,
+                        N'@ri INT',
+                        @ri = @rowIdx;
+
+                END;
+
+
+                INSERT INTO @out
+                (
+                    RowIndex,
+                    NewID,
+                    ErrorMessage
+                )
+                VALUES
+                (
+                    @rowIdx,
+                    @newId,
+                    NULL
+                );
+
+            END TRY
+
+            BEGIN CATCH
+
+                -- Si la transaction est toujours utilisable,
+                -- on garde le comportement ligne par ligne.
+                IF XACT_STATE() <> -1
+                BEGIN
+
+                    INSERT INTO @out
+                    (
+                        RowIndex,
+                        NewID,
+                        ErrorMessage
+                    )
+                    VALUES
+                    (
+                        @rowIdx,
+                        NULL,
+                        N'ERR: '
+                        + ERROR_MESSAGE()
+                    );
+
+                END
+                ELSE
+                BEGIN
+                    -- Ici continuer serait dangereux :
+                    -- on remonte immédiatement la vraie erreur.
+                    THROW;
+                END;
+
+            END CATCH;
+
+
+            SET @rowIdx = @rowIdx + 1;
+
+        END;
+
+
+        /* ============================================================
+           8. Résultat final
+           ============================================================ */
+
+        SELECT
+            RowIndex,
+            NewID,
+            ErrorMessage
+        FROM @out
+        ORDER BY RowIndex;
+
+    END TRY
+
+    BEGIN CATCH
+
+        DECLARE @errMsg NVARCHAR(2048) =
+            ERROR_MESSAGE();
+
+        DECLARE @errNum INT =
+            ERROR_NUMBER();
+
+        DECLARE @errState INT =
+            ERROR_STATE();
+
+        DECLARE @xstate INT =
+            XACT_STATE();
+
+
+        RAISERROR
+        (
+            N'batch_safe_insert erreur %d | State=%d | XACT_STATE=%d | %s',
+            16,
+            1,
+            @errNum,
+            @errState,
+            @xstate,
+            @errMsg
+        );
+
+    END CATCH;
+
 END;
