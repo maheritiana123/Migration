@@ -1,61 +1,16 @@
-// Build SET ...
-const char RS = (char)30; // séparation entre affectations
-const char CS = (char)29; // séparation colonne / valeur
+BEGIN CATCH
+    DECLARE @ErrMsg nvarchar(max) = ERROR_MESSAGE();
+    DECLARE @ErrNum int = ERROR_NUMBER();
+    DECLARE @ErrState int = ERROR_STATE();
+    DECLARE @XactState int = XACT_STATE();
 
-var setParts = new List<string>();
-
-foreach (var col in columns)
-{
-    if (!row.TryGetValue(col, out var oldFkVal) ||
-        string.IsNullOrWhiteSpace(oldFkVal))
-    {
-        setParts.Add(col + CS + "NULL");
-        continue;
-    }
-
-    // retrouver la table référencée
-    var fk = GetForeignKeyInfo(tableName)
-        .FirstOrDefault(f =>
-            f.ColumnName.Equals(
-                col,
-                StringComparison.OrdinalIgnoreCase));
-
-    if (fk == null)
-    {
-        setParts.Add(col + CS + "NULL");
-        continue;
-    }
-
-    if (_idMappings.TryGetValue(fk.ReferencedTableName, out var map) &&
-        map.TryGetValue(oldFkVal, out var mapped))
-    {
-        setParts.Add(col + CS + mapped);
-    }
-    else
-    {
-        setParts.Add(col + CS + "NULL");
-    }
-}
-
-if (setParts.Count == 0)
-    continue;
-
-string setBatch = string.Join(RS.ToString(), setParts);
-
-
-
-string req = @"EXEC dbo.batch_fixup_deferred_foreignKeys
-    @tableName = $t$,
-    @setBatch = $s$,
-    @idCol = $i$,
-    @newId = $n$;";
-
-sql.AddDirectRequest(req, MidwSqlXmlMode.MIDW_SQL_XMLMODE_RAW);
-
-sql.SetSecureParam("t", tableName, true, 0);
-sql.SetSecureParam("s", setBatch, true, 0);
-sql.SetSecureParam("i", idCol, true, 0);
-sql.SetSecureParam("n", newId, true, 0);
-
-sql.SetSite(Environment.GetEnvironmentVariable("PFTLSITE"));
-sql.Execute(30000);
+    RAISERROR(
+        'INSERT batch erreur %d | State=%d | XACT_STATE=%d | %s',
+        16,
+        1,
+        @ErrNum,
+        @ErrState,
+        @XactState,
+        @ErrMsg
+    );
+END CATCH
