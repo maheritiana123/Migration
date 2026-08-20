@@ -1,11 +1,14 @@
-ALTER PROCEDURE [dbo].[batch_fixup_deferred_foreignKeys]
-    @tableName NVARCHAR(128),
-    @setBatch  NVARCHAR(MAX),
-    @idCol     NVARCHAR(128),
-    @newId     NVARCHAR(255)
+ALTER PROCEDURE [dbo].[batch_safe_insert_with_type_conversion]
+    @TableName      NVARCHAR(128),
+    @Columns        NVARCHAR(MAX),
+    @ValuesBatch    NVARCHAR(MAX),
+    @HasIdentity    BIT = 0,
+    @IdentityCol    NVARCHAR(128) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET LOCK_TIMEOUT 5000;
+    SET DEADLOCK_PRIORITY LOW;
 
     DECLARE @RS NCHAR(1) = NCHAR(30);
     DECLARE @CS NCHAR(1) = NCHAR(29);
@@ -13,199 +16,595 @@ BEGIN
     BEGIN TRY
 
         ------------------------------------------------------------
-        -- 1) Table obligatoirement dans dbo
+        -- 1) Validation TABLE
+        -- On force dbo => pas de déplacement vers une autre base/schema
         ------------------------------------------------------------
         DECLARE @objectId INT =
-            OBJECT_ID(N'dbo.' + QUOTENAME(@tableName), N'U');
+            OBJECT_ID(N'dbo.' + QUOTENAME(@TableName), N'U');
 
         IF @objectId IS NULL
-            THROW 50001, 'Table invalide.', 1;
+            THROW 50100, 'Table invalide.', 1;
 
         ------------------------------------------------------------
-        -- 2) Vérification colonne ID
+        -- 2) Identity
         ------------------------------------------------------------
-        IF NOT EXISTS
-        (
-            SELECT 1
-            FROM sys.columns
-            WHERE object_id = @objectId
-              AND name = @idCol
-        )
-            THROW 50002, 'Colonne ID invalide.', 1;
+        IF @HasIdentity = 1
+           AND (@IdentityCol IS NULL OR LEN(@IdentityCol) = 0)
+        BEGIN
+            SELECT TOP (1)
+                @IdentityCol = c.name
+            FROM sys.columns c
+            WHERE c.object_id = @objectId
+              AND c.is_identity = 1;
+        END;
+
+        IF @IdentityCol IS NOT NULL
+           AND NOT EXISTS
+           (
+               SELECT 1
+               FROM sys.columns
+               WHERE object_id = @objectId
+                 AND name = @IdentityCol
+                 AND is_identity = 1
+           )
+            THROW 50101, 'Colonne identity invalide.', 1;
 
         ------------------------------------------------------------
-        -- 3) Parser les affectations
-        --
-        -- Format :
-        --
-        -- ColA <CS> valeurA <RS> ColB <CS> valeurB
+        -- 3) Colonnes d'entrée
         ------------------------------------------------------------
-        CREATE TABLE #SetValues
+        CREATE TABLE #Cols
         (
-            Ord      INT IDENTITY(1,1) PRIMARY KEY,
-            ColName  NVARCHAR(128) NOT NULL,
-            RawValue NVARCHAR(MAX) NULL,
-            IsNull   BIT NOT NULL
+            Ord     INT PRIMARY KEY,
+            ColName NVARCHAR(128) NOT NULL
         );
 
-        DECLARE @len INT = LEN(ISNULL(@setBatch, N''));
+        INSERT INTO #Cols(Ord, ColName)
+        SELECT
+            Ord,
+            LTRIM(RTRIM(
+                REPLACE(REPLACE(Item, N'[', N''), N']', N'')
+            ))
+        FROM dbo.SplitByCommaOrdered(@Columns);
+
+        ------------------------------------------------------------
+        -- Vérifier CHAQUE colonne contre sys.columns
+        ------------------------------------------------------------
+        IF EXISTS
+        (
+            SELECT 1
+            FROM #Cols x
+            LEFT JOIN sys.columns c
+                ON c.object_id = @objectId
+               AND c.name = x.ColName
+            WHERE c.column_id IS NULL
+               OR c.is_identity = 1
+               OR c.is_computed = 1
+               OR c.system_type_id = 189 -- timestamp / rowversion
+        )
+            THROW 50102, 'Liste de colonnes invalide.', 1;
+
+        DECLARE @colCount INT =
+            (SELECT COUNT(*) FROM #Cols);
+
+        ------------------------------------------------------------
+        -- 4) PK / UNIQUE
+        ------------------------------------------------------------
+        CREATE TABLE #Pk
+        (
+            ConstraintName NVARCHAR(255),
+            ColName        NVARCHAR(128),
+            Ord            INT,
+            ColOrd         INT
+        );
+
+        INSERT INTO #Pk
+        (
+            ConstraintName,
+            ColName,
+            Ord,
+            ColOrd
+        )
+        SELECT
+            tc.CONSTRAINT_NAME,
+            kcu.COLUMN_NAME,
+            kcu.ORDINAL_POSITION,
+            c.Ord
+        FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+            ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+           AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+           AND kcu.TABLE_NAME = tc.TABLE_NAME
+           AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+        INNER JOIN #Cols c
+            ON c.ColName = kcu.COLUMN_NAME
+        WHERE tc.TABLE_SCHEMA = N'dbo'
+          AND tc.TABLE_NAME = @TableName
+          AND tc.CONSTRAINT_TYPE IN
+              (N'PRIMARY KEY', N'UNIQUE')
+          AND
+          (
+              @IdentityCol IS NULL
+              OR kcu.COLUMN_NAME <> @IdentityCol
+          );
+
+        ------------------------------------------------------------
+        -- 5) Parser ValuesBatch
+        --
+        -- AUCUN token ne sera exécuté.
+        ------------------------------------------------------------
+        CREATE TABLE #Vals
+        (
+            RowIndex INT,
+            ColOrd   INT,
+            RawValue NVARCHAR(MAX) NULL,
+            IsNull   BIT NOT NULL,
+
+            PRIMARY KEY(RowIndex, ColOrd)
+        );
+
+        DECLARE @batchLen INT =
+            LEN(ISNULL(@ValuesBatch, N''));
+
+        IF @batchLen = 0
+        BEGIN
+            SELECT
+                0 AS RowIndex,
+                CAST(NULL AS NVARCHAR(100)) AS NewID,
+                N'Batch vide (aucune donnée)' AS ErrorMessage;
+
+            RETURN;
+        END;
+
         DECLARE @cur INT = 1;
         DECLARE @next INT;
-        DECLARE @item NVARCHAR(MAX);
+        DECLARE @line NVARCHAR(MAX);
+        DECLARE @rowIdx INT = 0;
 
-        WHILE @cur <= @len
+        WHILE @cur <= @batchLen
         BEGIN
-            SET @next = CHARINDEX(@RS, @setBatch, @cur);
+            SET @next =
+                CHARINDEX(@RS, @ValuesBatch, @cur);
 
             IF @next = 0
-                SET @item =
-                    SUBSTRING(@setBatch, @cur, @len - @cur + 1);
-            ELSE
-                SET @item =
-                    SUBSTRING(@setBatch, @cur, @next - @cur);
-
-            DECLARE @sep INT = CHARINDEX(@CS, @item);
-
-            IF @sep = 0
-                THROW 50003, 'Format setBatch invalide.', 1;
-
-            DECLARE @column NVARCHAR(128) =
-                LTRIM(RTRIM(SUBSTRING(@item, 1, @sep - 1)));
-
-            DECLARE @value NVARCHAR(MAX) =
-                LTRIM(RTRIM(
+                SET @line =
                     SUBSTRING(
-                        @item,
-                        @sep + 1,
-                        LEN(@item) - @sep
-                    )
-                ));
+                        @ValuesBatch,
+                        @cur,
+                        @batchLen - @cur + 1
+                    );
+            ELSE
+                SET @line =
+                    SUBSTRING(
+                        @ValuesBatch,
+                        @cur,
+                        @next - @cur
+                    );
+
+            IF @next = 0
+                SET @cur = @batchLen + 1;
+            ELSE
+                SET @cur = @next + 1;
+
+            SET @rowIdx += 1;
 
             --------------------------------------------------------
-            -- Validation de la colonne
+            -- Colonnes de cette ligne
             --------------------------------------------------------
-            IF NOT EXISTS
-            (
-                SELECT 1
-                FROM sys.columns
-                WHERE object_id = @objectId
-                  AND name = @column
-                  AND is_identity = 0
-                  AND is_computed = 0
-            )
-                THROW 50004, 'Colonne SET invalide.', 1;
+            DECLARE @p INT = 1;
+            DECLARE @n INT;
+            DECLARE @token NVARCHAR(MAX);
+            DECLARE @ord INT = 1;
 
-            --------------------------------------------------------
-            -- Transformer le token SQL actuel en donnée
-            --
-            -- NULL       -> NULL
-            -- 'bonjour'  -> bonjour
-            -- 123        -> 123
-            --------------------------------------------------------
-            DECLARE @isNull BIT = 0;
-
-            IF UPPER(@value) = N'NULL'
+            WHILE 1 = 1
             BEGIN
-                SET @isNull = 1;
-                SET @value = NULL;
-            END
-            ELSE IF LEN(@value) >= 2
-                 AND LEFT(@value,1) = N''''
-                 AND RIGHT(@value,1) = N''''
-            BEGIN
-                SET @value =
-                    SUBSTRING(@value, 2, LEN(@value) - 2);
+                SET @n =
+                    CHARINDEX(@CS, @line, @p);
 
-                SET @value =
-                    REPLACE(@value, N'''''', N'''');
+                IF @n = 0
+                    SET @token =
+                        SUBSTRING(
+                            @line,
+                            @p,
+                            LEN(@line) - @p + 1
+                        );
+                ELSE
+                    SET @token =
+                        SUBSTRING(
+                            @line,
+                            @p,
+                            @n - @p
+                        );
+
+                SET @token =
+                    LTRIM(RTRIM(@token));
+
+                DECLARE @isNull BIT = 0;
+                DECLARE @raw NVARCHAR(MAX);
+
+                ----------------------------------------------------
+                -- IMPORTANT
+                --
+                -- Le C# actuel envoie encore :
+                --
+                -- 'texte'
+                -- 123
+                -- NULL
+                --
+                -- On transforme ça en DATA.
+                ----------------------------------------------------
+                IF UPPER(@token) = N'NULL'
+                BEGIN
+                    SET @isNull = 1;
+                    SET @raw = NULL;
+                END
+                ELSE IF LEN(@token) >= 2
+                     AND LEFT(@token,1) = N''''
+                     AND RIGHT(@token,1) = N''''
+                BEGIN
+                    SET @raw =
+                        SUBSTRING(
+                            @token,
+                            2,
+                            LEN(@token) - 2
+                        );
+
+                    SET @raw =
+                        REPLACE(
+                            @raw,
+                            N'''''',
+                            N''''
+                        );
+                END
+                ELSE
+                BEGIN
+                    SET @raw = @token;
+                END;
+
+                INSERT INTO #Vals
+                (
+                    RowIndex,
+                    ColOrd,
+                    RawValue,
+                    IsNull
+                )
+                VALUES
+                (
+                    @rowIdx,
+                    @ord,
+                    @raw,
+                    @isNull
+                );
+
+                SET @ord += 1;
+
+                IF @n = 0
+                    BREAK;
+
+                SET @p = @n + 1;
             END;
 
-            INSERT INTO #SetValues
-            (
-                ColName,
-                RawValue,
-                IsNull
-            )
-            VALUES
-            (
-                @column,
-                @value,
-                @isNull
-            );
-
-            IF @next = 0
-                BREAK;
-
-            SET @cur = @next + 1;
+            --------------------------------------------------------
+            -- Structure
+            --------------------------------------------------------
+            IF (@ord - 1) <> @colCount
+                THROW 50103,
+                      'Nombre de valeurs différent du nombre de colonnes.',
+                      1;
         END;
 
-        IF NOT EXISTS (SELECT 1 FROM #SetValues)
-            THROW 50005, 'Aucune valeur à mettre à jour.', 1;
+        ------------------------------------------------------------
+        -- 6) Résultat
+        ------------------------------------------------------------
+        DECLARE @out TABLE
+        (
+            RowIndex     INT,
+            NewID        NVARCHAR(100),
+            ErrorMessage NVARCHAR(MAX)
+        );
+
+        DECLARE @totalRows INT =
+            (SELECT MAX(RowIndex) FROM #Vals);
+
+        SET @rowIdx = 1;
 
         ------------------------------------------------------------
-        -- 4) Construction du SET
-        --
-        -- IMPORTANT :
-        -- seules les colonnes validées sont concaténées.
-        -- Les valeurs restent dans #SetValues.
+        -- 7) Une ligne à la fois
         ------------------------------------------------------------
-        DECLARE @setClause NVARCHAR(MAX) = N'';
-
-        DECLARE
-            @ord INT,
-            @setCol NVARCHAR(128);
-
-        DECLARE curSet CURSOR LOCAL FAST_FORWARD FOR
-        SELECT Ord, ColName
-        FROM #SetValues
-        ORDER BY Ord;
-
-        OPEN curSet;
-
-        FETCH NEXT FROM curSet
-        INTO @ord, @setCol;
-
-        WHILE @@FETCH_STATUS = 0
+        WHILE @rowIdx <= @totalRows
         BEGIN
-            IF LEN(@setClause) > 0
-                SET @setClause += N',';
 
-            SET @setClause +=
-                QUOTENAME(@setCol)
-                + N' = (SELECT CASE WHEN IsNull = 1 '
-                + N'THEN NULL ELSE RawValue END '
-                + N'FROM #SetValues WHERE Ord = '
-                + CAST(@ord AS NVARCHAR(10))
-                + N')';
+            --------------------------------------------------------
+            -- Doublons
+            --------------------------------------------------------
+            DECLARE @exists BIT = 0;
+            DECLARE @dupId NVARCHAR(100) = NULL;
 
-            FETCH NEXT FROM curSet
-            INTO @ord, @setCol;
+            DECLARE @constraintName NVARCHAR(255);
+
+            DECLARE curDup CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT ConstraintName
+            FROM #Pk;
+
+            OPEN curDup;
+
+            FETCH NEXT FROM curDup
+            INTO @constraintName;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                DECLARE @whereClause NVARCHAR(MAX) = N'';
+
+                DECLARE
+                    @pkCol NVARCHAR(128),
+                    @pkColOrd INT;
+
+                DECLARE curPk CURSOR LOCAL FAST_FORWARD FOR
+                SELECT ColName, ColOrd
+                FROM #Pk
+                WHERE ConstraintName = @constraintName
+                ORDER BY Ord;
+
+                OPEN curPk;
+
+                FETCH NEXT FROM curPk
+                INTO @pkCol, @pkColOrd;
+
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    IF LEN(@whereClause) > 0
+                        SET @whereClause += N' AND ';
+
+                    ------------------------------------------------
+                    -- AUCUNE valeur concaténée.
+                    ------------------------------------------------
+                    SET @whereClause +=
+                        N'(
+                            (
+                                (SELECT IsNull
+                                 FROM #Vals
+                                 WHERE RowIndex = @ri
+                                   AND ColOrd = '
+                        + CAST(@pkColOrd AS NVARCHAR(10))
+                        + N') = 1
+                                AND '
+                        + QUOTENAME(@pkCol)
+                        + N' IS NULL
+                            )
+                            OR
+                            (
+                                (SELECT IsNull
+                                 FROM #Vals
+                                 WHERE RowIndex = @ri
+                                   AND ColOrd = '
+                        + CAST(@pkColOrd AS NVARCHAR(10))
+                        + N') = 0
+                                AND '
+                        + QUOTENAME(@pkCol)
+                        + N' =
+                                (SELECT RawValue
+                                 FROM #Vals
+                                 WHERE RowIndex = @ri
+                                   AND ColOrd = '
+                        + CAST(@pkColOrd AS NVARCHAR(10))
+                        + N')
+                            )
+                        )';
+
+                    FETCH NEXT FROM curPk
+                    INTO @pkCol, @pkColOrd;
+                END;
+
+                CLOSE curPk;
+                DEALLOCATE curPk;
+
+                IF LEN(@whereClause) > 0
+                BEGIN
+                    DECLARE @checkSql NVARCHAR(MAX);
+
+                    SET @checkSql =
+                        N'SELECT @found =
+                            CASE WHEN EXISTS
+                            (
+                                SELECT 1
+                                FROM [dbo].'
+                        + QUOTENAME(@TableName)
+                        + N' WITH (NOLOCK)
+                                WHERE '
+                        + @whereClause
+                        + N'
+                            )
+                            THEN 1 ELSE 0 END;';
+
+                    EXEC sp_executesql
+                        @checkSql,
+                        N'@ri INT, @found BIT OUTPUT',
+                        @ri = @rowIdx,
+                        @found = @exists OUTPUT;
+
+                    IF @exists = 1
+                    BEGIN
+                        IF @HasIdentity = 1
+                           AND @IdentityCol IS NOT NULL
+                        BEGIN
+                            DECLARE @dupSql NVARCHAR(MAX);
+
+                            SET @dupSql =
+                                N'SELECT TOP (1)
+                                    @nid =
+                                    CONVERT(NVARCHAR(100), '
+                                + QUOTENAME(@IdentityCol)
+                                + N')
+                                  FROM [dbo].'
+                                + QUOTENAME(@TableName)
+                                + N'
+                                  WHERE '
+                                + @whereClause
+                                + N';';
+
+                            EXEC sp_executesql
+                                @dupSql,
+                                N'@ri INT,
+                                  @nid NVARCHAR(100) OUTPUT',
+                                @ri = @rowIdx,
+                                @nid = @dupId OUTPUT;
+                        END;
+
+                        BREAK;
+                    END;
+                END;
+
+                FETCH NEXT FROM curDup
+                INTO @constraintName;
+            END;
+
+            CLOSE curDup;
+            DEALLOCATE curDup;
+
+            IF @exists = 1
+            BEGIN
+                INSERT INTO @out
+                VALUES
+                (
+                    @rowIdx,
+                    @dupId,
+                    N'Doublon'
+                );
+
+                SET @rowIdx += 1;
+
+                CONTINUE;
+            END;
+
+            --------------------------------------------------------
+            -- 8) INSERT sécurisé
+            --------------------------------------------------------
+            DECLARE @safeColumns NVARCHAR(MAX) = N'';
+            DECLARE @selectValues NVARCHAR(MAX) = N'';
+
+            DECLARE
+                @insertOrd INT,
+                @insertCol NVARCHAR(128);
+
+            DECLARE curInsert CURSOR LOCAL FAST_FORWARD FOR
+            SELECT Ord, ColName
+            FROM #Cols
+            ORDER BY Ord;
+
+            OPEN curInsert;
+
+            FETCH NEXT FROM curInsert
+            INTO @insertOrd, @insertCol;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                IF LEN(@safeColumns) > 0
+                BEGIN
+                    SET @safeColumns += N',';
+                    SET @selectValues += N',';
+                END;
+
+                SET @safeColumns +=
+                    QUOTENAME(@insertCol);
+
+                ----------------------------------------------------
+                -- Toujours aucune valeur concaténée
+                ----------------------------------------------------
+                SET @selectValues +=
+                    N'(SELECT CASE
+                         WHEN IsNull = 1 THEN NULL
+                         ELSE RawValue
+                       END
+                       FROM #Vals
+                       WHERE RowIndex = @ri
+                         AND ColOrd = '
+                    + CAST(@insertOrd AS NVARCHAR(10))
+                    + N')';
+
+                FETCH NEXT FROM curInsert
+                INTO @insertOrd, @insertCol;
+            END;
+
+            CLOSE curInsert;
+            DEALLOCATE curInsert;
+
+            DECLARE @insertSql NVARCHAR(MAX);
+
+            SET @insertSql =
+                N'INSERT INTO [dbo].'
+                + QUOTENAME(@TableName)
+                + N' (' + @safeColumns + N') '
+                + N'SELECT ' + @selectValues + N'; ';
+
+            IF @HasIdentity = 1
+               AND @IdentityCol IS NOT NULL
+            BEGIN
+                SET @insertSql +=
+                    N'SET @nid =
+                      CONVERT(
+                          NVARCHAR(100),
+                          SCOPE_IDENTITY()
+                      );';
+            END;
+
+            BEGIN TRY
+
+                DECLARE @newId NVARCHAR(100) = NULL;
+
+                IF @HasIdentity = 1
+                   AND @IdentityCol IS NOT NULL
+                BEGIN
+                    EXEC sp_executesql
+                        @insertSql,
+                        N'@ri INT,
+                          @nid NVARCHAR(100) OUTPUT',
+                        @ri = @rowIdx,
+                        @nid = @newId OUTPUT;
+                END
+                ELSE
+                BEGIN
+                    EXEC sp_executesql
+                        @insertSql,
+                        N'@ri INT',
+                        @ri = @rowIdx;
+                END;
+
+                INSERT INTO @out
+                VALUES
+                (
+                    @rowIdx,
+                    @newId,
+                    NULL
+                );
+
+            END TRY
+            BEGIN CATCH
+
+                INSERT INTO @out
+                VALUES
+                (
+                    @rowIdx,
+                    NULL,
+                    N'ERR: ' + ERROR_MESSAGE()
+                );
+
+            END CATCH;
+
+            SET @rowIdx += 1;
         END;
 
-        CLOSE curSet;
-        DEALLOCATE curSet;
-
         ------------------------------------------------------------
-        -- 5) UPDATE
-        --
-        -- @newId n'est PLUS concaténé.
+        -- 9) Résultat
         ------------------------------------------------------------
-        DECLARE @sql NVARCHAR(MAX);
-
-        SET @sql =
-            N'UPDATE [dbo].' + QUOTENAME(@tableName)
-            + N' SET ' + @setClause
-            + N' WHERE ' + QUOTENAME(@idCol)
-            + N' = @pNewId;';
-
-        EXEC sp_executesql
-            @sql,
-            N'@pNewId NVARCHAR(255)',
-            @pNewId = @newId;
+        SELECT
+            RowIndex,
+            NewID,
+            ErrorMessage
+        FROM @out
+        ORDER BY RowIndex;
 
     END TRY
     BEGIN CATCH
         PRINT ERROR_MESSAGE();
         THROW;
-    END CATCH
+    END CATCH;
 END;
