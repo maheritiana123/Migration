@@ -1,29 +1,28 @@
-IF UPPER(@token) = N'NULL'
-BEGIN
-    SET @raw = NULL;
-    SET @isNull = 1;
-END
-
 ELSE IF UPPER(LEFT(@token, 8)) = N'CONVERT('
 BEGIN
-    ...
-END
+    DECLARE @firstQuote INT = CHARINDEX(N'''', @token);
+    DECLARE @lastQuote INT =
+        LEN(@token) - CHARINDEX(N'''', REVERSE(@token)) + 1;
 
-ELSE IF LEN(@token) >= 3
-    AND UPPER(LEFT(@token, 2)) = N'N'''
-    AND RIGHT(@token, 1) = N''''
-BEGIN
-    ...
-END
+    IF @firstQuote > 0
+       AND @lastQuote > @firstQuote
+    BEGIN
+        SET @raw =
+            SUBSTRING(
+                @token,
+                @firstQuote + 1,
+                @lastQuote - @firstQuote - 1
+            );
 
-ELSE IF LEN(@token) >= 2
-    AND LEFT(@token, 1) = N''''
-    AND RIGHT(@token, 1) = N''''
-BEGIN
-    ...
+        SET @raw =
+            REPLACE(
+                @raw,
+                N'''''',
+                N''''
+            );
+    END
+    ELSE
+    BEGIN
+        SET @raw = @token;
+    END
 END
-
-ELSE
-BEGIN
-    SET @raw = @token;
-END;
